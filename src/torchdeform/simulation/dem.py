@@ -98,22 +98,3 @@ def synthetic_dem(
         dem = dem + base_elevation
     return dem
 
-
-# --------------------------------------------------------------------------- #
-# Self-check  (remove before shipping)
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    dem = synthetic_dem(4, 128, 128, relief=300.0, hurst=0.7,
-                        base_elevation=500.0)
-    print(f"shape {tuple(dem.shape)}, per-image std "
-          f"{dem.std(dim=(-2,-1)).mean():.2f} (want 300), "
-          f"mean {dem.mean():.1f} (want 500)")
-
-    demp = synthetic_dem(2, 64, 64, relief=200.0, positive=True,
-                         base_elevation=0.0)
-    print(f"positive DEM min: {demp.amin(dim=(-2,-1)).tolist()} (want 0)")
-
-    demr = synthetic_dem(2, 64, 80, relief=1e-9, ramp=400.0)
-    ptp = (demr.amax(dim=(-2,-1)) - demr.amin(dim=(-2,-1)))
-    print(f"ramp-dominated peak-to-peak: {ptp.tolist()} (want ~400)")

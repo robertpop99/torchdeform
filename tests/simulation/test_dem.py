@@ -13,29 +13,12 @@ Run with::
 
     pytest test_dem.py -v
 
-----------------------------------------------------------------------------
-IMPORT NOTE - adjust the imports below to your package layout.
-----------------------------------------------------------------------------
 """
 import pytest
 import torch
 
-try:
-    from .dem import synthetic_dem
-except ImportError:                               # pragma: no cover
-    try:
-        from deform.dem import synthetic_dem
-    except ImportError:
-        from dem import synthetic_dem
-
-# stratified_aps is only needed for the integration test; skip if unavailable.
-try:
-    from .atm import stratified_aps
-except ImportError:                               # pragma: no cover
-    try:
-        from atm import stratified_aps
-    except ImportError:
-        stratified_aps = None
+from torchdeform.simulation import synthetic_dem
+from torchdeform.atmosphere import stratified_aps
 
 
 DTYPE = torch.float64
