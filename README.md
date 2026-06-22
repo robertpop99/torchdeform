@@ -46,7 +46,7 @@ atmosphere.
 import torch
 from torchdeform import OkadaSourceSimple, los_vector
 from torchdeform.observation.insar import to_phase, wrap_phase
-from torchdeform.atmosphere import turbulent_aps, stratified_aps
+from torchdeform.atmosphere import turbulent_aps, stratified_aps, orbital_ramp
 from torchdeform.simulation import synthetic_dem, UniformPrior
 
 B, rows, cols = 4, 64, 64
@@ -78,10 +78,12 @@ los = los_vector(heading_deg=torch.full((B,), -13.0),
                  incidence_deg=torch.full((B,), 39.0))
 phase = to_phase(disp.to_los(los)).reshape(B, rows, cols)
 
-# 3. Add atmosphere: turbulent screen + topography-correlated delay
+# 3. Add a realistic background: orbital ramp + topo-correlated + turbulent APS
+#    (in a calm scene the long-wavelength ramp dominates; turbulence is texture)
 dem = synthetic_dem(B, rows, cols, relief=600.0)
-aps = turbulent_aps(B, rows, cols, rms=2.0, psizex=500.0, psizey=500.0)
-aps = aps + stratified_aps(dem, coeff=torch.full((B,), 3e-3))
+aps = orbital_ramp(B, rows, cols, rms=4.0)                              # long-wavelength trend
+aps = aps + stratified_aps(dem, coeff=torch.full((B,), 3e-3))          # tracks topography
+aps = aps + turbulent_aps(B, rows, cols, rms=0.8, psizex=500.0, psizey=500.0)
 
 # 4. Wrapped interferogram, [B, rows, cols]
 ifg = wrap_phase(phase + aps)

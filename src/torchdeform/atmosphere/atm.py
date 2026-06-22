@@ -1,15 +1,22 @@
 """
 Synthetic turbulent atmospheric phase screens (APS) for InSAR training data.
 
-This module generates both parts of the atmospheric phase delay:
+This module generates the components of the no-deformation phase background:
 
 * the *turbulent* component (:class:`TurbulentAPS`) -- the spatially-correlated,
-  stochastic signal from 3-D turbulent mixing of water vapour; and
+  stochastic signal from 3-D turbulent mixing of water vapour;
 * the *stratified* / topography-correlated component (:func:`stratified_aps`,
   :class:`StratifiedAPS`) -- the (per-interferogram) deterministic delay that
-  tracks elevation, because the atmosphere is vertically stratified. Needs a DEM.
+  tracks elevation, because the atmosphere is vertically stratified. Needs a DEM;
+  and
+* a long-wavelength *orbital ramp* (:func:`orbital_ramp`) -- the smooth low-order
+  polynomial trend (residual orbit error etc.) that usually dominates the look of
+  a real "noise-only" interferogram (a couple of widely-spaced fringes / slow
+  gradient).
 
-Add them for a full screen (see :func:`atmospheric_phase_screen`).
+Add them for a full screen (see :func:`atmospheric_phase_screen`). A realistic
+background is typically ``orbital_ramp + stratified + turbulent``, with the
+turbulent part the smallest in a calm scene.
 
 Why spectral synthesis instead of covariance + Cholesky
 -------------------------------------------------------
@@ -472,6 +479,89 @@ def sample_stratified_coeff(
                                        device=device, dtype=dtype)
 
 
+# --------------------------------------------------------------------------- #
+# Orbital / long-wavelength ramp
+# --------------------------------------------------------------------------- #
+def orbital_ramp(
+    batch: int,
+    rows: int,
+    cols: int,
+    *,
+    rms: Union[float, torch.Tensor] = 1.0,
+    order: int = 1,
+    coeff: Optional[torch.Tensor] = None,
+    generator: Optional[torch.Generator] = None,
+    device: Optional[DeviceLikeType] = "cpu",
+    dtype: torch.dtype = torch.float64,
+    num_eps: float = 1e-12,
+) -> torch.Tensor:
+    """Smooth long-wavelength phase ramp ``[batch, rows, cols]``.
+
+    Models the residual orbital-error trend (and other very-long-wavelength
+    background) that dominates the look of real no-deformation interferograms: a
+    low-order 2-D polynomial across the scene. With ``order=1`` it is a random
+    plane ``a*x + b*y``; with ``order=2`` it adds the quadratic terms
+    ``x^2, y^2, x*y``. The DC term is dropped (zero mean) and the field is
+    renormalised to per-image spatial RMS ``rms`` -- so it composes additively
+    with :func:`turbulent_aps` / :func:`stratified_aps` in the same units.
+
+    Coordinates are normalised to ``[-1, 1]`` across the scene, so the result is
+    independent of pixel spacing (only the grid aspect ratio matters).
+
+    Parameters
+    ----------
+    batch, rows, cols : int
+        Output shape.
+    rms : float or torch.Tensor
+        Per-image spatial RMS of the ramp (scalar, or ``[batch]`` to randomise
+        strength per image); same units as the other screens (typically radians).
+    order : {1, 2}
+        Polynomial order: 1 = planar (the dominant orbital term), 2 adds
+        quadratic curvature.
+    coeff : torch.Tensor, optional
+        Polynomial coefficients ``[batch, K]`` (``K = 2`` for ``order=1``, ``5``
+        for ``order=2``). Pass your own for reproducibility or to differentiate
+        through them; otherwise standard-normal coefficients are drawn.
+    generator, device, dtype, num_eps
+        Standard RNG / tensor-placement controls; ``num_eps`` floors the per-image
+        std during RMS renormalisation.
+
+    Returns
+    -------
+    torch.Tensor
+        Zero-mean ramp ``[batch, rows, cols]`` with per-image RMS ``rms``.
+    """
+    if order not in (1, 2):
+        raise ValueError(f"order must be 1 (planar) or 2 (planar+quadratic), got {order!r}")
+
+    ys = torch.linspace(-1.0, 1.0, rows, device=device, dtype=dtype)
+    xs = torch.linspace(-1.0, 1.0, cols, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")          # [rows, cols]
+
+    terms = [xx, yy]
+    if order == 2:
+        terms += [xx * xx, yy * yy, xx * yy]
+    basis = torch.stack(terms, dim=0)                       # [K, rows, cols]
+    k = basis.shape[0]
+
+    if coeff is None:
+        coeff = torch.randn(batch, k, generator=generator, device=device, dtype=dtype)
+    else:
+        coeff = coeff.to(device=device, dtype=dtype)
+        if coeff.shape != (batch, k):
+            raise ValueError(f"coeff must have shape {(batch, k)} for order={order}, "
+                             f"got {tuple(coeff.shape)}")
+
+    field = torch.einsum("bk,khw->bhw", coeff, basis)       # [batch, rows, cols]
+
+    field = field - field.mean(dim=(-2, -1), keepdim=True)
+    std = field.std(dim=(-2, -1), keepdim=True).clamp_min(num_eps)
+    rms_t = torch.as_tensor(rms, device=device, dtype=dtype)
+    if rms_t.ndim == 1:
+        rms_t = rms_t.reshape(-1, 1, 1)
+    return field / std * rms_t
+
+
 def atmospheric_phase_screen(
     turbulent: torch.Tensor,                  # [B, H, W] from TurbulentAPS
     dem: torch.Tensor,                        # [H, W] or [B, H, W]
@@ -479,11 +569,14 @@ def atmospheric_phase_screen(
     model: str = "linear",
     scale_height: float = 6000.0,
     reference: Union[str, float, None] = "mean",
+    orbital: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Full screen = turbulent + stratified, returned as ``[B, H, W]``.
+    """Full screen = turbulent + stratified (+ optional orbital ramp), ``[B, H, W]``.
 
-    Convenience adder for a precomputed turbulent screen and a fresh stratified
-    one on the same grid.
+    Convenience adder for a precomputed turbulent screen, a fresh stratified one
+    on the same grid, and an optional precomputed long-wavelength ramp. Combining
+    all three is what reproduces the smooth, few-fringe look of real
+    no-deformation interferograms.
 
     Parameters
     ----------
@@ -496,8 +589,14 @@ def atmospheric_phase_screen(
         Stratification coefficient; see :func:`stratified_aps`.
     model, scale_height, reference
         Forwarded to :func:`stratified_aps`.
+    orbital : torch.Tensor, optional
+        Long-wavelength ramp ``[B, H, W]`` (e.g. from :func:`orbital_ramp`) to add
+        on top. Omitted by default.
     """
     strat = stratified_aps(dem, coeff, model, scale_height, reference,
                            device=turbulent.device, dtype=turbulent.dtype)
-    return turbulent + strat
+    total = turbulent + strat
+    if orbital is not None:
+        total = total + orbital
+    return total
 

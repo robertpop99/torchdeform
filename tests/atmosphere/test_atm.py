@@ -30,7 +30,7 @@ import torch
 
 from torchdeform.atmosphere import (TurbulentAPS, turbulent_aps, spectral_filter,
                  correlated_noise_cholesky, stratified_aps, StratifiedAPS,
-                 sample_stratified_coeff, atmospheric_phase_screen)
+                 sample_stratified_coeff, orbital_ramp, atmospheric_phase_screen)
 
 
 
@@ -352,6 +352,76 @@ class TestDtypeAndDevice:
         dem = torch.rand(4, 64, 64, dtype=DTYPE, device="cuda") * 1000
         s = stratified_aps(dem, torch.tensor([1e-3], device="cuda"), model="linear")
         assert s.device.type == "cuda" and torch.isfinite(s).all()
+
+
+# --------------------------------------------------------------------------- #
+# orbital ramp
+# --------------------------------------------------------------------------- #
+class TestOrbitalRamp:
+    def test_shape_zero_mean_and_rms(self):
+        g = torch.Generator().manual_seed(0)
+        f = orbital_ramp(4, 32, 48, rms=2.0, generator=g, dtype=DTYPE)
+        assert f.shape == (4, 32, 48)
+        assert torch.allclose(f.mean(dim=(-2, -1)),
+                              torch.zeros(4, dtype=DTYPE), atol=1e-9)
+        std = f.std(dim=(-2, -1))
+        assert torch.allclose(std, torch.full((4,), 2.0, dtype=DTYPE), atol=1e-6)
+
+    def test_per_image_rms_tensor(self):
+        rms = torch.tensor([0.5, 3.0], dtype=DTYPE)
+        f = orbital_ramp(2, 24, 24, rms=rms, generator=torch.Generator().manual_seed(1))
+        assert torch.allclose(f.std(dim=(-2, -1)), rms, atol=1e-6)
+
+    def test_order1_is_planar(self):
+        """order=1 -> affine field: second differences vanish along both axes."""
+        f = orbital_ramp(3, 20, 20, order=1, generator=torch.Generator().manual_seed(2),
+                         dtype=DTYPE)
+        d2x = f[:, :, 2:] - 2 * f[:, :, 1:-1] + f[:, :, :-2]
+        d2y = f[:, 2:, :] - 2 * f[:, 1:-1, :] + f[:, :-2, :]
+        assert d2x.abs().max() < 1e-9
+        assert d2y.abs().max() < 1e-9
+
+    def test_order2_has_curvature(self):
+        f = orbital_ramp(8, 20, 20, order=2, generator=torch.Generator().manual_seed(3),
+                         dtype=DTYPE)
+        d2x = f[:, :, 2:] - 2 * f[:, :, 1:-1] + f[:, :, :-2]
+        assert d2x.abs().max() > 1e-6           # some image is genuinely curved
+
+    def test_generator_determinism(self):
+        a = orbital_ramp(2, 16, 16, generator=torch.Generator().manual_seed(7))
+        b = orbital_ramp(2, 16, 16, generator=torch.Generator().manual_seed(7))
+        assert torch.allclose(a, b)
+
+    def test_explicit_coeff_is_used(self):
+        coeff = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=DTYPE)   # x-ramp, y-ramp
+        f = orbital_ramp(2, 16, 16, coeff=coeff)
+        # image 0 varies along x only, image 1 along y only
+        assert f[0].std(dim=0).max() < 1e-9      # constant down columns
+        assert f[1].std(dim=1).max() < 1e-9      # constant along rows
+
+    def test_bad_order_and_coeff_shape_raise(self):
+        with pytest.raises(ValueError, match="order must be"):
+            orbital_ramp(1, 8, 8, order=3)
+        with pytest.raises(ValueError, match="coeff must have shape"):
+            orbital_ramp(2, 8, 8, order=1, coeff=torch.zeros(2, 5))
+
+    def test_differentiable_in_rms(self):
+        rms = torch.tensor([1.5], dtype=DTYPE, requires_grad=True)
+        f = orbital_ramp(1, 12, 12, rms=rms, generator=torch.Generator().manual_seed(4))
+        f.pow(2).mean().backward()
+        assert rms.grad is not None and torch.isfinite(rms.grad).all()
+
+    def test_folds_into_atmospheric_phase_screen(self):
+        g = torch.Generator().manual_seed(0)
+        turb = turbulent_aps(2, 32, 32, rms=1.0, generator=g)
+        dem = torch.rand(2, 32, 32, dtype=DTYPE, generator=g) * 1000
+        coeff = torch.tensor([2e-3, -2e-3], dtype=DTYPE)
+        ramp = orbital_ramp(2, 32, 32, rms=3.0, generator=g)
+
+        without = atmospheric_phase_screen(turb, dem, coeff, model="linear")
+        with_ramp = atmospheric_phase_screen(turb, dem, coeff, model="linear",
+                                             orbital=ramp)
+        assert torch.allclose(with_ramp, without + ramp)
 
 
 if __name__ == "__main__":
