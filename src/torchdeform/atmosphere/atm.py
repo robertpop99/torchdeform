@@ -78,13 +78,22 @@ between two dates can correlate either way with height), so randomise it.
   ``"mean"`` (default, zero-mean screen), ``"min"``, ``None`` (0), or a float
   reference elevation in metres.
 
-On the original MATLAB's missing arguments
-------------------------------------------
-``covmodel_type=1`` (expcos) needs ``beta`` (an oscillation wavenumber) and
-``covmodel_type=2`` (ebessel) needs ``eb_r, eb_w`` plus an external ``ebessel``
-function -- none are passed in, so only type 0 (exponential) actually runs.
-Those "hole-effect" models are niche; the power-law and exponential models here
-cover the mainstream turbulent-APS use case.
+Hole-effect covariance models
+-----------------------------
+The oscillating "hole-effect" covariances from the original MATLAB --
+``expcos`` (``maxvar exp(-alpha r) cos(beta r)``) and ``ebessel``
+(``maxvar exp(-alpha r) J0(2 pi r / w)``) -- are available, but only on the
+covariance + Cholesky path (:func:`correlated_noise_cholesky`, via its ``model``
+argument), since the spectral generator would need their 2-D PSDs. They are
+niche; the power-law and exponential models cover the mainstream use case.
+
+Calibrating from data
+---------------------
+:func:`covariance_vs_distance` estimates a field's radial autocovariance and
+:func:`fit_exponential_covariance` fits ``maxvar exp(-alpha r)`` to it, so the
+generator parameters (variance, ``correlation_length = 1/alpha``) can be measured
+from a real interferogram and fed straight back into the exponential
+:func:`turbulent_aps` / :func:`correlated_noise_cholesky`.
 """
 import math
 from typing import Optional, Union
@@ -280,35 +289,63 @@ def correlated_noise_cholesky(
     maxvar: float,
     alpha: float,
     N: int,
+    model: str = "exponential",
+    beta: Optional[float] = None,
+    bessel_w: Optional[float] = None,
     psizex: float = 1.0,
     psizey: float = 1.0,
     device: Optional[DeviceLikeType] = "cpu",
     dtype: torch.dtype = torch.float64,
     generator: Optional[torch.Generator] = None,
+    jitter: float = 1e-9,
 ) -> torch.Tensor:
-    """Direct PyTorch port of ``pcmc_atm`` (exponential model, covmodel_type=0).
+    """Direct PyTorch port of ``pcmc_atm``: covariance + Cholesky synthesis.
 
-    Builds the full ``n x n`` covariance ``maxvar * exp(-alpha * r)`` and draws
+    Builds the full ``n x n`` covariance for the chosen model and draws
     correlated noise via Cholesky. Returns ``[N, rows, cols]``.
+
+    Models (``cov(r)``, with ``maxvar`` the zero-lag variance):
+
+    * ``"exponential"`` -- ``maxvar * estatisticsxp(-alpha r)`` (covmodel_type 0).
+    * ``"expcos"`` -- ``maxvar * exp(-alpha r) * cos(beta r)`` (covmodel_type 1):
+      an oscillating "hole-effect" covariance; needs ``beta`` (the oscillation
+      wavenumber, rad/length). NOTE: this is only positive-definite for a gentle
+      oscillation (roughly ``beta <= alpha``); a pronounced hole makes the
+      covariance invalid and the Cholesky will fail (this is why the original
+      MATLAB effectively only ran the exponential model).
+    * ``"ebessel"`` -- ``maxvar * exp(-alpha r) * J0(2 pi r / bessel_w)``
+      (covmodel_type 2): exponential-Bessel hole-effect covariance; needs
+      ``bessel_w`` (the oscillation wavelength). A valid covariance, though it may
+      still need a larger ``jitter`` on some grids.
 
     Parameters
     ----------
     rows, cols : int
         Grid shape (``n = rows * cols``).
     maxvar : float
-        Variance at zero lag (the ``exp(-alpha r)`` covariance amplitude).
+        Variance at zero lag (the covariance amplitude).
     alpha : float
         Inverse correlation length (1/length); larger = decorrelates faster.
     N : int
         Number of independent screens to draw.
+    model : {'exponential', 'expcos', 'ebessel'}
+        Covariance model (see above).
+    beta : float, optional
+        Oscillation wavenumber for ``model='expcos'`` (rad/length).
+    bessel_w : float, optional
+        Oscillation wavelength for ``model='ebessel'`` (same units as distance).
     psizex, psizey : float
         Pixel spacing used to compute inter-pixel distances ``r``.
     device, dtype, generator
         Standard tensor placement / RNG controls.
+    jitter : float
+        Diagonal loading (``jitter * maxvar``) added for numerical PD-ness. The
+        hole-effect models are not guaranteed positive-definite, so the Cholesky
+        can still fail on some grids -- increase ``jitter`` if so.
 
     WARNING: O(n^2) memory, O(n^3) compute with n = rows*cols. Usable only for
     tiny grids (<= ~64x64). Use :class:`TurbulentAPS` for anything real; this
-    exists to validate that the spectral generator reproduces the same field.
+    exists to validate the spectral generator and to exercise covariance models.
     """
     n = rows * cols
     yy, xx = torch.meshgrid(
@@ -321,9 +358,26 @@ def correlated_noise_cholesky(
     dx = xv[:, None] - xv[None, :]
     dy = yv[:, None] - yv[None, :]
     r = torch.sqrt(dx * dx + dy * dy)
-    vcm = maxvar * torch.exp(-alpha * r)
-    # jitter for numerical PD-ness (the matrix is only marginally PD)
-    vcm = vcm + 1e-9 * maxvar * torch.eye(n, device=device, dtype=dtype)
+
+    decay = maxvar * torch.exp(-alpha * r)
+    if model == "exponential":
+        vcm = decay
+    elif model == "expcos":
+        if beta is None:
+            raise ValueError("model='expcos' needs beta (oscillation wavenumber)")
+        vcm = decay * torch.cos(beta * r)
+    elif model == "ebessel":
+        if bessel_w is None or bessel_w <= 0:
+            raise ValueError("model='ebessel' needs bessel_w > 0 (oscillation wavelength)")
+        vcm = decay * torch.special.bessel_j0(2.0 * math.pi * r / bessel_w)
+    else:
+        raise ValueError(
+            f"unknown model {model!r} (use 'exponential', 'expcos' or 'ebessel')"
+        )
+
+    # diagonal loading for numerical PD-ness (the matrix is only marginally PD,
+    # and the hole-effect models may be indefinite)
+    vcm = vcm + jitter * maxvar * torch.eye(n, device=device, dtype=dtype)
     L = torch.linalg.cholesky(vcm)                 # vcm = L L^T
     z = torch.randn(N, n, generator=generator, device=device, dtype=dtype)
     x = z @ L.T                                    # [N, n], cov(row) = vcm
@@ -599,4 +653,169 @@ def atmospheric_phase_screen(
     if orbital is not None:
         total = total + orbital
     return total
+
+
+# --------------------------------------------------------------------------- #
+# Covariance estimation (calibrate the generators from data)
+# --------------------------------------------------------------------------- #
+def covariance_vs_distance(
+    field: torch.Tensor,
+    psizex: float = 1.0,
+    psizey: float = 1.0,
+    n_bins: int = 50,
+    max_distance: Optional[float] = None,
+    demean: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Radial autocovariance vs distance of a field (Wiener-Khinchine estimate).
+
+    The inverse of the generators: given a screen (e.g. a real, deramped
+    interferogram, or a synthetic one), estimate how its covariance decays with
+    distance. The 2-D autocovariance is obtained spectrally on a zero-padded grid
+    (so it is the *linear*, non-wrapping autocorrelation) and normalised by the
+    per-lag sample overlap -- the unbiased estimate, free of the triangular taper
+    of the naive ``|FFT|^2`` estimator -- then averaged into radial distance bins.
+
+    Parameters
+    ----------
+    field : torch.Tensor
+        ``[H, W]`` or ``[B, H, W]``.
+    psizex, psizey : float
+        Pixel spacing (sets the physical distance axis).
+    n_bins : int
+        Number of distance bins.
+    max_distance : float, optional
+        Largest distance binned; defaults to half the smaller scene dimension
+        (the unbiased estimate gets noisy at large lags, where few pairs overlap).
+    demean : bool, default True
+        Remove each image's spatial mean first. This is the right choice for real
+        data (the true mean is unknown), but note it removes long-wavelength power
+        and so makes the *apparent* covariance decay faster than the underlying
+        field's -- the recovered correlation length is biased short on a finite
+        scene (more so the longer the true correlation). Set ``False`` to validate
+        against a generator on an already-zero-mean synthetic field.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        ``distance`` ``[n_bins]`` (bin centres) and ``covariance`` shaped
+        ``[n_bins]`` for a 2-D input or ``[B, n_bins]`` for a batch.
+    """
+    squeeze = field.ndim == 2
+    if squeeze:
+        field = field[None]
+    if field.ndim != 3:
+        raise ValueError(f"field must be [H, W] or [B, H, W], got {tuple(field.shape)}")
+
+    B, H, W = field.shape
+    dtype, device = field.dtype, field.device
+
+    if demean:
+        field = field - field.mean(dim=(-2, -1), keepdim=True)
+    # zero-padded (linear) autocorrelation via FFT, zero lag at [0, 0]
+    spec = torch.fft.rfft2(field, s=(2 * H, 2 * W))
+    ac = torch.fft.irfft2(spec.real ** 2 + spec.imag ** 2, s=(2 * H, 2 * W))
+    ac = ac[:, :H, :W]                                   # non-negative lags
+
+    # unbiased normalisation: number of overlapping pairs at each lag
+    oy = (H - torch.arange(H, device=device, dtype=dtype)).clamp_min(1.0)
+    ox = (W - torch.arange(W, device=device, dtype=dtype)).clamp_min(1.0)
+    ac = ac / (oy[:, None] * ox[None, :])               # [B, H, W], ac[:,0,0] = variance
+
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device, dtype=dtype) * psizey,
+        torch.arange(W, device=device, dtype=dtype) * psizex,
+        indexing="ij",
+    )
+    r = torch.sqrt(yy * yy + xx * xx).reshape(-1)       # [H*W]
+
+    if max_distance is None:
+        max_distance = 0.5 * min(H * psizey, W * psizex)
+    bin_w = max_distance / n_bins
+    # don't bin finer than the pixel spacing, else near-distance bins are empty
+    # (the discrete lag grid has no samples between 0 and one pixel)
+    min_bw = min(psizex, psizey)
+    if bin_w < min_bw:
+        bin_w = min_bw
+        n_bins = max(1, int(math.ceil(max_distance / bin_w)))
+
+    keep = r < max_distance
+    r = r[keep]
+    bin_idx = (r / bin_w).to(torch.long).clamp_(max=n_bins - 1)
+    ac_flat = ac.reshape(B, -1)[:, keep]               # [B, M]
+
+    counts = torch.zeros(n_bins, device=device, dtype=dtype).index_add_(
+        0, bin_idx, torch.ones_like(r))
+    sums = torch.zeros(B, n_bins, device=device, dtype=dtype).index_add_(
+        1, bin_idx, ac_flat)
+    cov = sums / counts.clamp_min(1.0)
+
+    distance = (torch.arange(n_bins, device=device, dtype=dtype) + 0.5) * bin_w
+    return distance, (cov[0] if squeeze else cov)
+
+
+def fit_exponential_covariance(
+    field: torch.Tensor,
+    psizex: float = 1.0,
+    psizey: float = 1.0,
+    n_bins: int = 50,
+    max_distance: Optional[float] = None,
+    demean: bool = True,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit ``maxvar * exp(-alpha r)`` to a field's radial autocovariance.
+
+    Recovers the parameters of the exponential covariance model, ready to feed
+    back into the generators: ``correlation_length = 1 / alpha`` for the
+    exponential :func:`turbulent_aps`, and ``(maxvar, alpha)`` for
+    :func:`correlated_noise_cholesky`.
+
+    ``maxvar`` is the zero-lag variance (per image); ``alpha`` is recovered from
+    the binned covariance curve (:func:`covariance_vs_distance`) by a stable,
+    closed-form weighted log-linear fit -- ``log cov ~ log maxvar - alpha r``,
+    weighted by the (positive) covariance so the reliable near field dominates
+    and the noisy/negative tail is ignored.
+
+    Parameters
+    ----------
+    field : torch.Tensor
+        ``[H, W]`` or ``[B, H, W]``.
+    psizex, psizey, n_bins, max_distance, demean
+        Passed to :func:`covariance_vs_distance` (see its note on the finite-scene
+        bias from ``demean``).
+    eps : float
+        Numerical floor.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        ``variance`` and ``correlation_length`` (= ``1 / alpha``), each a scalar
+        for a 2-D input or ``[B]`` for a batch.
+    """
+    squeeze = field.ndim == 2
+    if squeeze:
+        field = field[None]
+
+    distance, cov = covariance_vs_distance(
+        field, psizex, psizey, n_bins, max_distance, demean)
+    if cov.ndim == 1:
+        cov = cov[None]
+
+    centred = field - field.mean(dim=(-2, -1), keepdim=True) if demean else field
+    var = centred.pow(2).mean(dim=(-2, -1)).clamp_min(eps)   # zero-lag covariance
+
+    r = distance[None]                                  # [1, n_bins]
+    maxvar = var[:, None]                               # [B, 1]
+
+    # weighted log-linear fit: log(cov) ~ log(maxvar) - alpha r, weighted by the
+    # positive covariance (down-weights the noisy / negative far-field tail)
+    w = cov.clamp_min(0.0)
+    log_ratio = torch.log(cov.clamp_min(eps)) - torch.log(maxvar)
+    num = (w * r * log_ratio).sum(dim=1)
+    den = (w * r * r).sum(dim=1).clamp_min(eps)
+    alpha = (-num / den).clamp_min(eps)
+
+    corr_len = 1.0 / alpha
+    if squeeze:
+        return var[0], corr_len[0]
+    return var, corr_len
 

@@ -83,7 +83,9 @@ phase = to_phase(disp.to_los(los)).reshape(B, rows, cols)
 dem = synthetic_dem(B, rows, cols, relief=600.0)
 aps = orbital_ramp(B, rows, cols, rms=4.0)                              # long-wavelength trend
 aps = aps + stratified_aps(dem, coeff=torch.full((B,), 3e-3))          # tracks topography
-aps = aps + turbulent_aps(B, rows, cols, rms=0.8, psizex=500.0, psizey=500.0)
+aps = aps + turbulent_aps(B, rows, cols, rms=0.8)                       # powerlaw: scale-free
+# (the default powerlaw turbulence is fractal, so psizex/psizey have no effect; set them
+#  to your ground sampling only for model="exponential" with a physical correlation_length)
 
 # 4. Wrapped interferogram, [B, rows, cols]
 ifg = wrap_phase(phase + aps)

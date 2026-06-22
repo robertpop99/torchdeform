@@ -24,13 +24,16 @@ Run with::
 
 """
 
+import math
+
 import pytest
 import torch
 
 
 from torchdeform.atmosphere import (TurbulentAPS, turbulent_aps, spectral_filter,
                  correlated_noise_cholesky, stratified_aps, StratifiedAPS,
-                 sample_stratified_coeff, orbital_ramp, atmospheric_phase_screen)
+                 sample_stratified_coeff, orbital_ramp, atmospheric_phase_screen,
+                 covariance_vs_distance, fit_exponential_covariance)
 
 
 
@@ -422,6 +425,87 @@ class TestOrbitalRamp:
         with_ramp = atmospheric_phase_screen(turb, dem, coeff, model="linear",
                                              orbital=ramp)
         assert torch.allclose(with_ramp, without + ramp)
+
+
+# --------------------------------------------------------------------------- #
+# hole-effect covariance models (Cholesky path)
+# --------------------------------------------------------------------------- #
+class TestHoleEffectModels:
+    def test_expcos_runs(self):
+        # PD only for a gentle oscillation: beta <= alpha (period >= 2*pi/alpha)
+        g = torch.Generator().manual_seed(0)
+        f = correlated_noise_cholesky(20, 20, 3.0, 1 / 3000.0, N=4, model="expcos",
+                                      beta=2 * math.pi / 25000.0, psizex=500.0,
+                                      psizey=500.0, generator=g, jitter=1e-4)
+        assert torch.isfinite(f).all()
+
+    def test_ebessel_runs(self):
+        g = torch.Generator().manual_seed(0)
+        f = correlated_noise_cholesky(24, 24, 3.0, 1 / 5000.0, N=4, model="ebessel",
+                                      bessel_w=30000.0, psizex=500.0, psizey=500.0,
+                                      generator=g, jitter=1e-3)
+        assert torch.isfinite(f).all()
+
+    def test_hole_effect_differs_from_exponential(self):
+        g = lambda: torch.Generator().manual_seed(0)
+        exp = correlated_noise_cholesky(20, 20, 3.0, 1 / 5000.0, N=4, psizex=500.0,
+                                        psizey=500.0, generator=g())
+        eb = correlated_noise_cholesky(20, 20, 3.0, 1 / 5000.0, N=4, model="ebessel",
+                                       bessel_w=30000.0, psizex=500.0, psizey=500.0,
+                                       generator=g(), jitter=1e-3)
+        assert not torch.allclose(exp, eb)
+
+    def test_missing_params_and_unknown_model_raise(self):
+        with pytest.raises(ValueError, match="expcos"):
+            correlated_noise_cholesky(16, 16, 1.0, 1 / 1000.0, N=1, model="expcos")
+        with pytest.raises(ValueError, match="ebessel"):
+            correlated_noise_cholesky(16, 16, 1.0, 1 / 1000.0, N=1, model="ebessel")
+        with pytest.raises(ValueError, match="unknown model"):
+            correlated_noise_cholesky(16, 16, 1.0, 1 / 1000.0, N=1, model="bogus")
+
+
+# --------------------------------------------------------------------------- #
+# covariance estimation
+# --------------------------------------------------------------------------- #
+class TestCovarianceEstimation:
+    def _field(self, cl, N=32, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        return correlated_noise_cholesky(48, 48, 4.0, 1 / cl, N=N,
+                                         psizex=300.0, psizey=300.0, generator=g)
+
+    def test_covariance_curve_shape(self):
+        f = self._field(3000.0)
+        d, cov = covariance_vs_distance(f, psizex=300.0, psizey=300.0)
+        assert d.shape[0] == cov.shape[1]
+        assert cov.shape[0] == f.shape[0]
+        # zero-lag bin ~ variance, and covariance decreases with distance
+        cov_m = cov.mean(0)
+        var = (f - f.mean(dim=(-2, -1), keepdim=True)).pow(2).mean()
+        assert cov_m[0].item() == pytest.approx(var.item(), rel=0.05)
+        assert cov_m[0] > cov_m[5] > cov_m[-1]
+
+    def test_roundtrip_recovers_parameters(self):
+        """demean=False on a zero-mean exponential field recovers (var, corr_len)."""
+        f = self._field(3000.0, N=32)
+        var, cl = fit_exponential_covariance(f, psizex=300.0, psizey=300.0, demean=False)
+        assert var.mean().item() == pytest.approx(4.0, rel=0.3)
+        assert cl.mean().item() == pytest.approx(3000.0, rel=0.3)
+
+    def test_estimate_is_monotonic_in_true_correlation_length(self):
+        cls = [1500.0, 3000.0, 6000.0]
+        ests = []
+        for cl in cls:
+            _, est = fit_exponential_covariance(self._field(cl, N=32), psizex=300.0,
+                                                psizey=300.0, demean=False)
+            ests.append(est.mean().item())
+        assert ests[0] < ests[1] < ests[2]
+
+    def test_accepts_2d_input(self):
+        f = self._field(3000.0, N=1)[0]            # [H, W]
+        d, cov = covariance_vs_distance(f, psizex=300.0, psizey=300.0)
+        assert cov.shape == d.shape                 # 1-D, no batch axis
+        var, cl = fit_exponential_covariance(f, psizex=300.0, psizey=300.0)
+        assert var.ndim == 0 and cl.ndim == 0
 
 
 if __name__ == "__main__":
