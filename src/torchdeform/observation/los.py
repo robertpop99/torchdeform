@@ -28,6 +28,7 @@ import torch
 from torch import Tensor
 
 from ..core import LOSVector, DeviceLikeType, ECEF
+from ..geometry.coordinates import _ecef_to_geodetic
 
 # ---------------------------------------------------------------------------
 # Sentinel-1 IW realistic parameter ranges (for random sampling in training)
@@ -287,6 +288,13 @@ def _los_vector_from_satellite(
     -------
     LOSVector
         Unit LOS vectors in the local ENU frame.
+
+    Notes
+    -----
+    The ENU frame uses the geodetic (ellipsoidal) normal at each ground point,
+    consistent with :func:`~torchdeform.geometry.coordinates.ecef_to_local_enu`,
+    so the incidence angle is referenced to the local vertical of the WGS84
+    ellipsoid rather than the geocentric radial direction.
     """
     sat_xyz = torch.as_tensor(sat_xyz,device=device,dtype=dtype)
     ground_xyz = torch.as_tensor(ground_xyz,device=device,dtype=dtype)
@@ -294,56 +302,30 @@ def _los_vector_from_satellite(
     # Expand satellite position to pixels.
     sat_xyz = sat_xyz[:, None, :]  # [B,1,3]
 
-    # LOS in ECEF.
+    # Unit LOS in ECEF, pointing ground -> satellite.
     los_ecef = sat_xyz - ground_xyz  # [B,N,3]
-
     los_ecef = los_ecef / torch.linalg.norm(
         los_ecef,
         dim=-1,
         keepdim=True,
     )
 
-    # Local ENU basis from geocentric normal.
-    up = ground_xyz / torch.linalg.norm(
-        ground_xyz,
-        dim=-1,
-        keepdim=True,
-    )
+    lx = los_ecef[..., 0]
+    ly = los_ecef[..., 1]
+    lz = los_ecef[..., 2]
 
-    z = torch.zeros_like(up[..., 0])
-    east_ref = torch.stack(
-        (-ground_xyz[..., 1],
-         ground_xyz[..., 0],
-         z),
-        dim=-1,
-    )
+    # Geodetic ENU basis at each ground point (ellipsoidal normal). This is the
+    # transpose of the ECEF->ENU rotation in _ecef_to_local_enu, applied to a
+    # direction (no translation), so the result is consistent with that frame.
+    lat, lon, _ = _ecef_to_geodetic(ground_xyz)   # [B,N], radians
+    sin_lat = torch.sin(lat)
+    cos_lat = torch.cos(lat)
+    sin_lon = torch.sin(lon)
+    cos_lon = torch.cos(lon)
 
-    east = east_ref / torch.linalg.norm(
-        east_ref,
-        dim=-1,
-        keepdim=True,
-    )
-
-    north = torch.cross(
-        up,
-        east,
-        dim=-1,
-    )
-
-    los_e = torch.sum(
-        los_ecef * east,
-        dim=-1,
-    )
-
-    los_n = torch.sum(
-        los_ecef * north,
-        dim=-1,
-    )
-
-    los_u = torch.sum(
-        los_ecef * up,
-        dim=-1,
-    )
+    los_e = -sin_lon * lx + cos_lon * ly
+    los_n = -sin_lat * cos_lon * lx - sin_lat * sin_lon * ly + cos_lat * lz
+    los_u = cos_lat * cos_lon * lx + cos_lat * sin_lon * ly + sin_lat * lz
 
     return LOSVector(
         e=los_e,
@@ -353,6 +335,25 @@ def _los_vector_from_satellite(
 
 
 def los_vector_from_satellite(satellite: ECEF, ground: ECEF) -> LOSVector:
+    """Per-pixel LOS vectors from explicit satellite and ground ECEF positions.
+
+    The most physically faithful entry point: no flat/curved-Earth incidence
+    model, just the exact geometry between each ground point and the satellite,
+    expressed in the local geodetic ENU frame (ground -> satellite, positive
+    toward the satellite).
+
+    Parameters
+    ----------
+    satellite : ECEF
+        Satellite position, ``[B]`` per component (one per image).
+    ground : ECEF
+        Ground positions, ``[B, N]`` per component.
+
+    Returns
+    -------
+    LOSVector
+        Unit LOS vectors ``[B, N]`` in the local ENU frame.
+    """
     dtype = satellite.dtype
     if dtype is None:
         dtype = torch.float64

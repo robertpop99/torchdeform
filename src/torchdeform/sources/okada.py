@@ -1,3 +1,38 @@
+"""
+Okada (1992) rectangular finite-fault dislocation model, differentiable.
+
+A PyTorch port of Okada's classic ``DC3D`` Fortran routine for the surface (and
+sub-surface) displacement of a uniform-slip rectangular dislocation in an
+elastic half-space -- the workhorse model for earthquake/fault deformation. It
+handles strike-slip, dip-slip and tensile (opening) components.
+
+Two public source classes are provided:
+
+* :class:`OkadaSource` -- the general model for arbitrary observation depth
+  ``z <= 0``; assembles the real-source, image-source and depth (UA/UB/UC)
+  contributions exactly as ``DC3D`` does.
+* :class:`OkadaSourceSimple` -- the surface-only (``z = 0``) specialisation, in
+  which the UA and UC terms cancel/drop and only UB remains; cheaper when you
+  only need surface displacement.
+
+Structure
+---------
+The file mirrors the Fortran sub-routine decomposition. ``dccon0`` precomputes
+medium/dip constants (:class:`DCCon0`); ``dccon1``/``dccon2`` precompute the
+per-observation geometry (:class:`DCCon1`/:class:`DCCon2`); ``ua_displacement``,
+``ub_displacement`` and ``uc_displacement_*`` evaluate the three displacement
+kernels. The leading ``_soft_*`` / ``_safe_*`` helpers are smooth
+regularisations of the hard ``abs``/``max``/branch operations.
+
+Differentiability / ``training_safe``
+-------------------------------------
+The exact Fortran logic contains hard branches and zero-snapping at geometric
+singularities (vertical dip, fault edges, ``r + d -> 0``) that produce
+non-finite or discontinuous gradients. Passing ``training_safe=True`` replaces
+those with smooth blends/attenuations, trading a tiny accuracy loss away from
+the singular manifolds for finite, well-behaved gradients during optimisation.
+The handful of ``*_EPS`` module constants set the regularisation scales.
+"""
 import torch
 from dataclasses import dataclass
 import math
@@ -304,6 +339,13 @@ def dccon1(
 
 @dataclass(slots=True)
 class DCCon2:
+    """
+    Per-observation geometry constants for Okada finite-source terms.
+
+    Corresponds to ``DCCON2`` in ``DC3D.f``; produced by :func:`dccon2` and
+    consumed by the UA/UB/UC displacement kernels. All fields are
+    broadcast-compatible tensors over the corner/observation grid.
+    """
 
     xi: torch.Tensor
     et: torch.Tensor
@@ -509,6 +551,7 @@ def dccon2(
 
 @dataclass(slots=True)
 class UADisplacement:
+    """UA (infinite-medium) displacement kernel output; fault-frame ``ux/uy/uz``."""
     ux: torch.Tensor
     uy: torch.Tensor
     uz: torch.Tensor
@@ -662,6 +705,7 @@ def ua_displacement(
 
 @dataclass(slots=True)
 class UBDisplacement:
+    """UB (half-space surface) displacement kernel output; fault-frame ``ux/uy/uz``."""
     ux: torch.Tensor
     uy: torch.Tensor
     uz: torch.Tensor
@@ -906,6 +950,11 @@ def ub_displacement(
 
 @dataclass(slots=True)
 class UCResult:
+    """UC (depth-dependent) kernel output: 3 displacements + 9 spatial derivatives.
+
+    Field order matches the Fortran ``DC3D`` UC output: ``ux, uy, uz`` followed
+    by the derivatives ``u{x,y,z}{x,y,z}``.
+    """
     ux: torch.Tensor
     uy: torch.Tensor
     uz: torch.Tensor
@@ -927,8 +976,6 @@ def uc_displacement_and_derivatives(
     disl3: torch.Tensor,
     c0: DCCon0,
     c2: DCCon2,
-    *,
-    num_eps: float = 1e-12,
 ):
     """
     PyTorch translation of Okada finite-fault UC subroutine.
@@ -943,8 +990,6 @@ def uc_displacement_and_derivatives(
         Output of dccon0(...)
     c2 : DCCon2
         Output of dccon2(...)
-    num_eps : float
-        Numerical guard for denominator safety only.
 
     Returns
     -------
@@ -1175,6 +1220,7 @@ def uc_displacement_and_derivatives(
 
 @dataclass(slots=True)
 class UCDisplacement:
+    """UC kernel displacement only (the three components, no derivatives)."""
     ux: torch.Tensor
     uy: torch.Tensor
     uz: torch.Tensor
@@ -1187,9 +1233,12 @@ def uc_displacement_only(
         disl3: torch.Tensor,
         c0: DCCon0,
         c2: DCCon2,
-        *,
-        num_eps: float = 1e-12
 ):
+    """Convenience wrapper returning only the UC displacement (no derivatives).
+
+    Calls :func:`uc_displacement_and_derivatives` and keeps just the three
+    displacement components as a :class:`UCDisplacement`.
+    """
     full = uc_displacement_and_derivatives(
         z=z,
         disl1=disl1,
@@ -1197,7 +1246,6 @@ def uc_displacement_only(
         disl3=disl3,
         c0=c0,
         c2=c2,
-        num_eps=num_eps,
     )
     return UCDisplacement(
         ux=full.ux,
@@ -1206,7 +1254,74 @@ def uc_displacement_only(
     )
 
 
-class OkadaSource(SourceModel):
+class _OkadaBase(SourceModel):
+    """
+    Shared configuration for the Okada source models.
+
+    Holds the common constructor (elastic/dip constants and the regularisation
+    epsilons) and the centroid-based fault-geometry helper used by both
+    :class:`OkadaSource` and :class:`OkadaSourceSimple`. Not meant to be
+    instantiated directly -- it leaves ``forward`` abstract.
+    """
+
+    def __init__(
+        self,
+        poisson_ratio: float = 0.25,
+        internal_dtype: torch.dtype = torch.float64,
+        training_safe: bool = False,
+        num_eps: float = NUM_EPS,
+        geom_eps: float = GEOM_EPS,
+        rd_eps: float = RD_EPS,
+        smooth_eps: float = 1e-8,
+        blend_eps: float = 1e-4,
+    ):
+        """
+        Parameters
+        ----------
+        poisson_ratio : float, default 0.25
+            Poisson's ratio of the elastic half-space (sets ``alpha``).
+        internal_dtype : torch.dtype, default torch.float64
+            Dtype used for the internal computation; inputs are cast to it.
+        training_safe : bool, default False
+            If True, replace the hard singularity branches with smooth
+            blends/attenuations so gradients stay finite (see module docstring).
+        num_eps : float, default NUM_EPS
+            Numerical guard for denominators/logs/sqrt.
+        geom_eps : float, default GEOM_EPS
+            Geometric "treat as zero" threshold for the exact-mode branches.
+        rd_eps : float, default RD_EPS
+            Guard for the ``r + d -> 0`` singularity in the UB kernel.
+        smooth_eps : float, default 1e-8
+            Smoothing scale for the ``training_safe`` reciprocals/divisions.
+        blend_eps : float, default 1e-4
+            Smoothing scale for the ``training_safe`` ``cd != 0`` / ``cd ~ 0`` blend.
+        """
+        super().__init__()
+        self.alpha = 1.0 / (2.0 * (1.0 - poisson_ratio))
+        self.internal_dtype = internal_dtype
+        self.training_safe = training_safe
+        self.num_eps = num_eps
+        self.geom_eps = geom_eps
+        self.rd_eps = rd_eps
+        self.smooth_eps = smooth_eps
+        self.blend_eps = blend_eps
+
+    @staticmethod
+    def _fault_geometry(centroid_depth, length, width):
+        """Centroid-based fault corners ``(al1, al2, aw1, aw2, depth)``.
+
+        Along-strike half-lengths ``al1/al2 = -/+ length/2`` and down-dip
+        half-widths ``aw1/aw2 = -/+ width/2``; depth is the centroid depth.
+        """
+        al1 = -0.5 * length
+        al2 = +0.5 * length
+        aw1 = -0.5 * width
+        aw2 = +0.5 * width
+        depth = centroid_depth
+        return al1, al2, aw1, aw2, depth
+
+
+class OkadaSource(_OkadaBase):
     """
     General finite-fault Okada displacement model for arbitrary observation depth z.
 
@@ -1222,49 +1337,8 @@ class OkadaSource(SourceModel):
         z > 0   invalid
 
     Input fault location (fault_x, fault_y) is the map location of the fault centroid.
+    Construction parameters are documented on :class:`_OkadaBase`.
     """
-
-
-    def __init__(
-        self,
-        poisson_ratio: float = 0.25,
-        internal_dtype: torch.dtype = torch.float64,
-        training_safe: bool = False,
-        num_eps: float = NUM_EPS,
-        geom_eps: float = GEOM_EPS,
-        rd_eps: float = RD_EPS,
-        smooth_eps: float = 1e-8,
-        blend_eps: float = 1e-4,
-    ):
-        """
-        Okada Fault
-        :param poisson_ratio:
-        :param internal_dtype:
-        :param training_safe:
-        :param num_eps:
-        :param geom_eps:
-        :param rd_eps:
-        :param smooth_eps:
-        :param blend_eps:
-        """
-        super().__init__()
-        self.alpha = 1.0 / (2.0 * (1.0 - poisson_ratio))
-        self.internal_dtype = internal_dtype
-        self.training_safe = training_safe
-        self.num_eps = num_eps
-        self.geom_eps = geom_eps
-        self.rd_eps = rd_eps
-        self.smooth_eps = smooth_eps
-        self.blend_eps = blend_eps
-
-    @staticmethod
-    def _fault_geometry(centroid_depth, length, width):
-        al1 = -0.5 * length
-        al2 = +0.5 * length
-        aw1 = -0.5 * width
-        aw2 = +0.5 * width
-        depth = centroid_depth
-        return al1, al2, aw1, aw2, depth
 
     def forward(
         self,
@@ -1282,6 +1356,41 @@ class OkadaSource(SourceModel):
         disl2: Tensor,               # [B], meters
         disl3: Tensor,               # [B], meters
     ) -> Displacement:
+        """Displacement of a finite rectangular fault at observation depth ``z``.
+
+        Parameters
+        ----------
+        x_obs, y_obs : Tensor
+            East/north observation coordinates [B, N] in metres.
+        z_obs : Tensor
+            Observation depth [B] (or per-pixel [B, N]), Okada convention
+            ``z <= 0`` (0 at the surface, negative below). A positive value
+            raises ``ValueError``.
+        fault_x, fault_y : Tensor
+            Map position of the fault centroid [B] in metres.
+        dip, strike : Tensor
+            Fault dip and strike [B] in radians.
+        centroid_depth : Tensor
+            Depth of the fault centroid [B] in metres (positive down).
+        length, width : Tensor
+            Fault length (along strike) and width (down dip) [B] in metres.
+        disl1, disl2, disl3 : Tensor
+            Strike-slip, dip-slip and tensile (opening) dislocations [B] in metres.
+
+        Returns
+        -------
+        Displacement
+            ENU displacement [B, N] in metres. Points on the dislocation
+            singularity are zeroed.
+        """
+        self._validate_inputs(
+            x_obs, y_obs,
+            {"fault_x": fault_x, "fault_y": fault_y, "dip": dip,
+             "strike": strike, "centroid_depth": centroid_depth,
+             "length": length, "width": width,
+             "disl1": disl1, "disl2": disl2, "disl3": disl3},
+        )
+
         dtype = self.internal_dtype
 
         x_obs = x_obs.to(dtype)
@@ -1504,7 +1613,6 @@ class OkadaSource(SourceModel):
             disl3=disl3,
             c0=c0,
             c2=c2_img,
-            num_eps=self.num_eps,
         )
 
         # -------------------------------------------------
@@ -1593,47 +1701,21 @@ class OkadaSource(SourceModel):
         )
 
 
-class OkadaSourceSimple(SourceModel):
-    def __init__(
-        self,
-        poisson_ratio: float = 0.25,
-        internal_dtype: torch.dtype = torch.float64,
-        training_safe: bool = False,
-        num_eps: float = NUM_EPS,
-        geom_eps: float = GEOM_EPS,
-        rd_eps: float = RD_EPS,
-        smooth_eps: float = 1e-8,
-        blend_eps: float = 1e-4,
-    ):
-        """
-        Simplification of the Okada Fault for the case Z = 0
-        :param poisson_ratio:
-        :param internal_dtype:
-        :param training_safe:
-        :param num_eps:
-        :param geom_eps:
-        :param rd_eps:
-        :param smooth_eps:
-        :param blend_eps:
-        """
-        super().__init__()
-        self.alpha = 1.0 / (2.0 * (1.0 - poisson_ratio))
-        self.internal_dtype = internal_dtype
-        self.training_safe = training_safe
-        self.num_eps = num_eps
-        self.geom_eps = geom_eps
-        self.rd_eps = rd_eps
-        self.smooth_eps = smooth_eps
-        self.blend_eps = blend_eps
+class OkadaSourceSimple(_OkadaBase):
+    """
+    Surface-only (``z = 0``) specialisation of :class:`OkadaSource`.
 
-    @staticmethod
-    def _fault_geometry(centroid_depth, length, width):
-        al1 = -0.5 * length
-        al2 = +0.5 * length
-        aw1 = -0.5 * width
-        aw2 = +0.5 * width
-        depth = centroid_depth
-        return al1, al2, aw1, aw2, depth
+    When the observation depth is exactly zero the real-source and image-source
+    UA terms cancel and the depth-dependent UC term drops out, leaving only the
+    UB contribution. This class evaluates that reduced form -- numerically
+    identical to :class:`OkadaSource` at the surface but cheaper, since it skips
+    the real-source and UA/UC kernels.
+
+    Conventions are the same as :class:`OkadaSource`: centroid-based geometry,
+    ``(fault_x, fault_y)`` the map location of the fault centroid, distances in
+    metres and dip/strike in radians. Construction parameters are documented on
+    :class:`_OkadaBase`.
+    """
 
     def forward(
             self,
@@ -1650,6 +1732,39 @@ class OkadaSourceSimple(SourceModel):
             disl2: Tensor,  # [B], meters
             disl3: Tensor,  # [B], meters
     ) -> Displacement:
+        """Surface displacement of a finite rectangular fault (``z = 0``).
+
+        Same parameters as :meth:`OkadaSource.forward` but without ``z_obs``
+        (the observation depth is fixed at the surface).
+
+        Parameters
+        ----------
+        x_obs, y_obs : Tensor
+            East/north observation coordinates [B, N] in metres.
+        fault_x, fault_y : Tensor
+            Map position of the fault centroid [B] in metres.
+        dip, strike : Tensor
+            Fault dip and strike [B] in radians.
+        centroid_depth : Tensor
+            Depth of the fault centroid [B] in metres (positive down).
+        length, width : Tensor
+            Fault length (along strike) and width (down dip) [B] in metres.
+        disl1, disl2, disl3 : Tensor
+            Strike-slip, dip-slip and tensile (opening) dislocations [B] in metres.
+
+        Returns
+        -------
+        Displacement
+            ENU surface displacement [B, N] in metres; singular points zeroed.
+        """
+        self._validate_inputs(
+            x_obs, y_obs,
+            {"fault_x": fault_x, "fault_y": fault_y, "dip": dip,
+             "strike": strike, "centroid_depth": centroid_depth,
+             "length": length, "width": width,
+             "disl1": disl1, "disl2": disl2, "disl3": disl3},
+        )
+
         dtype = self.internal_dtype
 
         x_obs = x_obs.to(dtype)
@@ -1823,3 +1938,64 @@ class OkadaSourceSimple(SourceModel):
             n=un,
             u=uu,
         )
+
+
+# Geophysical fault parameter names consumed by okada_params_from_fault.
+_FAULT_PARAM_KEYS = (
+    "strike", "dip", "rake", "slip", "opening", "top_depth", "length", "width",
+)
+
+
+def okada_params_from_fault(params: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Convert geophysical fault parameters to :class:`OkadaSource` inputs.
+
+    Bridges the constraint-friendly, intuitive parametrisation sampled by an
+    :class:`~torchdeform.simulation.OkadaPrior` to the kwargs the Okada source
+    models actually consume. This is pure geometry (no ML / normalisation), so it
+    is reusable independently of the priors.
+
+    The conversion is::
+
+        strike, dip   <- degrees -> radians
+        disl1 = slip * cos(rake)      # strike-slip
+        disl2 = slip * sin(rake)      # dip-slip
+        disl3 = opening               # tensile
+        centroid_depth = top_depth + 0.5 * width * sin(dip)
+
+    Parameters
+    ----------
+    params : dict[str, Tensor]
+        Must contain ``strike``, ``dip``, ``rake`` (degrees), ``slip``,
+        ``opening`` (m), ``top_depth``, ``length``, ``width`` (m) -- e.g. the
+        output of ``OkadaPrior.sample(...)``. Any other keys (e.g. ``fault_x``,
+        ``fault_y``) are passed through unchanged.
+
+    Returns
+    -------
+    dict[str, Tensor]
+        ``strike`` and ``dip`` in radians, plus ``centroid_depth``, ``length``,
+        ``width``, ``disl1``, ``disl2``, ``disl3`` -- ready to splat into
+        ``OkadaSource.forward`` / ``OkadaSourceSimple.forward`` alongside the
+        observation coordinates and ``fault_x`` / ``fault_y``.
+    """
+    strike = torch.deg2rad(params["strike"])
+    dip = torch.deg2rad(params["dip"])
+    rake = torch.deg2rad(params["rake"])
+    slip = params["slip"]
+    width = params["width"]
+
+    out: dict[str, Tensor] = {
+        "strike": strike,
+        "dip": dip,
+        "length": params["length"],
+        "width": width,
+        "centroid_depth": params["top_depth"] + 0.5 * width * torch.sin(dip),
+        "disl1": slip * torch.cos(rake),
+        "disl2": slip * torch.sin(rake),
+        "disl3": params["opening"],
+    }
+    # Pass through anything that isn't a recognised fault parameter (e.g. location).
+    for k, v in params.items():
+        if k not in _FAULT_PARAM_KEYS:
+            out[k] = v
+    return out

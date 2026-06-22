@@ -1,3 +1,25 @@
+"""
+Penny-shaped (circular) crack source, differentiable.
+
+Surface displacement from a pressurised horizontal penny-shaped crack in an
+elastic half-space (Fialko et al., 2001) -- a sill-like analogue to the Mogi
+point source that captures the flatter, broader signal of a shallow horizontal
+intrusion. There is no closed form: the solution reduces to a Fredholm integral
+equation, which is discretised with Gauss-Legendre quadrature, solved as a dense
+linear system, and integrated over the crack. Every step is implemented with
+batched tensor ops and a linear solve, so the whole model is differentiable in
+the source parameters.
+
+Pipeline (all batched over ``B`` source instances)
+-------------------------------------------------
+1. ``build_quadrature`` -- Gauss-Legendre nodes/weights on ``[0, 1]`` (16-point
+   rule, ``ROOT16``/``WEIGHT16``, subdivided into ``nis`` panels).
+2. ``fpkernel_vec`` / ``kg`` / ``kern`` -- the integral-equation kernels.
+3. ``fredholm_solve_differentiable`` -- solves for the auxiliary functions
+   ``fi``, ``psi`` via :func:`torch.linalg.solve`.
+4. ``q_all`` + ``intgr_batched`` -- integrate to get dimensionless vertical and
+   radial displacement, which :class:`PennySource` rescales to metres.
+"""
 import math
 import torch
 from torch import Tensor
@@ -48,12 +70,21 @@ WEIGHT16 = torch.tensor([
 
 
 def kg(s, p):
+    """Elementary kernel term ``(3p - s^2) / (p + s^2)^3`` used by ``fpkernel_vec``.
+
+    ``s`` and ``p`` are broadcast-compatible tensors (``p = 4 h^2``).
+    """
     z = s * s
     y = p + z
     return (3.0 * p - z) / (y ** 3)
 
 
 def kern(w, p):
+    """Elementary kernel term ``2 (p^2/2 + w^4 - p w^2/2) / (p + w^2)^3``.
+
+    Companion to :func:`kg`, used to assemble the ``n = 2`` (KN1) kernel.
+    ``w`` and ``p`` are broadcast-compatible tensors.
+    """
     u = (p + w * w) ** 3
     return 2.0 * (0.5 * p * p + w**4 - 0.5 * p * w * w) / u
 
@@ -352,6 +383,33 @@ class PennySource(SourceModel):
         radius: Tensor,     # [B]
         pressure: Tensor,   # [B]
     ) -> Displacement:
+        """Surface displacement from a pressurised penny-shaped crack.
+
+        Parameters
+        ----------
+        x_obs, y_obs : Tensor
+            East/north observation coordinates [B, N] in metres.
+        source_x, source_y : Tensor
+            East/north position of the crack centre [B] in metres.
+        depth : Tensor
+            Depth of the crack centre [B] in metres (positive down).
+        radius : Tensor
+            Crack radius [B] in metres.
+        pressure : Tensor
+            Excess (boundary) pressure [B] in Pa; scaled by the configured shear
+            modulus and Poisson ratio.
+
+        Returns
+        -------
+        Displacement
+            ENU surface displacement [B, N] in metres.
+        """
+        self._validate_inputs(
+            x_obs, y_obs,
+            {"source_x": source_x, "source_y": source_y, "depth": depth,
+             "radius": radius, "pressure": pressure},
+        )
+
         dtype = self.internal_dtype
         device = x_obs.device
 

@@ -1,3 +1,12 @@
+"""
+Mogi point-source deformation model.
+
+Implements the classic Mogi (1958) solution for the surface displacement caused
+by a point pressure/volume change in an elastic half-space -- the standard
+first-order model for an inflating/deflating magma chamber. The implementation
+is batched and differentiable in both the observation coordinates and the source
+parameters. See :class:`MogiSource`.
+"""
 import math
 import torch
 from torch import Tensor
@@ -38,6 +47,30 @@ class MogiSource(SourceModel):
         depth: Tensor,      # [B] or [B, N], positive downward (m)
         delta_v: Tensor,    # [B] volume change (m^3)
     ) -> Displacement:
+        """Surface displacement from a Mogi point source.
+
+        Parameters
+        ----------
+        x_obs, y_obs : Tensor
+            East/north observation coordinates [B, N] in metres.
+        source_x, source_y : Tensor
+            East/north position of the source [B] in metres.
+        depth : Tensor
+            Source depth [B] (or per-pixel [B, N]), positive downward, metres.
+        delta_v : Tensor
+            Volume change [B] in m^3 (positive = inflation).
+
+        Returns
+        -------
+        Displacement
+            ENU surface displacement [B, N] in metres.
+        """
+        self._validate_inputs(
+            x_obs, y_obs,
+            {"source_x": source_x, "source_y": source_y,
+             "depth": depth, "delta_v": delta_v},
+        )
+
         dtype = self.internal_dtype
 
         x_obs = x_obs.to(dtype)

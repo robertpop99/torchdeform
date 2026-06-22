@@ -113,6 +113,28 @@ def spectral_filter(
 
     The absolute scale is irrelevant (the field is renormalised to ``rms``),
     only the shape in k matters. DC is zeroed so the field has zero mean.
+
+    Parameters
+    ----------
+    rows, cols : int
+        Grid shape of the field the filter will be applied to.
+    psizex, psizey : float
+        Pixel spacing along x/y (same length units as ``correlation_length``);
+        sets the physical scale of the wavenumber grid.
+    model : {'powerlaw', 'exponential'}
+        Power-spectrum shape (see module docstring).
+    beta : float
+        Power-law slope (``model='powerlaw'``); 8/3 is Kolmogorov.
+    correlation_length : float, optional
+        e-folding length of the covariance (``model='exponential'``); required
+        for that model, must be > 0.
+    device, dtype
+        Device/dtype of the returned filter.
+
+    Returns
+    -------
+    torch.Tensor
+        Real ``sqrt(PSD)`` filter on the rfft2 half-spectrum grid.
     """
     k = _radial_wavenumber(rows, cols, psizey, psizex, device, dtype)
     if model == "powerlaw":
@@ -154,6 +176,27 @@ class TurbulentAPS(nn.Module):
         internal_dtype: torch.dtype = torch.float64,
         num_eps: float = 1e-12,
     ):
+        """Precompute the spectral filter for a fixed grid and spectrum.
+
+        Parameters
+        ----------
+        rows, cols : int
+            Output screen shape.
+        psizex, psizey : float
+            Ground pixel spacing (metres); see :func:`spectral_filter`.
+        model : {'powerlaw', 'exponential'}
+            Power-spectrum shape (see module docstring).
+        beta : float
+            Power-law slope (``model='powerlaw'``); 8/3 is Kolmogorov.
+        correlation_length : float, optional
+            e-folding length (``model='exponential'``), must be > 0.
+        device : DeviceLikeType, optional
+            Device the cached ``filt`` buffer lives on.
+        internal_dtype : torch.dtype
+            Dtype used for the filter and the FFTs in :meth:`forward`.
+        num_eps : float
+            Floor on the per-image std when renormalising to ``rms``.
+        """
         super().__init__()
         self.rows = rows
         self.cols = cols
@@ -208,7 +251,14 @@ def turbulent_aps(
     generator: Optional[torch.Generator] = None,
     noise: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Functional one-shot wrapper around :class:`TurbulentAPS`."""
+    """Functional one-shot wrapper around :class:`TurbulentAPS`.
+
+    Builds a :class:`TurbulentAPS` and calls it once; convenient when you don't
+    want to keep the generator around. Constructor arguments (``rows``, ``cols``,
+    ``psize*``, ``model``, ``beta``, ``correlation_length``) match
+    :class:`TurbulentAPS`; ``batch``, ``rms``, ``generator`` and ``noise`` match
+    :meth:`TurbulentAPS.forward`. Returns ``[batch, rows, cols]``.
+    """
     gen = TurbulentAPS(rows, cols, psizex, psizey, model, beta,
                        correlation_length, device=device, internal_dtype=dtype)
     return gen(batch, rms=rms, generator=generator, noise=noise)
@@ -233,6 +283,21 @@ def correlated_noise_cholesky(
 
     Builds the full ``n x n`` covariance ``maxvar * exp(-alpha * r)`` and draws
     correlated noise via Cholesky. Returns ``[N, rows, cols]``.
+
+    Parameters
+    ----------
+    rows, cols : int
+        Grid shape (``n = rows * cols``).
+    maxvar : float
+        Variance at zero lag (the ``exp(-alpha r)`` covariance amplitude).
+    alpha : float
+        Inverse correlation length (1/length); larger = decorrelates faster.
+    N : int
+        Number of independent screens to draw.
+    psizex, psizey : float
+        Pixel spacing used to compute inter-pixel distances ``r``.
+    device, dtype, generator
+        Standard tensor placement / RNG controls.
 
     WARNING: O(n^2) memory, O(n^3) compute with n = rows*cols. Usable only for
     tiny grids (<= ~64x64). Use :class:`TurbulentAPS` for anything real; this
@@ -277,6 +342,24 @@ def stratified_aps(
     ``reference`` selects ``h_ref`` / ``t_ref``: per-image ``"mean"`` (default,
     zero-mean screen), ``"min"``, ``None`` (=0), or a reference elevation float.
     Differentiable in both ``dem`` and ``coeff``.
+
+    Parameters
+    ----------
+    dem : torch.Tensor
+        Elevation in metres, ``[H, W]`` or ``[B, H, W]``.
+    coeff : float or torch.Tensor
+        Signed per-image stratification coefficient (scalar or ``[B]``); rad/m
+        for ``model='linear'``, rad for ``model='exponential'``. ``dem`` and
+        ``coeff`` are broadcast to a common batch (mismatch raises ``ValueError``).
+    model : {'linear', 'exponential'}
+        Phase-elevation relation (see module docstring for guidance).
+    scale_height : float
+        Tropospheric scale height ``H_s`` in metres (exponential model only).
+    reference : {'mean', 'min', None} or float
+        What to subtract so the screen is referenced sensibly; a float is a
+        reference elevation in metres.
+    device, dtype
+        Tensor placement for the computation/output.
     """
     dem = torch.as_tensor(dem, device=device, dtype=dtype)
     if dem.ndim == 2:
@@ -312,7 +395,11 @@ def stratified_aps(
 
 
 class StratifiedAPS(nn.Module):
-    """Module wrapper around :func:`stratified_aps` (symmetry with TurbulentAPS)."""
+    """Module wrapper around :func:`stratified_aps` (symmetry with TurbulentAPS).
+
+    Stores the model configuration so the screen can be produced from just
+    ``(dem, coeff)`` at call time.
+    """
 
     def __init__(
         self,
@@ -321,6 +408,19 @@ class StratifiedAPS(nn.Module):
         reference: Union[str, float, None] = "mean",
         internal_dtype: torch.dtype = torch.float64,
     ):
+        """Configure the stratified model.
+
+        Parameters
+        ----------
+        model : {'linear', 'exponential'}
+            Phase-elevation relation (see :func:`stratified_aps`).
+        scale_height : float
+            Tropospheric scale height in metres (exponential model only).
+        reference : {'mean', 'min', None} or float
+            Reference subtracted from the transformed elevation.
+        internal_dtype : torch.dtype
+            Dtype used for the computation.
+        """
         super().__init__()
         self.model = model
         self.scale_height = scale_height
@@ -328,6 +428,10 @@ class StratifiedAPS(nn.Module):
         self.internal_dtype = internal_dtype
 
     def forward(self, dem: torch.Tensor, coeff: Union[float, torch.Tensor]) -> torch.Tensor:
+        """Return the stratified screen ``[B, H, W]`` for ``dem`` and ``coeff``.
+
+        See :func:`stratified_aps` for the meaning of ``dem`` and ``coeff``.
+        """
         return stratified_aps(dem, coeff, self.model, self.scale_height,
                               self.reference, device=None, dtype=self.internal_dtype)
 
@@ -341,7 +445,28 @@ def sample_stratified_coeff(
     device: Optional[DeviceLikeType] = "cpu",
     dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
-    """Sample a signed per-image stratification coefficient ``[batch]``."""
+    """Sample a signed per-image stratification coefficient ``[batch]``.
+
+    Parameters
+    ----------
+    batch : int
+        Number of coefficients to draw.
+    model : {'linear', 'exponential'}
+        Selects which range is used: ``k_range`` for linear, ``a_range`` for
+        exponential.
+    k_range : tuple[float, float]
+        Coefficient range for the linear model (rad/m); sampled uniformly.
+    a_range : tuple[float, float]
+        Amplitude range for the exponential model (rad); sampled uniformly.
+    generator, device, dtype
+        Standard RNG / tensor placement controls.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[batch]`` signed coefficients, ready to pass as ``coeff`` to
+        :func:`stratified_aps`.
+    """
     lo, hi = k_range if model == "linear" else a_range
     return lo + (hi - lo) * torch.rand(batch, generator=generator,
                                        device=device, dtype=dtype)
@@ -355,7 +480,23 @@ def atmospheric_phase_screen(
     scale_height: float = 6000.0,
     reference: Union[str, float, None] = "mean",
 ) -> torch.Tensor:
-    """Full screen = turbulent + stratified, returned as ``[B, H, W]``."""
+    """Full screen = turbulent + stratified, returned as ``[B, H, W]``.
+
+    Convenience adder for a precomputed turbulent screen and a fresh stratified
+    one on the same grid.
+
+    Parameters
+    ----------
+    turbulent : torch.Tensor
+        Turbulent screen ``[B, H, W]`` (e.g. from :class:`TurbulentAPS`); its
+        device/dtype are reused for the stratified part.
+    dem : torch.Tensor
+        Elevation ``[H, W]`` or ``[B, H, W]`` (metres).
+    coeff : float or torch.Tensor
+        Stratification coefficient; see :func:`stratified_aps`.
+    model, scale_height, reference
+        Forwarded to :func:`stratified_aps`.
+    """
     strat = stratified_aps(dem, coeff, model, scale_height, reference,
                            device=turbulent.device, dtype=turbulent.dtype)
     return turbulent + strat

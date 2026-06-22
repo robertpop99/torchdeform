@@ -3,6 +3,8 @@ from .coordinates import (
     ecef_to_geodetic,
     ecef_to_local_enu,
     local_enu_to_ecef,
+    geodetic_to_local_enu,
+    local_enu_to_geodetic,
 )
 
 __all__ = [
@@ -10,4 +12,6 @@ __all__ = [
     "ecef_to_geodetic",
     "ecef_to_local_enu",
     "local_enu_to_ecef",
+    "geodetic_to_local_enu",
+    "local_enu_to_geodetic",
 ]

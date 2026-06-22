@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "torchdeform: differentiable synthetic deformation and atmosphere in PyTorch"
+abstract: >-
+  A PyTorch library for generating synthetic, fully differentiable InSAR-style
+  data: analytic deformation source models (Mogi, Okada finite fault,
+  penny-shaped crack), Sentinel-1 line-of-sight and phase observation operators,
+  and turbulent and topography-correlated atmospheric phase screens.
+type: software
+authors:
+  - given-names: Robert Gabriel Popescu
+    alias: robertpop99
+repository-code: "https://github.com/robertpop99/torchdeform"
+license: Apache-2.0
+version: 0.1.0
+keywords:
+  - InSAR
+  - deformation
+  - PyTorch
+  - differentiable
+  - geophysics
+  - atmosphere
