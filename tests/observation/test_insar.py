@@ -150,13 +150,13 @@ def test_phase_to_complex_is_wrap_invariant():
 # --------------------------------------------------------------------------- #
 def test_wrapped_phase_loss_zero_when_equal():
     p = torch.randn(3, 6, dtype=DTYPE)
-    assert wrapped_phase_loss(p, p.clone()) == pytest.approx(0.0, abs=1e-12)
+    assert wrapped_phase_loss(p, p.clone()).item() == pytest.approx(0.0, abs=1e-12)
 
 
 def test_wrapped_phase_loss_cycle_invariant():
     pred = torch.randn(4, 5, dtype=DTYPE)
     target = pred + 2.0 * math.pi * torch.randint(-2, 3, (4, 5)).to(DTYPE)
-    assert wrapped_phase_loss(pred, target) == pytest.approx(0.0, abs=1e-9)
+    assert wrapped_phase_loss(pred, target).item() == pytest.approx(0.0, abs=1e-9)
 
 
 def test_wrapped_phase_loss_reductions():
@@ -195,7 +195,7 @@ def test_wrapped_phase_loss_normalized_period_cycle_invariant():
     """With phase normalised to [-1, 1] (period=2), a 2-unit shift is one cycle."""
     pred = torch.rand(4, 6, dtype=DTYPE) * 2.0 - 1.0          # in [-1, 1]
     target = pred + 2.0 * torch.randint(-2, 3, (4, 6)).to(DTYPE)
-    assert wrapped_phase_loss(pred, target, period=2.0) == pytest.approx(0.0, abs=1e-9)
+    assert wrapped_phase_loss(pred, target, period=2.0).item() == pytest.approx(0.0, abs=1e-9)
     # the default (radians) period would NOT see these as equal
     assert wrapped_phase_loss(pred, target) > 1e-3
 
