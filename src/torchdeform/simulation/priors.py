@@ -23,7 +23,8 @@ for config-driven setups.
 Source priors
 -------------
 :class:`SourcePrior` subclasses (:class:`MogiPrior`, :class:`PennyPrior`,
-:class:`OkadaPrior`) bundle one named scalar prior per source parameter.
+:class:`OkadaPrior`, :class:`PCDMPrior`) bundle one named scalar prior per source
+parameter.
 :meth:`SourcePrior.sample` draws them all at once into a ``{name: tensor}`` dict
 whose keys are the parameters the matching source model consumes -- so
 ``model(**prior.sample(size))`` works directly. ``OkadaPrior`` samples in a
@@ -403,6 +404,53 @@ class OkadaPrior(SourcePrior):
     width: Prior
 
 
+@dataclass(slots=True)
+class PCDMPrior(SourcePrior):
+    """Prior over point compound dislocation model (pCDM) parameters.
+
+    Fields match :class:`~torchdeform.sources.PCDMSource` (minus the location):
+    ``depth``, the orientation angles ``omega_x/y/z`` (radians), and the three
+    potencies ``dv_x/y/z`` (m^3).
+
+    The potency priors should produce **positive magnitudes**; ``PCDMSource``
+    requires the three potencies to share a sign, which this prior enforces by
+    drawing one random sign per item and applying it to all three (so you get
+    both inflation and deflation). Set ``signed=False`` to keep them positive
+    (inflation only).
+    """
+
+    depth: Prior
+    omega_x: Prior
+    omega_y: Prior
+    omega_z: Prior
+    dv_x: Prior
+    dv_y: Prior
+    dv_z: Prior
+    signed: bool = True
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> dict[str, Tensor]:
+        """Sample the pCDM parameters, applying a shared sign to the potencies.
+
+        See :class:`SourcePrior.sample`; additionally, when ``signed`` is True a
+        single ``+/-1`` is drawn per item and multiplied into ``dv_x/y/z`` so the
+        three potencies always share a sign.
+        """
+        # NB: explicit base call -- zero-arg super() breaks under @dataclass(slots=True)
+        out = SourcePrior.sample(self, size, generator, device, dtype)
+        if self.signed:
+            u = torch.rand(size, generator=generator, device=device, dtype=dtype)
+            sign = 1.0 - 2.0 * (u < 0.5).to(dtype)      # +/-1, shared by the 3 potencies
+            for key in ("dv_x", "dv_y", "dv_z"):
+                out[key] = out[key] * sign
+        return out
+
+
 # --------------------------------------------------------------------------- #
 # Default priors (angles in degrees, lengths/depths in metres, slip/opening in
 # metres). One instance per source type, collected in DEFAULT_PRIORS. The Okada
@@ -452,6 +500,16 @@ DEFAULT_PENNY_PRIOR = PennyPrior(
     pressure=SignedLogUniformPrior(1e5, 1e7),
 )
 
+DEFAULT_PCDM_PRIOR = PCDMPrior(
+    depth=LogUniformPrior(1_000.0, 20_000.0),
+    omega_x=UniformPrior(-math.pi / 2, math.pi / 2),   # tilt about X (rad)
+    omega_y=UniformPrior(-math.pi / 2, math.pi / 2),   # tilt about Y (rad)
+    omega_z=UniformPrior(0.0, 2.0 * math.pi),          # azimuth about Z (rad)
+    dv_x=LogUniformPrior(1e5, 1e8),                     # positive magnitudes;
+    dv_y=LogUniformPrior(1e5, 1e8),                     # a shared random sign is
+    dv_z=LogUniformPrior(1e5, 1e8),                     # applied (signed=True)
+)
+
 #: Default prior per source type, keyed by name.
 DEFAULT_PRIORS: dict[str, SourcePrior] = {
     "earthquake": DEFAULT_EARTHQUAKE_PRIOR,
@@ -459,6 +517,7 @@ DEFAULT_PRIORS: dict[str, SourcePrior] = {
     "sill": DEFAULT_SILL_PRIOR,
     "mogi": DEFAULT_MOGI_PRIOR,
     "penny": DEFAULT_PENNY_PRIOR,
+    "pcdm": DEFAULT_PCDM_PRIOR,
 }
 
 

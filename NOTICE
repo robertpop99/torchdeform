@@ -1,0 +1,39 @@
+torchdeform
+Copyright 2026 Robert Gabriel Popescu
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+-------------------------------------------------------------------------------
+Third-party components
+-------------------------------------------------------------------------------
+
+Point Compound Dislocation Model (pCDM)
+  src/torchdeform/sources/pcdm.py is a derivative work (a differentiable,
+  batched PyTorch port of the surface-displacement computation) of the MATLAB
+  "pCDM" function by Mehdi Nikkhoo, used under the MIT License:
+
+    Copyright (c) 2016 Mehdi Nikkhoo
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files
+    (the "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to permit
+    persons to whom the Software is furnished to do so, subject to the
+    following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+    NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+    DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+    OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+    USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  Reference:
+    Nikkhoo, M., Walter, T. R., Lundgren, P. R., Prats-Iraola, P. (2017),
+    "Compound dislocation models (CDMs) for volcano deformation analyses",
+    Geophysical Journal International, 208(2), 877-894.

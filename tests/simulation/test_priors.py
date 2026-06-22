@@ -15,6 +15,7 @@ import torch
 from torchdeform import (
     OkadaSourceSimple,
     okada_params_from_fault,
+    PCDMSource,
 )
 from torchdeform.simulation import (
     Prior,
@@ -27,10 +28,12 @@ from torchdeform.simulation import (
     MogiPrior,
     PennyPrior,
     OkadaPrior,
+    PCDMPrior,
     DEFAULT_MOGI_PRIOR,
     DEFAULT_PRIORS,
     DEFAULT_EARTHQUAKE_PRIOR,
     DEFAULT_DYKE_PRIOR,
+    DEFAULT_PCDM_PRIOR,
     SourceMixture,
     MixtureSample,
 )
@@ -140,7 +143,7 @@ def test_source_prior_call_matches_sample():
 
 def test_defaults_are_source_priors():
     assert isinstance(DEFAULT_MOGI_PRIOR, SourcePrior)
-    assert set(DEFAULT_PRIORS) == {"earthquake", "dyke", "sill", "mogi", "penny"}
+    assert set(DEFAULT_PRIORS) == {"earthquake", "dyke", "sill", "mogi", "penny", "pcdm"}
     # the Okada defaults are OkadaPrior presets, not distinct types
     assert isinstance(DEFAULT_EARTHQUAKE_PRIOR, OkadaPrior)
     assert type(DEFAULT_PRIORS["dyke"]) is OkadaPrior
@@ -232,23 +235,73 @@ def test_okada_prior_plugs_into_okada_source():
 
 
 # --------------------------------------------------------------------------- #
+# PCDMPrior
+# --------------------------------------------------------------------------- #
+def test_pcdm_prior_fields_match_source():
+    out = DEFAULT_PCDM_PRIOR.sample((5,), _gen(0))
+    assert set(out) == {"depth", "omega_x", "omega_y", "omega_z",
+                        "dv_x", "dv_y", "dv_z"}
+    assert all(v.shape == (5,) for v in out.values())
+
+
+def test_pcdm_prior_potencies_share_sign_per_item():
+    out = DEFAULT_PCDM_PRIOR.sample((200,), _gen(1))
+    sx, sy, sz = out["dv_x"].sign(), out["dv_y"].sign(), out["dv_z"].sign()
+    assert torch.equal(sx, sy) and torch.equal(sy, sz)
+    # and both polarities actually occur
+    assert (sx > 0).any() and (sx < 0).any()
+
+
+def test_pcdm_prior_unsigned_is_positive():
+    p = PCDMPrior(
+        depth=LogUniformPrior(1e3, 2e4),
+        omega_x=UniformPrior(-1.0, 1.0), omega_y=UniformPrior(-1.0, 1.0),
+        omega_z=UniformPrior(0.0, 6.0),
+        dv_x=LogUniformPrior(1e5, 1e8), dv_y=LogUniformPrior(1e5, 1e8),
+        dv_z=LogUniformPrior(1e5, 1e8),
+        signed=False,
+    )
+    out = p.sample((100,), _gen(2))
+    assert (out["dv_x"] > 0).all() and (out["dv_y"] > 0).all() and (out["dv_z"] > 0).all()
+
+
+def test_pcdm_prior_plugs_into_source():
+    B, N = 4, 9
+    params = DEFAULT_PCDM_PRIOR.sample((B,), _gen(0))
+    x = torch.linspace(-10_000, 10_000, N, dtype=DTYPE).expand(B, -1).contiguous()
+    y = x.clone()
+    disp = PCDMSource()(
+        x, y, source_x=torch.zeros(B, dtype=DTYPE), source_y=torch.zeros(B, dtype=DTYPE),
+        **params,
+    )
+    assert disp.u.shape == (B, N)
+    assert torch.isfinite(disp.u).all()
+
+
+def test_pcdm_in_default_priors():
+    assert "pcdm" in DEFAULT_PRIORS
+    assert isinstance(DEFAULT_PRIORS["pcdm"], PCDMPrior)
+
+
+# --------------------------------------------------------------------------- #
 # SourceMixture
 # --------------------------------------------------------------------------- #
 def test_mixture_uniform_probabilities_by_default():
     mix = SourceMixture(DEFAULT_PRIORS)
+    k = len(DEFAULT_PRIORS)
     assert mix.names == tuple(DEFAULT_PRIORS)
-    assert torch.allclose(mix.probabilities, torch.full((5,), 0.2, dtype=torch.float64))
+    assert torch.allclose(mix.probabilities, torch.full((k,), 1.0 / k, dtype=torch.float64))
 
 
 def test_mixture_normalizes_weights():
-    mix = SourceMixture(DEFAULT_PRIORS,
-                        weights={"earthquake": 3, "dyke": 1, "sill": 1,
-                                 "mogi": 1, "penny": 4})
+    mix = SourceMixture(
+        {"earthquake": DEFAULT_PRIORS["earthquake"], "penny": DEFAULT_PRIORS["penny"]},
+        weights={"earthquake": 3, "penny": 7},
+    )
     assert torch.isclose(mix.probabilities.sum(), torch.tensor(1.0, dtype=torch.float64))
-    # order matches names; earthquake weight 3/10, penny 4/10
     p = dict(zip(mix.names, mix.probabilities.tolist()))
     assert p["earthquake"] == pytest.approx(0.3)
-    assert p["penny"] == pytest.approx(0.4)
+    assert p["penny"] == pytest.approx(0.7)
 
 
 def test_mixture_sample_groups_by_type():

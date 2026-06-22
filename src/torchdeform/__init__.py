@@ -24,6 +24,7 @@ from .sources import (
     OkadaSourceSimple,
     okada_params_from_fault,
     PennySource,
+    PCDMSource,
 )
 from .observation import (
     # S1_INCIDENCE_RANGE_DEG,
@@ -58,6 +59,7 @@ __all__ = [
     "OkadaSourceSimple",
     "okada_params_from_fault",
     "PennySource",
+    "PCDMSource",
 
     # "S1_INCIDENCE_RANGE_DEG",
     # "S1_HEADING_ASCENDING_DEG",
