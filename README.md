@@ -11,6 +11,12 @@ atmosphere. Every step is batched and fully differentiable, so it works both as
 a synthetic **data generator** (for training networks) and as differentiable
 **layers/forward models** inside an optimisation or inversion loop.
 
+📓 **Visual tour:** [`examples/tutorial.ipynb`](examples/tutorial.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/robertpop99/torchdeform/blob/main/examples/tutorial.ipynb)
+walks through the whole library step by step with plots — sources,
+LOS/phase/wrapping, atmosphere, the full pipeline, datasets, and covariance
+fitting.
+
 ## Features
 
 - **Source models** (`torchdeform.sources`): Mogi point source, the full Okada
