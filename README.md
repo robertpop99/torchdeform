@@ -32,7 +32,7 @@ a synthetic **data generator** (for training networks) and as differentiable
 ## Installation
 
 ```bash
-pip install -e .
+pip install git+https://github.com/robertpop99/torchdeform.git
 ```
 
 Requires Python ≥ 3.11 and PyTorch.
