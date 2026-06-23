@@ -42,6 +42,7 @@ pip install git+https://github.com/robertpop99/torchdeform.git
 ```
 
 Requires Python ≥ 3.11 and PyTorch.
+
 CPU-only users should install PyTorch CPU before torchdeform:
 
 ```bash
