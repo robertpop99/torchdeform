@@ -353,6 +353,40 @@ class TestDtypeAndDevice:
         assert vc.u.device.type == "cuda" and torch.isfinite(vc.u).all()
 
 
+# --------------------------------------------------------------------------- #
+# batchable look_side
+# --------------------------------------------------------------------------- #
+class TestBatchableLookSide:
+    def test_per_image_matches_scalar(self):
+        heading = _t([-13.0, -13.0])
+        inc = _t([39.0, 39.0])
+        batched = los_vector(heading, inc, look_side=_t([1.0, -1.0]))
+        right = los_vector(heading[:1], inc[:1], look_side=1)
+        left = los_vector(heading[1:], inc[1:], look_side=-1)
+        assert torch.allclose(batched.e[0], right.e[0])
+        assert torch.allclose(batched.e[1], left.e[0])
+
+    def test_flipping_look_side_flips_horizontal_keeps_vertical(self):
+        heading = _t([-13.0, -13.0])
+        inc = _t([39.0, 39.0])
+        v = los_vector(heading, inc, look_side=_t([1.0, -1.0]))
+        assert torch.allclose(v.e[0], -v.e[1])
+        assert torch.allclose(v.n[0], -v.n[1])
+        assert torch.allclose(v.u[0], v.u[1])
+        assert torch.allclose(_norm(v), torch.ones_like(_norm(v)))
+
+    def test_scalar_default_still_works(self):
+        v = los_vector(_t([-13.0]), _t([39.0]))     # int default look_side
+        assert torch.allclose(_norm(v), torch.ones_like(_norm(v)))
+
+    def test_per_pixel_batchable(self):
+        h = torch.full((2, 4), -13.0, dtype=DTYPE)
+        i = torch.full((2, 4), 39.0, dtype=DTYPE)
+        v = los_vector_per_pixel(h, i, look_side=_t([1.0, -1.0]))
+        assert v.e.shape == (2, 4)
+        assert torch.allclose(v.e[0], -v.e[1])
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

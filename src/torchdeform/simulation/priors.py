@@ -15,35 +15,38 @@ Each scalar prior implements the :class:`Prior` interface -- ``sample(size, ...)
 * :class:`SignedLogUniformPrior` -- log-uniform magnitude with a random sign;
   use for signed scale parameters (e.g. inflation/deflation).
 * :class:`ConstantPrior` -- always returns a fixed value (to pin a parameter).
+* :class:`MultimodalPrior` -- a finite mixture of scalar priors (per-draw weighted
+  choice); for parameters with separated modes, e.g. a Sentinel-1 heading.
 
 Subclass :class:`Prior` to add a distribution and it works anywhere a prior is
 accepted. :func:`make_prior` builds one from a ``(low, high, mode)`` spec, handy
 for config-driven setups.
 
-Source priors
+Prior bundles
 -------------
-:class:`SourcePrior` subclasses (:class:`MogiPrior`, :class:`PennyPrior`,
-:class:`OkadaPrior`, :class:`PCDMPrior`) bundle one named scalar prior per source
-parameter.
-:meth:`SourcePrior.sample` draws them all at once into a ``{name: tensor}`` dict
-whose keys are the parameters the matching source model consumes -- so
-``model(**prior.sample(size))`` works directly. ``OkadaPrior`` samples in a
-geophysical, constraint-friendly fault parametrisation; convert it to the raw
-``OkadaSource`` inputs with
+:class:`PriorBundle` subclasses bundle one named scalar prior per parameter,
+named exactly as a consuming function's arguments, so ``f(**bundle.sample(n))``
+works: source models (:class:`MogiPrior`, :class:`PennyPrior`,
+:class:`OkadaPrior`, :class:`PCDMPrior`) and acquisition geometry
+(:class:`GeometryPrior`, whose fields feed :func:`~torchdeform.observation.los_vector`).
+``OkadaPrior`` samples a geophysical fault parametrisation; convert it with
 :func:`~torchdeform.sources.okada.okada_params_from_fault`.
 
-Default instances are provided (:data:`DEFAULT_MOGI_PRIOR`, ...). The Okada
-defaults (:data:`DEFAULT_EARTHQUAKE_PRIOR`, :data:`DEFAULT_DYKE_PRIOR`,
+Default instances are provided (:data:`DEFAULT_MOGI_PRIOR`,
+:data:`DEFAULT_S1_GEOMETRY_PRIOR`, ...). The Okada defaults
+(:data:`DEFAULT_EARTHQUAKE_PRIOR`, :data:`DEFAULT_DYKE_PRIOR`,
 :data:`DEFAULT_SILL_PRIOR`) are opinionated presets -- ordinary ``OkadaPrior``
-instances with sensible ranges -- not distinct types. All defaults are collected
-in :data:`DEFAULT_PRIORS`.
+instances -- not distinct types. The source defaults are collected in
+:data:`DEFAULT_PRIORS`.
+
+(``SourcePrior`` is a backwards-compatible alias for ``PriorBundle``.)
 
 Mixtures
 --------
-:class:`SourceMixture` holds several source priors with relative selection
-``weights`` and samples a source type per batch item (then that type's
-parameters). Weights live on the mixture, not the priors, so the same prior can
-be reused across datasets with different mixes.
+:class:`PriorMixture` holds several bundles with relative selection ``weights``
+and samples a key per batch item (then that bundle's parameters). Weights live on
+the mixture, not the bundles, so a bundle can be reused across datasets with
+different mixes. (``SourceMixture`` is a backwards-compatible alias.)
 
 Mapping parameters to an ML target space (normalisation, sin/cos angle
 encodings, network head layout, ...) is intentionally left to the application:
@@ -58,6 +61,12 @@ import torch
 from torch import Tensor
 
 from ..core import DeviceLikeType
+from ..observation.los import (
+    S1_INCIDENCE_RANGE_DEG,
+    S1_HEADING_ASCENDING_DEG,
+    S1_HEADING_DESCENDING_DEG,
+    S1_LOOK_SIDE,
+)
 
 
 def _rand(
@@ -269,6 +278,60 @@ class ConstantPrior(Prior):
         return torch.full(tuple(size), float(self.value), device=device, dtype=dtype)
 
 
+@dataclass(slots=True)
+class MultimodalPrior(Prior):
+    """Finite mixture of scalar priors: each draw picks one component by weight.
+
+    Per element, a component prior is chosen ~ Categorical(weights) and sampled
+    from. Use for a parameter whose distribution has separated modes -- e.g. a
+    Sentinel-1 heading, which clusters around the ascending and descending
+    azimuths. (It is only genuinely "multimodal" if the components are separated;
+    overlapping components simply blend.)
+
+    Parameters
+    ----------
+    priors : Sequence[Prior]
+        Component priors to mix.
+    weights : Sequence[float], optional
+        Relative (unnormalised) selection weight per component; must be strictly
+        positive. Defaults to uniform.
+    """
+
+    priors: Sequence[Prior]
+    weights: Optional[Sequence[float]] = None
+
+    def __post_init__(self):
+        if len(self.priors) == 0:
+            raise ValueError("priors must be non-empty")
+        if self.weights is not None:
+            if len(self.weights) != len(self.priors):
+                raise ValueError("weights must have one entry per prior")
+            if any(float(w) <= 0.0 for w in self.weights):
+                raise ValueError("weights must be strictly positive")
+
+    def _probabilities(self, device: Optional[DeviceLikeType]) -> Tensor:
+        w = [1.0] * len(self.priors) if self.weights is None else [float(x) for x in self.weights]
+        t = torch.tensor(w, dtype=torch.float64, device=device)
+        return t / t.sum()
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> Tensor:
+        """Draw ``size``, each element from a weighted-random component prior."""
+        comps = torch.stack(
+            [p.sample(size, generator, device, dtype) for p in self.priors], dim=0
+        )                                                   # [K, *size]
+        flat = comps.reshape(comps.shape[0], -1)            # [K, M]
+        probs = self._probabilities(device)
+        choice = torch.multinomial(probs, flat.shape[1], replacement=True,
+                                   generator=generator)     # [M]
+        return flat.gather(0, choice[None, :]).reshape(tuple(size))
+
+
 # --------------------------------------------------------------------------- #
 # Bridge: build a scalar prior from a (low, high, mode) spec
 # --------------------------------------------------------------------------- #
@@ -308,21 +371,24 @@ def make_prior(low: float, high: float, mode: str = "uniform") -> Prior:
 
 
 # --------------------------------------------------------------------------- #
-# Source priors: typed bundles of named per-parameter priors
+# Prior bundles: typed bundles of named per-parameter priors
 # --------------------------------------------------------------------------- #
-class SourcePrior:
+class PriorBundle:
     """Base class for a bundle of named per-parameter :class:`Prior` objects.
 
     Subclasses are dataclasses whose fields are individual :class:`Prior`
-    instances, one per source parameter, named exactly as the matching source
-    model's ``forward`` expects (so ``model(**prior.sample(size))`` works).
-    :meth:`sample` draws every ``Prior`` field at once and returns them keyed by
-    field name, so adding or renaming a parameter is a single edit.
+    instances, one per parameter, named exactly as the consuming function's
+    arguments (so ``f(**bundle.sample(size))`` works -- a source model's
+    ``forward`` for a :class:`MogiPrior`, ``los_vector`` for a
+    :class:`GeometryPrior`, ...). :meth:`sample` draws every ``Prior`` field at
+    once and returns them keyed by field name, so adding or renaming a parameter
+    is a single edit.
 
-    Sampling *weights* (how often to pick this source type relative to others)
-    are deliberately not stored here -- they are a property of a particular
-    dataset's mixture of sources, not of the prior itself, and live on
-    :class:`SourceMixture`.
+    Sampling *weights* (how often to pick this bundle relative to others) are
+    deliberately not stored here -- they are a property of a particular dataset's
+    mixture, not of the bundle itself, and live on :class:`PriorMixture`.
+
+    ``SourcePrior`` is a backwards-compatible alias for this class.
     """
 
     __slots__ = ()
@@ -349,8 +415,12 @@ class SourcePrior:
         return self.sample(*args, **kwargs)
 
 
+#: Backwards-compatible alias (the bundle base used to be source-specific).
+SourcePrior = PriorBundle
+
+
 @dataclass(slots=True)
-class MogiPrior(SourcePrior):
+class MogiPrior(PriorBundle):
     """Prior over Mogi point-source parameters (fields match ``MogiSource``)."""
 
     depth: Prior
@@ -358,7 +428,7 @@ class MogiPrior(SourcePrior):
 
 
 @dataclass(slots=True)
-class PennyPrior(SourcePrior):
+class PennyPrior(PriorBundle):
     """Prior over penny-shaped crack parameters (fields match ``PennySource``)."""
 
     depth: Prior
@@ -367,7 +437,7 @@ class PennyPrior(SourcePrior):
 
 
 @dataclass(slots=True)
-class OkadaPrior(SourcePrior):
+class OkadaPrior(PriorBundle):
     """Prior over rectangular-dislocation (Okada) fault parameters.
 
     Sampled in a geophysical, constraint-friendly parametrisation rather than the
@@ -405,7 +475,7 @@ class OkadaPrior(SourcePrior):
 
 
 @dataclass(slots=True)
-class PCDMPrior(SourcePrior):
+class PCDMPrior(PriorBundle):
     """Prior over point compound dislocation model (pCDM) parameters.
 
     Fields match :class:`~torchdeform.sources.PCDMSource` (minus the location):
@@ -442,13 +512,42 @@ class PCDMPrior(SourcePrior):
         three potencies always share a sign.
         """
         # NB: explicit base call -- zero-arg super() breaks under @dataclass(slots=True)
-        out = SourcePrior.sample(self, size, generator, device, dtype)
+        out = PriorBundle.sample(self, size, generator, device, dtype)
         if self.signed:
             u = torch.rand(size, generator=generator, device=device, dtype=dtype)
             sign = 1.0 - 2.0 * (u < 0.5).to(dtype)      # +/-1, shared by the 3 potencies
             for key in ("dv_x", "dv_y", "dv_z"):
                 out[key] = out[key] * sign
         return out
+
+
+@dataclass(slots=True)
+class GeometryPrior(PriorBundle):
+    """Prior over acquisition geometry (fields match :func:`los_vector`).
+
+    Samples ``heading_deg`` and ``incidence_deg`` (degrees) plus ``look_side``
+    (a ``[B]`` tensor: ``+1`` right-looking, ``-1`` left-looking), so
+    ``los_vector(**prior.sample(size))`` works directly.
+
+    ``look_side`` defaults to a constant ``+1`` (the usual single-sensor case);
+    pass ``ConstantPrior(-1.0)`` for a left-looking sensor. A bimodal heading
+    (e.g. ascending vs descending) is expressed with :class:`MultimodalPrior`;
+    when several genuinely different platforms are mixed, use one ``GeometryPrior``
+    per platform and combine them with :class:`PriorMixture`.
+
+    Fields
+    ------
+    heading_deg : Prior
+        Flight azimuth (degrees CW from North).
+    incidence_deg : Prior
+        Radar incidence angle (degrees from vertical).
+    look_side : Prior
+        Look side, ``+1``/``-1`` (default ``ConstantPrior(1.0)``).
+    """
+
+    heading_deg: Prior
+    incidence_deg: Prior
+    look_side: Prior = field(default_factory=lambda: ConstantPrior(1.0))
 
 
 # --------------------------------------------------------------------------- #
@@ -511,7 +610,7 @@ DEFAULT_PCDM_PRIOR = PCDMPrior(
 )
 
 #: Default prior per source type, keyed by name.
-DEFAULT_PRIORS: dict[str, SourcePrior] = {
+DEFAULT_PRIORS: dict[str, PriorBundle] = {
     "earthquake": DEFAULT_EARTHQUAKE_PRIOR,
     "dyke": DEFAULT_DYKE_PRIOR,
     "sill": DEFAULT_SILL_PRIOR,
@@ -519,6 +618,22 @@ DEFAULT_PRIORS: dict[str, SourcePrior] = {
     "penny": DEFAULT_PENNY_PRIOR,
     "pcdm": DEFAULT_PCDM_PRIOR,
 }
+
+#: Sentinel-1 IW acquisition geometry: bimodal heading (ascending/descending),
+#: IW incidence range, right-looking. Plug into ``los_vector(**prior.sample(n))``.
+#: The functional one-shot equivalent is
+#: :func:`~torchdeform.observation.sample_s1_geometry` (returns a ``(heading,
+#: incidence)`` tuple); this composable form additionally yields ``look_side``,
+#: lets you reweight the ascending/descending split via the ``MultimodalPrior``
+#: weights, and can be combined with :class:`PriorMixture`.
+DEFAULT_S1_GEOMETRY_PRIOR = GeometryPrior(
+    heading_deg=MultimodalPrior([
+        UniformPrior(*S1_HEADING_ASCENDING_DEG),
+        UniformPrior(*S1_HEADING_DESCENDING_DEG),
+    ]),
+    incidence_deg=UniformPrior(*S1_INCIDENCE_RANGE_DEG),
+    look_side=ConstantPrior(float(S1_LOOK_SIDE)),
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -547,25 +662,28 @@ class MixtureSample:
 
 
 @dataclass
-class SourceMixture:
-    """Weighted mixture over named :class:`SourcePrior` objects.
+class PriorMixture:
+    """Weighted mixture over named :class:`PriorBundle` objects.
 
-    Models a dataset's choice of which source type to generate: each item draws
-    a type from a categorical distribution given by ``weights`` (normalised
-    internally), then that type's parameters are drawn from its prior. The same
-    :class:`SourcePrior` can appear in several mixtures with different weights --
-    which is exactly why the weight lives here and not on the prior.
+    Models a dataset's choice of which bundle to draw: each item picks a key from
+    a categorical distribution given by ``weights`` (normalised internally), then
+    that bundle's parameters are sampled. The same :class:`PriorBundle` can appear
+    in several mixtures with different weights -- which is exactly why the weight
+    lives here and not on the bundle. Works for any bundle (source types via
+    :class:`MogiPrior`/..., acquisition geometry via :class:`GeometryPrior`, ...).
+
+    ``SourceMixture`` is a backwards-compatible alias for this class.
 
     Parameters
     ----------
-    priors : dict[str, SourcePrior]
-        Source priors keyed by type name (e.g. ``"mogi"``).
+    priors : dict[str, PriorBundle]
+        Prior bundles keyed by name (e.g. ``"mogi"``, ``"asc"``).
     weights : dict[str, float], optional
-        Relative (unnormalised) sampling weight per type; must use the same keys
+        Relative (unnormalised) sampling weight per key; must use the same keys
         as ``priors`` and be strictly positive. Defaults to uniform.
     """
 
-    priors: dict[str, SourcePrior]
+    priors: dict[str, PriorBundle]
     weights: Optional[dict[str, float]] = None
 
     _names: tuple[str, ...] = field(init=False, repr=False)
@@ -640,3 +758,7 @@ class SourceMixture:
                 (int(sel.numel()),), generator=generator, device=device, dtype=dtype
             )
         return MixtureSample(types=types, params=params, index=index)
+
+
+#: Backwards-compatible alias (the mixture used to be source-specific).
+SourceMixture = PriorMixture

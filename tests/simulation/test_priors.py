@@ -16,6 +16,7 @@ from torchdeform import (
     OkadaSourceSimple,
     okada_params_from_fault,
     PCDMSource,
+    los_vector,
 )
 from torchdeform.simulation import (
     Prior,
@@ -23,17 +24,22 @@ from torchdeform.simulation import (
     LogUniformPrior,
     SignedLogUniformPrior,
     ConstantPrior,
+    MultimodalPrior,
     make_prior,
+    PriorBundle,
     SourcePrior,
     MogiPrior,
     PennyPrior,
     OkadaPrior,
     PCDMPrior,
+    GeometryPrior,
     DEFAULT_MOGI_PRIOR,
     DEFAULT_PRIORS,
     DEFAULT_EARTHQUAKE_PRIOR,
     DEFAULT_DYKE_PRIOR,
     DEFAULT_PCDM_PRIOR,
+    DEFAULT_S1_GEOMETRY_PRIOR,
+    PriorMixture,
     SourceMixture,
     MixtureSample,
 )
@@ -339,3 +345,94 @@ def test_mixture_validation():
     with pytest.raises(ValueError):
         SourceMixture({"mogi": DEFAULT_PRIORS["mogi"]},
                       weights={"mogi": 0.0})                # non-positive
+
+
+# --------------------------------------------------------------------------- #
+# Generic aliases (renamed from Source* -> Prior*)
+# --------------------------------------------------------------------------- #
+def test_aliases_are_identical_objects():
+    assert SourcePrior is PriorBundle
+    assert SourceMixture is PriorMixture
+    # existing bundles are PriorBundle instances
+    assert isinstance(DEFAULT_MOGI_PRIOR, PriorBundle)
+
+
+# --------------------------------------------------------------------------- #
+# MultimodalPrior
+# --------------------------------------------------------------------------- #
+def test_multimodal_is_prior_and_covers_components():
+    mm = MultimodalPrior([UniformPrior(-15.0, -13.0), UniformPrior(193.0, 195.0)])
+    assert isinstance(mm, Prior)
+    x = mm.sample((4000,), _gen(0), dtype=DTYPE)
+    in_asc = (x >= -15.0) & (x <= -13.0)
+    in_desc = (x >= 193.0) & (x <= 195.0)
+    assert bool((in_asc | in_desc).all())     # every draw in one component
+    assert in_asc.any() and in_desc.any()     # both components used
+
+
+def test_multimodal_weighting():
+    mm = MultimodalPrior([ConstantPrior(0.0), ConstantPrior(1.0)], weights=[1.0, 3.0])
+    x = mm.sample((10000,), _gen(1))
+    frac_one = (x == 1.0).float().mean().item()
+    assert 0.70 < frac_one < 0.80           # ~0.75
+
+
+def test_multimodal_validation():
+    with pytest.raises(ValueError):
+        MultimodalPrior([])
+    with pytest.raises(ValueError):
+        MultimodalPrior([UniformPrior(0, 1)], weights=[1.0, 2.0])    # length mismatch
+    with pytest.raises(ValueError):
+        MultimodalPrior([UniformPrior(0, 1)], weights=[0.0])         # non-positive
+
+
+def test_multimodal_call_and_dtype():
+    mm = MultimodalPrior([UniformPrior(0.0, 1.0), UniformPrior(2.0, 3.0)])
+    a = mm.sample((5,), _gen(2), dtype=torch.float32)
+    assert a.shape == (5,) and a.dtype == torch.float32
+
+
+# --------------------------------------------------------------------------- #
+# GeometryPrior
+# --------------------------------------------------------------------------- #
+def test_geometry_prior_fields_and_default_look_side():
+    geom = GeometryPrior(UniformPrior(-15.0, -13.0), UniformPrior(29.0, 46.0))
+    out = geom.sample((6,), _gen(0))
+    assert set(out) == {"heading_deg", "incidence_deg", "look_side"}
+    assert all(v.shape == (6,) for v in out.values())
+    assert torch.all(out["look_side"] == 1.0)      # default right-looking
+
+
+def test_geometry_prior_left_looking():
+    geom = GeometryPrior(UniformPrior(-15.0, -13.0), UniformPrior(29.0, 46.0),
+                         look_side=ConstantPrior(-1.0))
+    out = geom.sample((4,))
+    assert torch.all(out["look_side"] == -1.0)
+
+
+def test_geometry_prior_plugs_into_los_vector():
+    out = DEFAULT_S1_GEOMETRY_PRIOR.sample((8,), _gen(0))
+    los = los_vector(**out)
+    assert torch.allclose(los.norm, torch.ones_like(los.norm), atol=1e-12)
+
+
+def test_s1_default_heading_is_bimodal():
+    out = DEFAULT_S1_GEOMETRY_PRIOR.sample((4000,), _gen(0))
+    h = out["heading_deg"]
+    in_asc = (h >= -15.0) & (h <= -13.0)
+    in_desc = (h >= 193.0) & (h <= 195.0)
+    assert bool((in_asc | in_desc).all())
+    assert in_asc.any() and in_desc.any()
+    # incidence in the IW range
+    assert bool(((out["incidence_deg"] >= 29.0) & (out["incidence_deg"] <= 46.0)).all())
+
+
+def test_prior_mixture_over_geometry_bundles():
+    asc = GeometryPrior(UniformPrior(-15.0, -13.0), UniformPrior(29.0, 46.0))
+    desc = GeometryPrior(UniformPrior(193.0, 195.0), UniformPrior(29.0, 46.0))
+    mix = PriorMixture({"asc": asc, "desc": desc}, weights={"asc": 1.0, "desc": 3.0})
+    res = mix.sample(2000, generator=_gen(0))
+    assert set(res.index) <= {"asc", "desc"}
+    # the heavier "desc" bundle is chosen ~3x more often
+    n_desc = res.index["desc"].numel()
+    assert 0.70 < n_desc / 2000 < 0.80

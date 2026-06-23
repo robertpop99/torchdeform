@@ -55,6 +55,13 @@ def sample_s1_geometry(batch, generator: Optional[torch.Generator] = None, devic
     Picks a pass direction (ascending/descending) per image, jitters the
     heading around its nominal value, and draws incidence uniformly across
     the IW swath. Returns two [batch] tensors ready for los_vector().
+
+    See also :data:`~torchdeform.simulation.DEFAULT_S1_GEOMETRY_PRIOR` for the
+    composable typed-prior equivalent: it returns a dict that plugs straight into
+    ``los_vector(**...)``, also yields ``look_side``, lets you reweight the
+    ascending/descending split, and can be mixed with
+    :class:`~torchdeform.simulation.PriorMixture`. This function is the quick
+    one-call form.
     """
     def u(lo, hi, shape):
         return lo + (hi - lo) * torch.rand(shape, generator=generator,
@@ -68,8 +75,16 @@ def sample_s1_geometry(batch, generator: Optional[torch.Generator] = None, devic
     return heading, incidence
 
 
-def _los_from_angles(heading_rad: Tensor, incidence_rad: Tensor, look_side: int) -> LOSVector:
-    """Core formula. All args broadcastable tensors in radians."""
+def _los_from_angles(heading_rad: Tensor, incidence_rad: Tensor,
+                     look_side: int | Tensor) -> LOSVector:
+    """Core formula. All args broadcastable tensors in radians.
+
+    ``look_side`` may be a scalar (``+1`` right-looking, ``-1`` left-looking) or a
+    per-image ``[B]`` tensor; in the latter case it is unsqueezed to ``[B, 1]`` so
+    it broadcasts against the ``[B, 1]`` / ``[B, N]`` angle grids.
+    """
+    if isinstance(look_side, Tensor) and look_side.ndim == 1:
+        look_side = look_side[:, None]
     look_az = heading_rad + look_side * (math.pi / 2.0)
     sin_i = torch.sin(incidence_rad)
     los_e = sin_i * torch.sin(look_az)
@@ -91,7 +106,7 @@ def los_vector(
     incidence_deg: Any,      # [B]  radar incidence angle, deg from vertical
     device: Optional[DeviceLikeType] = None,
     dtype: torch.dtype = torch.float64,
-    look_side: int = S1_LOOK_SIDE,
+    look_side: int | Tensor = S1_LOOK_SIDE,
 ) -> LOSVector:
     """One LOS vector per image, shaped [B, 1] to broadcast against [B, N]
     displacement fields. Use when a single incidence per scene is acceptable
@@ -115,7 +130,7 @@ def los_vector_per_pixel(
     incidence_deg: Any,      # [B, N]
     device: Optional[DeviceLikeType] = None,
     dtype: torch.dtype = torch.float64,
-    look_side: int = S1_LOOK_SIDE,
+    look_side: int | Tensor = S1_LOOK_SIDE,
 ) -> LOSVector:
     """LOS vector evaluated independently at every pixel. Use when you have a
     per-pixel incidence (and possibly heading) raster -- the physically
@@ -138,7 +153,7 @@ def los_vector_from_center(
     y_obs: Any,               # [B, N]
     device: Optional[DeviceLikeType] = None,
     dtype: torch.dtype = torch.float64,
-    look_side: int = S1_LOOK_SIDE,
+    look_side: int | Tensor = S1_LOOK_SIDE,
     sat_alt_m: float = 693_000.0,  # Sentinel-1 nominal orbit altitude ~693 km
 ) -> LOSVector:
     """Per-pixel LOS from a single center incidence, reconstructing how
@@ -201,7 +216,7 @@ def los_vector_from_center_curved(
     y_obs: Any,
     device: Optional[DeviceLikeType] = None,
     dtype: torch.dtype = torch.float64,
-    look_side: int = S1_LOOK_SIDE,
+    look_side: int | Tensor = S1_LOOK_SIDE,
     earth_radius_m: float = 6378137.0,
 ) -> LOSVector:
     """
