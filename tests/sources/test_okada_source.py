@@ -87,12 +87,12 @@ def _assert_output_shape(out, expected):
             f"{nm} has shape {tuple(v.shape)}, expected {tuple(expected)}"
 
 
-def run_simplified(x_obs, y_obs, fault_x, fault_y, dip, strike,
+def run_simplified(x_obs, y_obs, source_x, source_y, dip, strike,
                    depth, length, width, d1, d2, d3, **model_kw):
     model = OkadaSourceSimple(**model_kw)
     out = model(
         x_obs=t(x_obs), y_obs=t(y_obs),
-        fault_x=t(fault_x), fault_y=t(fault_y),
+        source_x=t(source_x), source_y=t(source_y),
         dip=t(dip), strike=t(strike),
         centroid_depth=t(depth), length=t(length), width=t(width),
         disl1=t(d1), disl2=t(d2), disl3=t(d3),
@@ -101,12 +101,12 @@ def run_simplified(x_obs, y_obs, fault_x, fault_y, dip, strike,
     return out.e, out.n, out.u
 
 
-def run_fullz(x_obs, y_obs, z_obs, fault_x, fault_y, dip, strike,
+def run_fullz(x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
               depth, length, width, d1, d2, d3, **model_kw):
     model = OkadaSource(**model_kw)
     out = model(
         x_obs=t(x_obs), y_obs=t(y_obs), z_obs=t(z_obs),
-        fault_x=t(fault_x), fault_y=t(fault_y),
+        source_x=t(source_x), source_y=t(source_y),
         dip=t(dip), strike=t(strike),
         centroid_depth=t(depth), length=t(length), width=t(width),
         disl1=t(d1), disl2=t(d2), disl3=t(d3),
@@ -129,8 +129,8 @@ def random_params(seed, batch=4, n=12, surface_safe=True):
     # keep the fault buried: top edge depth = depth - (W/2) sin(dip) > margin
     min_depth = 0.5 * width * torch.sin(dip) + 1e3
     depth = min_depth + u(0.0, 20e3, batch)
-    fault_x = u(-5e3, 5e3, batch)
-    fault_y = u(-5e3, 5e3, batch)
+    source_x = u(-5e3, 5e3, batch)
+    source_y = u(-5e3, 5e3, batch)
     d1 = u(-2.0, 2.0, batch)
     d2 = u(-2.0, 2.0, batch)
     d3 = u(-0.5, 0.5, batch)
@@ -138,7 +138,7 @@ def random_params(seed, batch=4, n=12, surface_safe=True):
     y_obs = u(-60e3, 60e3, batch, n)
     if not surface_safe:
         pass
-    return dict(x_obs=x_obs, y_obs=y_obs, fault_x=fault_x, fault_y=fault_y,
+    return dict(x_obs=x_obs, y_obs=y_obs, source_x=source_x, source_y=source_y,
                 dip=dip, strike=strike, depth=depth, length=length,
                 width=width, d1=d1, d2=d2, d3=d3)
 
@@ -250,7 +250,7 @@ def _benign_inputs_simplified(dtype, device="cpu"):
         return torch.tensor(x, dtype=dtype, device=device)
     return dict(
         x_obs=f([[3e3, -7e3, 12e3]]), y_obs=f([[5e3, 9e3, -4e3]]),
-        fault_x=f([0.0]), fault_y=f([0.0]),
+        source_x=f([0.0]), source_y=f([0.0]),
         dip=f([0.9]), strike=f([0.7]),
         centroid_depth=f([9e3]), length=f([8e3]), width=f([4e3]),
         disl1=f([1.0]), disl2=f([-0.5]), disl3=f([0.2]),
@@ -272,7 +272,7 @@ class TestOkada85Reference:
 
         common = dict(
             x_obs=[[de]], y_obs=[[dn]],
-            fault_x=[0.0], fault_y=[0.0],
+            source_x=[0.0], source_y=[0.0],
             dip=[dip], strike=[0.0],
             depth=[depth_c], length=[float(L)], width=[float(W)],
             d1=[d1], d2=[d2], d3=[d3],
@@ -324,7 +324,7 @@ class TestOkada85Reference:
         y_obs = t([[dn]]).requires_grad_(True)   # along strike  (Okada x)
 
         kw = dict(
-            fault_x=t([0.0]), fault_y=t([0.0]),
+            source_x=t([0.0]), source_y=t([0.0]),
             dip=t([dip]), strike=t([0.0]),
             centroid_depth=t([depth_c]), length=t([float(L)]), width=t([float(W)]),
             disl1=t([d1]), disl2=t([d2]), disl3=t([d3]),
@@ -399,7 +399,7 @@ class TestFullZConsistency:
 
         ue, un, uu = run_fullz(
             x_obs=xs, y_obs=ys, z_obs=zs,
-            fault_x=[0.0], fault_y=[0.0],
+            source_x=[0.0], source_y=[0.0],
             dip=[dip], strike=[0.0],
             depth=[depth_c], length=[L], width=[W],
             d1=[d1], d2=[d2], d3=[d3],
@@ -447,8 +447,8 @@ class TestPhysicsInvariants:
         p2 = dict(p)
         p2["x_obs"] = p["x_obs"] + shift_x
         p2["y_obs"] = p["y_obs"] + shift_y
-        p2["fault_x"] = p["fault_x"] + shift_x
-        p2["fault_y"] = p["fault_y"] + shift_y
+        p2["source_x"] = p["source_x"] + shift_x
+        p2["source_y"] = p["source_y"] + shift_y
         ue2, un2, uu2 = run_simplified(**p2)
         assert torch.allclose(ue1, ue2, rtol=1e-10, atol=1e-13)
         assert torch.allclose(un1, un2, rtol=1e-10, atol=1e-13)
@@ -470,11 +470,11 @@ class TestPhysicsInvariants:
 
         ue1, un1, uu1 = run_simplified(**p)
 
-        dx = p["x_obs"] - p["fault_x"][:, None]
-        dy = p["y_obs"] - p["fault_y"][:, None]
+        dx = p["x_obs"] - p["source_x"][:, None]
+        dy = p["y_obs"] - p["source_y"][:, None]
         p2 = dict(p)
-        p2["x_obs"] = p["fault_x"][:, None] + (dx * ca + dy * sa)
-        p2["y_obs"] = p["fault_y"][:, None] + (-dx * sa + dy * ca)
+        p2["x_obs"] = p["source_x"][:, None] + (dx * ca + dy * sa)
+        p2["y_obs"] = p["source_y"][:, None] + (-dx * sa + dy * ca)
         p2["strike"] = p["strike"] + a
         ue2, un2, uu2 = run_simplified(**p2)
 
@@ -513,7 +513,7 @@ class TestPhysicsInvariants:
     def test_far_field_decay(self):
         """|u| should fall off rapidly (~1/r^2 for a finite source)."""
         base = dict(
-            fault_x=[0.0], fault_y=[0.0],
+            source_x=[0.0], source_y=[0.0],
             dip=[math.radians(60.0)], strike=[0.4],
             depth=[8e3], length=[10e3], width=[5e3],
             d1=[1.0], d2=[0.5], d3=[0.1],
@@ -552,7 +552,7 @@ class TestNumericalHealth:
 
         ue, un, uu = run_simplified(
             x_obs=xs, y_obs=ys,
-            fault_x=[0.0], fault_y=[0.0],
+            source_x=[0.0], source_y=[0.0],
             dip=[dip], strike=[math.pi / 2.0],
             depth=[depth_c], length=[L], width=[W],
             d1=[1.0], d2=[0.0], d3=[0.0],
@@ -579,7 +579,7 @@ class TestNumericalHealth:
         model = OkadaSourceSimple(training_safe=True)
         out = model(
             x_obs=x_obs, y_obs=y_obs,
-            fault_x=t([0.0]), fault_y=t([0.0]),
+            source_x=t([0.0]), source_y=t([0.0]),
             dip=dip, strike=t([0.3]),
             centroid_depth=depth, length=t([L]), width=t([W]),
             disl1=d1, disl2=d2, disl3=d3,
@@ -611,7 +611,7 @@ class TestDifferentiability:
         def f(dip, depth, length, width, d1, d2, d3):
             out = model(
                 x_obs=x_obs, y_obs=y_obs,
-                fault_x=td([0.0]), fault_y=td([0.0]),
+                source_x=td([0.0]), source_y=td([0.0]),
                 dip=dip, strike=td([0.7]),
                 centroid_depth=depth, length=length, width=width,
                 disl1=d1, disl2=d2, disl3=d3,
@@ -643,7 +643,7 @@ class TestDifferentiability:
         def f(dip, depth, length, width, d1, d2, d3):
             out = model(
                 x_obs=x_obs, y_obs=y_obs, z_obs=z_obs,
-                fault_x=td([0.0]), fault_y=td([0.0]),
+                source_x=td([0.0]), source_y=td([0.0]),
                 dip=dip, strike=td([0.6]),
                 centroid_depth=depth, length=length, width=width,
                 disl1=d1, disl2=d2, disl3=d3,
@@ -672,7 +672,7 @@ class TestDifferentiability:
         d3 = t([0.2]).requires_grad_(True)
         out = model(
             x_obs=x_obs, y_obs=y_obs,
-            fault_x=t([0.0]), fault_y=t([0.0]),
+            source_x=t([0.0]), source_y=t([0.0]),
             dip=dip, strike=t([0.7]),
             centroid_depth=depth, length=t([8e3]), width=t([4e3]),
             disl1=d1, disl2=d2, disl3=d3,
@@ -694,7 +694,7 @@ class TestDifferentiability:
         out = model(
             x_obs=p["x_obs"], y_obs=p["y_obs"],
             z_obs=torch.full_like(p["x_obs"], -2e3),
-            fault_x=p["fault_x"], fault_y=p["fault_y"],
+            source_x=p["source_x"], source_y=p["source_y"],
             dip=p["dip"], strike=p["strike"],
             centroid_depth=p["depth"], length=p["length"], width=p["width"],
             disl1=p["d1"], disl2=p["d2"], disl3=d3,
@@ -770,7 +770,7 @@ class TestDtypeAndDevice:
         simp = OkadaSourceSimple(training_safe=True).to(device)
         out_s = simp(
             x_obs=to("x_obs"), y_obs=to("y_obs"),
-            fault_x=to("fault_x"), fault_y=to("fault_y"),
+            source_x=to("source_x"), source_y=to("source_y"),
             dip=to("dip"), strike=to("strike"),
             centroid_depth=to("depth"), length=to("length"), width=to("width"),
             disl1=to("d1"), disl2=to("d2"), disl3=to("d3"),
@@ -782,7 +782,7 @@ class TestDtypeAndDevice:
         out_f = full(
             x_obs=to("x_obs"), y_obs=to("y_obs"),
             z_obs=torch.full_like(p["x_obs"], -2e3).to(device),
-            fault_x=to("fault_x"), fault_y=to("fault_y"),
+            source_x=to("source_x"), source_y=to("source_y"),
             dip=to("dip"), strike=to("strike"),
             centroid_depth=to("depth"), length=to("length"), width=to("width"),
             disl1=to("d1"), disl2=to("d2"), disl3=to("d3"),

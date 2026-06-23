@@ -204,7 +204,7 @@ def test_okada_params_from_fault_conversion():
         "top_depth": torch.tensor([1000.0], dtype=DTYPE),
         "length": torch.tensor([5000.0], dtype=DTYPE),
         "width": torch.tensor([4000.0], dtype=DTYPE),
-        "fault_x": torch.tensor([123.0], dtype=DTYPE),   # passthrough
+        "source_x": torch.tensor([123.0], dtype=DTYPE),   # passthrough
     }
     out = okada_params_from_fault(params)
 
@@ -216,7 +216,7 @@ def test_okada_params_from_fault_conversion():
     assert torch.allclose(out["disl3"], torch.tensor([0.5], dtype=DTYPE))
     # centroid = top + 0.5*width*sin(dip) = 1000 + 0.5*4000*0.5 = 2000
     assert torch.allclose(out["centroid_depth"], torch.tensor([2000.0], dtype=DTYPE))
-    assert "fault_x" in out and torch.allclose(out["fault_x"], params["fault_x"])
+    assert "source_x" in out and torch.allclose(out["source_x"], params["source_x"])
     # raw fault keys are consumed, not passed through
     assert "slip" not in out and "top_depth" not in out
 
@@ -232,7 +232,7 @@ def test_okada_prior_plugs_into_okada_source():
     y = x.clone()
     disp = OkadaSourceSimple()(
         x, y,
-        fault_x=torch.zeros(B, dtype=DTYPE), fault_y=torch.zeros(B, dtype=DTYPE),
+        source_x=torch.zeros(B, dtype=DTYPE), source_y=torch.zeros(B, dtype=DTYPE),
         **fwd,
     )
     assert disp.e.shape == (B, N)
@@ -417,10 +417,14 @@ def test_geometry_prior_plugs_into_los_vector():
 
 
 def test_s1_default_heading_is_bimodal():
+    from torchdeform.observation import (S1_HEADING_ASCENDING_DEG,
+                                         S1_HEADING_DESCENDING_DEG)
+    alo, ahi = S1_HEADING_ASCENDING_DEG
+    dlo, dhi = S1_HEADING_DESCENDING_DEG
     out = DEFAULT_S1_GEOMETRY_PRIOR.sample((4000,), _gen(0))
     h = out["heading_deg"]
-    in_asc = (h >= -15.0) & (h <= -13.0)
-    in_desc = (h >= 193.0) & (h <= 195.0)
+    in_asc = (h >= alo) & (h <= ahi)
+    in_desc = (h >= dlo) & (h <= dhi)
     assert bool((in_asc | in_desc).all())
     assert in_asc.any() and in_desc.any()
     # incidence in the IW range

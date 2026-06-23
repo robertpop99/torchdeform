@@ -550,6 +550,19 @@ class GeometryPrior(PriorBundle):
     look_side: Prior = field(default_factory=lambda: ConstantPrior(1.0))
 
 
+@dataclass(slots=True)
+class LocationPrior(PriorBundle):
+    """Prior over a source's map location.
+
+    ``sample`` returns ``{"source_x": [B], "source_y": [B]}`` (metres), matching
+    the ``source_x``/``source_y`` arguments of the source models. Typically a
+    uniform jitter about the scene centre.
+    """
+
+    source_x: Prior
+    source_y: Prior
+
+
 # --------------------------------------------------------------------------- #
 # Default priors (angles in degrees, lengths/depths in metres, slip/opening in
 # metres). One instance per source type, collected in DEFAULT_PRIORS. The Okada

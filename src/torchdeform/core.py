@@ -296,7 +296,3 @@ class Geodetic(TensorDataclassMixin):
 
         return geodetic_to_ecef(self)
 
-
-# @dataclass(slots=True)
-# class InSARPhase(TensorDataclassMixin):
-#     phase: Tensor

@@ -34,17 +34,20 @@ from ..geometry.coordinates import _ecef_to_geodetic
 # Sentinel-1 IW realistic parameter ranges (for random sampling in training)
 # ---------------------------------------------------------------------------
 # Incidence angle across the IW swath: ~29 deg (near range) to ~46 deg (far
-# range). Heading (flight azimuth, deg CW from North) for the near-polar
-# Sentinel-1 orbit clusters tightly around two values:
-#     ascending  ~ -13 deg  (i.e. 347 deg)
-#     descending ~ -167 deg  (i.e. 193 deg)
-# with a few degrees of spread by latitude. We expose both as ranges plus a
-# convenience sampler that picks a pass direction then jitters around it.
+# range).
+#
+# Heading (flight azimuth, deg CW from North; here in the signed (-180, 180]
+# convention, so headings sit just *west* of north -> negative). Sentinel-1 is
+# near-polar (inclination 98.18 deg, retrograde), and the heading depends on the
+# scene latitude phi via sin(A) = cos(i) / cos(phi): it is ~-8 deg ascending /
+# ~-172 deg descending at the equator and steepens toward the poles
+# (~-19 / -161 deg near 65 deg latitude). The ranges below span that global
+# spread; narrow them to your area of interest's latitude band for tighter
+# samples. A convenience sampler (sample_s1_geometry) picks a pass then draws
+# uniformly within the band.
 S1_INCIDENCE_RANGE_DEG = (29.0, 46.0)
-# S1_HEADING_ASCENDING_DEG = (-16.0, -9.0)
-# S1_HEADING_DESCENDING_DEG = (-171.0, -163.0)
-S1_HEADING_ASCENDING_DEG = (-15.0, -13.0)
-S1_HEADING_DESCENDING_DEG = (193.0, 195.0)
+S1_HEADING_ASCENDING_DEG = (-19.0, -8.0)       # equator (-8) -> ~65 deg lat (-19)
+S1_HEADING_DESCENDING_DEG = (-172.0, -161.0)   # equator (-172) -> ~65 deg lat (-161)
 S1_LOOK_SIDE = +1  # right-looking
 
 

@@ -49,11 +49,12 @@ from torchdeform.observation.insar import to_phase, wrap_phase
 from torchdeform.atmosphere import turbulent_aps, stratified_aps, orbital_ramp
 from torchdeform.simulation import synthetic_dem, UniformPrior
 
-B, rows, cols = 4, 64, 64
+B, rows, cols = 4, 500, 500
+psizex, psizey = 100, 100 # metres per pixel
 
 # Observation grid: East/North metres, flattened to [B, N]
-ax = torch.linspace(-15_000, 15_000, cols)
-ay = torch.linspace(-15_000, 15_000, rows)
+ax = torch.arange(-cols / 2 * psizex, cols / 2 * psizex, psizex)
+ay = torch.arange(-rows / 2 * psizey, rows / 2 * psizey, psizey)
 yy, xx = torch.meshgrid(ay, ax, indexing="ij")
 x_obs = xx.reshape(1, -1).expand(B, -1)
 y_obs = yy.reshape(1, -1).expand(B, -1)
@@ -62,7 +63,7 @@ y_obs = yy.reshape(1, -1).expand(B, -1)
 src = OkadaSourceSimple(training_safe=True)
 disp = src(
     x_obs, y_obs,
-    fault_x=torch.zeros(B), fault_y=torch.zeros(B),
+    source_x=torch.zeros(B), source_y=torch.zeros(B),
     dip=torch.deg2rad(torch.full((B,), 45.0)),
     strike=torch.deg2rad(torch.full((B,), 30.0)),
     centroid_depth=UniformPrior(2000.0, 6000.0).sample((B,)),
@@ -94,6 +95,73 @@ ifg = wrap_phase(phase + aps)
 Because the whole chain is differentiable, you can also backpropagate a loss on
 `ifg` (or `phase`) all the way to the source/atmosphere parameters — see
 `tests/test_pipeline_gradients.py`.
+
+## Datasets
+
+For training you usually don't want to wire the pipeline by hand each time.
+`torchdeform.simulation` provides **generators** that compose priors, source
+models and atmosphere, and thin **`Dataset`** wrappers over them. A dataset is
+reproducible per index (seed `base_seed + i`) and yields *physical* samples
+(unwrapped fields + labels); your ML-target encoding goes in a `transform`.
+
+```python
+import torch
+from torchdeform import MogiSource, OkadaSourceSimple, okada_params_from_fault
+from torchdeform.observation.insar import phase_to_unit_circle
+from torchdeform.simulation import (
+    ObservationGrid, SourceGenerator, DeformationGenerator, GeometryGenerator,
+    AtmosphereGenerator, InterferogramGenerator, InsarDataset,
+    UniformPrior, synthetic_dem,
+    DEFAULT_MOGI_PRIOR, DEFAULT_EARTHQUAKE_PRIOR, DEFAULT_S1_GEOMETRY_PRIOR,
+)
+
+grid = ObservationGrid(64, 64, psizex=500.0, psizey=500.0)
+
+# which source types to generate, and how often (location sampled per item)
+deformation = DeformationGenerator(
+    grid,
+    sources={
+        "mogi": SourceGenerator(MogiSource(), DEFAULT_MOGI_PRIOR),
+        "quake": SourceGenerator(
+            OkadaSourceSimple(training_safe=True), DEFAULT_EARTHQUAKE_PRIOR,
+            to_forward=okada_params_from_fault,
+        ),
+    },
+    weights={"mogi": 1.0, "quake": 2.0},
+)
+
+geometry = GeometryGenerator(DEFAULT_S1_GEOMETRY_PRIOR)        # Sentinel-1 asc/desc
+
+atmosphere = AtmosphereGenerator(
+    grid,
+    orbital_rms=UniformPrior(2.0, 5.0),
+    turbulent_rms=UniformPrior(0.5, 1.5),
+    strat_coeff=UniformPrior(-3e-3, 3e-3),
+    dem=lambda b, g: synthetic_dem(b, grid.rows, grid.cols, relief=600.0, generator=g),
+)
+
+pipeline = InterferogramGenerator(deformation, geometry, atmosphere)
+
+# the dataset yields physical samples; encode YOUR training targets in `transform`
+def to_training(sample):
+    image = phase_to_unit_circle(sample.wrapped().squeeze(0), channel_dim=0)  # (cos, sin), [2, H, W]
+    label = sample.deformation.source_type[0]              # + normalised params, etc.
+    return image, label
+
+dataset = InsarDataset(pipeline, length=10_000, transform=to_training)
+loader = torch.utils.data.DataLoader(dataset, batch_size=32)
+images, labels = next(iter(loader))                       # [32, 2, 64, 64], 32 source-type labels
+```
+
+Each sample stores the **unwrapped** `deformation_phase` (plus `atmosphere`,
+`los`, and source `params`/`source_type`/location); call `sample.wrapped()` for
+the observable interferogram. Without a `transform`, `dataset[i]` returns the raw
+sample for inspection. The same applies to `DeformationDataset` over a
+`DeformationGenerator` if you only need the displacement field.
+
+Mapping samples to normalised regression targets (sin/cos angles, log-scaled
+depths, network head layout, ...) is intentionally left to your code — the
+library produces physical quantities, not training tensors.
 
 ## Conventions
 

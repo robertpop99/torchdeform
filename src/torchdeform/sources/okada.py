@@ -1336,7 +1336,7 @@ class OkadaSource(_OkadaBase):
         z < 0   below the surface
         z > 0   invalid
 
-    Input fault location (fault_x, fault_y) is the map location of the fault centroid.
+    Input fault location (source_x, source_y) is the map location of the fault centroid.
     Construction parameters are documented on :class:`_OkadaBase`.
     """
 
@@ -1345,8 +1345,8 @@ class OkadaSource(_OkadaBase):
         x_obs: Tensor,          # [B, N]
         y_obs: Tensor,          # [B, N]
         z_obs: Tensor,          # [B] or [B, N], Okada convention: z <= 0
-        fault_x: Tensor,        # [B]
-        fault_y: Tensor,        # [B]
+        source_x: Tensor,        # [B]
+        source_y: Tensor,        # [B]
         dip: Tensor,            # [B] radians
         strike: Tensor,         # [B] radians
         centroid_depth: Tensor, # [B], meters
@@ -1366,7 +1366,7 @@ class OkadaSource(_OkadaBase):
             Observation depth [B] (or per-pixel [B, N]), Okada convention
             ``z <= 0`` (0 at the surface, negative below). A positive value
             raises ``ValueError``.
-        fault_x, fault_y : Tensor
+        source_x, source_y : Tensor
             Map position of the fault centroid [B] in metres.
         dip, strike : Tensor
             Fault dip and strike [B] in radians.
@@ -1385,7 +1385,7 @@ class OkadaSource(_OkadaBase):
         """
         self._validate_inputs(
             x_obs, y_obs,
-            {"fault_x": fault_x, "fault_y": fault_y, "dip": dip,
+            {"source_x": source_x, "source_y": source_y, "dip": dip,
              "strike": strike, "centroid_depth": centroid_depth,
              "length": length, "width": width,
              "disl1": disl1, "disl2": disl2, "disl3": disl3},
@@ -1397,8 +1397,8 @@ class OkadaSource(_OkadaBase):
         y_obs = y_obs.to(dtype)
         z_obs = z_obs.to(dtype)
 
-        fault_x = fault_x.to(dtype)
-        fault_y = fault_y.to(dtype)
+        source_x = source_x.to(dtype)
+        source_y = source_y.to(dtype)
 
         dip = dip.to(dtype)
         strike = strike.to(dtype)
@@ -1426,8 +1426,8 @@ class OkadaSource(_OkadaBase):
         )
 
         # Observation coordinates relative to centroid reference point
-        dx = x_obs - fault_x.to(dtype)[:, None]
-        dy = y_obs - fault_y.to(dtype)[:, None]
+        dx = x_obs - source_x.to(dtype)[:, None]
+        dy = y_obs - source_y.to(dtype)[:, None]
 
         ss = torch.sin(strike.to(dtype))
         cs = torch.cos(strike.to(dtype))
@@ -1712,7 +1712,7 @@ class OkadaSourceSimple(_OkadaBase):
     the real-source and UA/UC kernels.
 
     Conventions are the same as :class:`OkadaSource`: centroid-based geometry,
-    ``(fault_x, fault_y)`` the map location of the fault centroid, distances in
+    ``(source_x, source_y)`` the map location of the fault centroid, distances in
     metres and dip/strike in radians. Construction parameters are documented on
     :class:`_OkadaBase`.
     """
@@ -1721,8 +1721,8 @@ class OkadaSourceSimple(_OkadaBase):
             self,
             x_obs: Tensor,  # [B, N]
             y_obs: Tensor,  # [B, N]
-            fault_x: Tensor,  # [B]
-            fault_y: Tensor,  # [B]
+            source_x: Tensor,  # [B]
+            source_y: Tensor,  # [B]
             dip: Tensor,  # [B] radians
             strike: Tensor,  # [B] radians
             centroid_depth: Tensor,  # [B], meters
@@ -1741,7 +1741,7 @@ class OkadaSourceSimple(_OkadaBase):
         ----------
         x_obs, y_obs : Tensor
             East/north observation coordinates [B, N] in metres.
-        fault_x, fault_y : Tensor
+        source_x, source_y : Tensor
             Map position of the fault centroid [B] in metres.
         dip, strike : Tensor
             Fault dip and strike [B] in radians.
@@ -1759,7 +1759,7 @@ class OkadaSourceSimple(_OkadaBase):
         """
         self._validate_inputs(
             x_obs, y_obs,
-            {"fault_x": fault_x, "fault_y": fault_y, "dip": dip,
+            {"source_x": source_x, "source_y": source_y, "dip": dip,
              "strike": strike, "centroid_depth": centroid_depth,
              "length": length, "width": width,
              "disl1": disl1, "disl2": disl2, "disl3": disl3},
@@ -1770,8 +1770,8 @@ class OkadaSourceSimple(_OkadaBase):
         x_obs = x_obs.to(dtype)
         y_obs = y_obs.to(dtype)
 
-        fault_x = fault_x.to(dtype)
-        fault_y = fault_y.to(dtype)
+        source_x = source_x.to(dtype)
+        source_y = source_y.to(dtype)
 
         dip = dip.to(dtype)
         strike = strike.to(dtype)
@@ -1787,8 +1787,8 @@ class OkadaSourceSimple(_OkadaBase):
             centroid_depth, length, width
         )
 
-        dx = x_obs - fault_x[:, None]
-        dy = y_obs - fault_y[:, None]
+        dx = x_obs - source_x[:, None]
+        dy = y_obs - source_y[:, None]
 
         cs = torch.cos(strike)[:, None]
         ss = torch.sin(strike)[:, None]
@@ -1967,8 +1967,8 @@ def okada_params_from_fault(params: dict[str, Tensor]) -> dict[str, Tensor]:
     params : dict[str, Tensor]
         Must contain ``strike``, ``dip``, ``rake`` (degrees), ``slip``,
         ``opening`` (m), ``top_depth``, ``length``, ``width`` (m) -- e.g. the
-        output of ``OkadaPrior.sample(...)``. Any other keys (e.g. ``fault_x``,
-        ``fault_y``) are passed through unchanged.
+        output of ``OkadaPrior.sample(...)``. Any other keys (e.g. ``source_x``,
+        ``source_y``) are passed through unchanged.
 
     Returns
     -------
@@ -1976,7 +1976,7 @@ def okada_params_from_fault(params: dict[str, Tensor]) -> dict[str, Tensor]:
         ``strike`` and ``dip`` in radians, plus ``centroid_depth``, ``length``,
         ``width``, ``disl1``, ``disl2``, ``disl3`` -- ready to splat into
         ``OkadaSource.forward`` / ``OkadaSourceSimple.forward`` alongside the
-        observation coordinates and ``fault_x`` / ``fault_y``.
+        observation coordinates and ``source_x`` / ``source_y``.
     """
     strike = torch.deg2rad(params["strike"])
     dip = torch.deg2rad(params["dip"])
