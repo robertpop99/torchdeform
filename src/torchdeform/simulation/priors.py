@@ -67,6 +67,9 @@ from ..observation.los import (
     S1_HEADING_DESCENDING_DEG,
     S1_LOOK_SIDE,
 )
+# CDM shape->forward adapter lives with the source model (cf. okada_params_from_fault);
+# re-exported here so CDMPrior and the simulation namespace can use it.
+from ..sources.cdm import cdm_params_from_shape, CDM_STYLES
 
 
 def _rand(
@@ -522,6 +525,91 @@ class PCDMPrior(PriorBundle):
 
 
 @dataclass(slots=True)
+class CDMPrior(PriorBundle):
+    """Prior over finite Compound Dislocation Model (CDM) parameters by style.
+
+    Samples a magmatic-style shape -- ``depth``, an in-plane ``radius``, an
+    ``aspect`` ratio, the potency ``dv`` (m^3), and the orientation angles
+    ``omega_x`` (tilt) and ``omega_z`` (azimuth) -- and maps it to the raw
+    :class:`~torchdeform.sources.CDMSource` inputs with
+    :func:`cdm_params_from_shape`, so ``CDMSource(**prior.sample(size),
+    source_x=..., source_y=..., x_obs=..., y_obs=...)`` works (``to_forward`` is
+    not needed; the keys already match ``forward``).
+
+    The ``style`` selects how the three semi-axes are built from ``radius`` /
+    ``aspect`` (see :func:`cdm_params_from_shape`); the standard
+    dyke / sill / sphere / prolate / oblate presets are
+    :data:`DEFAULT_CDM_PRIORS`. ``dv`` priors should produce **positive
+    magnitudes**; with ``signed=True`` (default) a single ``+/-1`` is drawn per
+    item and applied to ``dv`` so you get both inflation and deflation.
+
+    Notes
+    -----
+    The presets also carry physical validity constraints from the volcano-geodesy
+    literature -- a compactness bound ``radius/depth < 0.35``, a dyke aspect bound
+    ``a_y/a_z > 0.25`` (Kavanagh & Sparks 2011; Krumbholz et al. 2014), and a
+    ``dv/V`` chamber-compressibility guideline (Anderson & Segall 2011; Heap et al.
+    2020). These couple parameters,
+    so rather than "zero the displacement when violated" they are honoured here by
+    *choosing default ranges that satisfy them* (see :data:`DEFAULT_CDM_PRIORS`);
+    tighten the ranges, or post-filter samples, if you need hard enforcement.
+
+    The same set of magmatic styles, with these constraints, is used by Ireland
+    et al. (2026) [doi:10.22541/essoar.15001947/v1]; this is an independent
+    implementation from the underlying source geometry and that literature.
+
+    Fields
+    ------
+    depth, radius, aspect, dv, omega_x, omega_z : Prior
+        The shape parameters (see :func:`cdm_params_from_shape`).
+    style : str
+        Magmatic style, one of :data:`CDM_STYLES`.
+    signed : bool
+        Apply a shared random sign to ``dv`` (inflation/deflation).
+    flat_axis_ratio : float
+        Thin-axis fraction for the dyke/sill degenerate semi-axis.
+    """
+
+    depth: Prior
+    radius: Prior
+    aspect: Prior
+    dv: Prior
+    omega_x: Prior
+    omega_z: Prior
+    style: str = "sphere"
+    signed: bool = True
+    flat_axis_ratio: float = 1e-4
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> dict[str, Tensor]:
+        """Sample the shape parameters and map them to ``CDMSource`` kwargs.
+
+        Draws ``depth/radius/aspect/dv/omega_x/omega_z``, applies a shared
+        ``+/-1`` to ``dv`` when ``signed``, then returns
+        :func:`cdm_params_from_shape` for ``style``.
+        """
+        if self.style not in CDM_STYLES:
+            raise ValueError(
+                f"unknown CDM style {self.style!r}; expected one of {CDM_STYLES}")
+        # NB: explicit base call -- zero-arg super() breaks under @dataclass(slots=True)
+        out = PriorBundle.sample(self, size, generator, device, dtype)
+        dv = out["dv"]
+        if self.signed:
+            u = torch.rand(size, generator=generator, device=device, dtype=dtype)
+            sign = 1.0 - 2.0 * (u < 0.5).to(dtype)
+            dv = dv * sign
+        return cdm_params_from_shape(
+            self.style, depth=out["depth"], radius=out["radius"],
+            aspect=out["aspect"], dv=dv, omega_x=out["omega_x"],
+            omega_z=out["omega_z"], flat_axis_ratio=self.flat_axis_ratio)
+
+
+@dataclass(slots=True)
 class GeometryPrior(PriorBundle):
     """Prior over acquisition geometry (fields match :func:`los_vector`).
 
@@ -630,6 +718,91 @@ DEFAULT_PRIORS: dict[str, PriorBundle] = {
     "mogi": DEFAULT_MOGI_PRIOR,
     "penny": DEFAULT_PENNY_PRIOR,
     "pcdm": DEFAULT_PCDM_PRIOR,
+}
+
+# --------------------------------------------------------------------------- #
+# Finite-CDM presets, one per standard volcano-geodesy magmatic style. Ranges are
+# chosen so the validity constraints from the literature hold by construction:
+# compact sources keep radius/depth < 0.35; sheets stay submerged (vertical extent
+# < min depth) and within the radius/depth artefact guideline; the dyke aspect
+# respects a_y/a_z > 0.25 (Kavanagh & Sparks 2011; Krumbholz et al. 2014). dv
+# ranges follow the dv/V chamber-compressibility guideline (Anderson & Segall
+# 2011; Heap et al. 2020) for
+# typical sizes (not hard-enforced for the smallest cavities). The same style
+# family is used for InSAR inversion by Ireland et al. (2026); this is an
+# independent implementation. Drive them with CDMSource; angles in radians,
+# lengths in m, dv (potency) in m^3.
+# --------------------------------------------------------------------------- #
+DEFAULT_CDM_SPHERE_PRIOR = CDMPrior(
+    depth=LogUniformPrior(3_000.0, 15_000.0),
+    radius=UniformPrior(200.0, 1_000.0),     # radius/depth <= 1000/3000 < 0.35
+    aspect=ConstantPrior(1.0),               # unused (isotropic)
+    dv=LogUniformPrior(1e5, 1e7),
+    omega_x=ConstantPrior(0.0),              # orientation irrelevant for a sphere
+    omega_z=ConstantPrior(0.0),
+    style="sphere",
+)
+
+DEFAULT_CDM_PROLATE_PRIOR = CDMPrior(
+    depth=LogUniformPrior(3_000.0, 15_000.0),
+    radius=UniformPrior(200.0, 1_000.0),     # a_z = radius; radius/depth < 0.35
+    aspect=UniformPrior(0.2, 0.9),           # a_x = a_y = radius*aspect (equatorial < polar)
+    dv=LogUniformPrior(1e5, 1e7),
+    omega_x=UniformPrior(-math.pi / 2, math.pi / 2),
+    omega_z=UniformPrior(0.0, 2.0 * math.pi),
+    style="prolate",
+)
+
+DEFAULT_CDM_OBLATE_PRIOR = CDMPrior(
+    depth=LogUniformPrior(3_000.0, 15_000.0),
+    radius=UniformPrior(200.0, 1_000.0),     # a_x = a_y = radius
+    aspect=UniformPrior(0.1, 0.8),           # a_z = radius*aspect (flattened)
+    dv=LogUniformPrior(1e5, 1e7),
+    omega_x=UniformPrior(-math.pi / 2, math.pi / 2),
+    omega_z=UniformPrior(0.0, 2.0 * math.pi),
+    style="oblate",
+)
+
+DEFAULT_CDM_DYKE_PRIOR = CDMPrior(
+    depth=LogUniformPrior(5_000.0, 15_000.0),
+    radius=UniformPrior(500.0, 3_000.0),     # a_y (along-strike half-length)
+    aspect=UniformPrior(0.3, 1.5),           # a_z/a_y: vert extent <= 4500 < min depth; a_y/a_z > 0.25
+    dv=LogUniformPrior(1e5, 1e7),
+    omega_x=ConstantPrior(0.0),              # vertical sheet
+    omega_z=UniformPrior(0.0, math.pi),      # strike (pi symmetry)
+    style="dyke",
+)
+
+DEFAULT_CDM_SILL_PRIOR = CDMPrior(
+    depth=LogUniformPrior(5_000.0, 15_000.0),
+    radius=UniformPrior(500.0, 3_000.0),     # a_x
+    aspect=UniformPrior(0.5, 1.5),           # a_y/a_x: in-plane extent <= 4500 < min depth
+    dv=LogUniformPrior(1e5, 1e7),
+    omega_x=ConstantPrior(0.0),              # horizontal sheet
+    omega_z=UniformPrior(0.0, math.pi),
+    style="sill",
+)
+
+DEFAULT_CDM_SILL_SYMMETRIC_PRIOR = CDMPrior(
+    depth=LogUniformPrior(5_000.0, 15_000.0),
+    radius=UniformPrior(500.0, 3_000.0),
+    aspect=ConstantPrior(1.0),               # circular horizontal sheet
+    dv=LogUniformPrior(1e5, 1e7),
+    omega_x=ConstantPrior(0.0),
+    omega_z=ConstantPrior(0.0),
+    style="sill",
+)
+
+#: Default finite-CDM prior per magmatic style, keyed by name. The
+#: ``sphere`` preset covers both the symmetric and "simple" sphere setups (a
+#: sphere is isotropic, so orientation is irrelevant).
+DEFAULT_CDM_PRIORS: dict[str, CDMPrior] = {
+    "dyke": DEFAULT_CDM_DYKE_PRIOR,
+    "sill": DEFAULT_CDM_SILL_PRIOR,
+    "sill_symmetric": DEFAULT_CDM_SILL_SYMMETRIC_PRIOR,
+    "sphere": DEFAULT_CDM_SPHERE_PRIOR,
+    "prolate": DEFAULT_CDM_PROLATE_PRIOR,
+    "oblate": DEFAULT_CDM_OBLATE_PRIOR,
 }
 
 #: Sentinel-1 IW acquisition geometry: bimodal heading (ascending/descending),

@@ -7,10 +7,11 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 Third-party components
 -------------------------------------------------------------------------------
 
-Point Compound Dislocation Model (pCDM)
-  src/torchdeform/sources/pcdm.py is a derivative work (a differentiable,
-  batched PyTorch port of the surface-displacement computation) of the MATLAB
-  "pCDM" function by Mehdi Nikkhoo, used under the MIT License:
+Compound dislocation models (pCDM / CDM / pECM)
+  src/torchdeform/sources/pcdm.py, src/torchdeform/sources/cdm.py and
+  src/torchdeform/sources/pecm.py are derivative works (differentiable, batched
+  PyTorch ports of the surface-displacement computations) of the MATLAB "pCDM",
+  "CDM" and "pECM" functions by Mehdi Nikkhoo, used under the MIT License:
 
     Copyright (c) 2016 Mehdi Nikkhoo
 
@@ -37,3 +38,29 @@ Point Compound Dislocation Model (pCDM)
     Nikkhoo, M., Walter, T. R., Lundgren, P. R., Prats-Iraola, P. (2017),
     "Compound dislocation models (CDMs) for volcano deformation analyses",
     Geophysical Journal International, 208(2), 877-894.
+
+-------------------------------------------------------------------------------
+
+Acknowledgments (CDM magmatic-style parameterisation)
+  The convenience layer that restricts the CDM to named magmatic styles
+  (src/torchdeform/sources/cdm.py: cdm_params_from_shape, and the DEFAULT_CDM_*
+  presets in src/torchdeform/simulation/priors.py) is an INDEPENDENT
+  implementation built from the elementary source geometry, the CDM potency
+  relation of Nikkhoo et al. (2017) (see above), and physical validity thresholds
+  taken from the published literature (Kavanagh & Sparks 2011; Krumbholz et al.
+  2014; Anderson & Segall 2011; Heap et al. 2020). Its per-style parameterisation
+  was extracted clean-room from the publication below and its supplement; the
+  cited derivation is recorded in docs/cdm_style_provenance.md. It contains no
+  third-party source code and carries no third-party copyleft/attribution
+  obligation; the items below are scientific acknowledgments only.
+
+  - The practice of driving compound-dislocation sources as named magmatic
+    styles for geodetic Bayesian inversion was popularised by GBIS (Geodetic
+    Bayesian Inversion Software, Marco Bagnardi, 2017; BSD 2-Clause).
+
+  - The same style family is used for InSAR source inversion of the East African
+    Rift System by Ben Ireland and colleagues. If you use these CDM-style priors,
+    please cite:
+      Ireland, B., Biggs, J., Albino, F., et al. (2026), "Along-rift variations
+      in magma system geometry observed using Sentinel-1 InSAR data from the East
+      African Rift System," ESS Open Archive, doi:10.22541/essoar.15001947/v1.
