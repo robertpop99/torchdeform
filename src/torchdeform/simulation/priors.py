@@ -156,8 +156,8 @@ class LogUniformPrior(Prior):
     low: float
     high: float
 
-    _lo: float = field(init=False)
-    _hi: float = field(init=False)
+    _lo: float = field(init=False, repr=False)
+    _hi: float = field(init=False, repr=False)
 
     def __post_init__(self):
         if self.low <= 0:
@@ -211,7 +211,7 @@ class SignedLogUniformPrior(Prior):
     low: float
     high: float
 
-    _logu: LogUniformPrior = field(init=False)
+    _logu: LogUniformPrior = field(init=False, repr=False)
 
     def __post_init__(self):
         if self.low <= 0:

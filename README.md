@@ -175,6 +175,42 @@ Mapping samples to normalised regression targets (sin/cos angles, log-scaled
 depths, network head layout, ...) is intentionally left to your code — the
 library produces physical quantities, not training tensors.
 
+## Priors
+
+The `DEFAULT_*` priors (and the `DEFAULT_CDM_*` magmatic-style presets) are
+**general-purpose, plug-and-use defaults** — sensible ranges to get a pipeline
+running, *not* calibrated or authoritative values for any particular volcano,
+fault, or region. Treat them as a starting point, and define your own whenever a
+task needs specific ranges.
+
+A prior bundle is a plain dataclass, so inspect any preset by printing it:
+
+```python
+from torchdeform.simulation import DEFAULT_MOGI_PRIOR, DEFAULT_CDM_PRIORS
+print(DEFAULT_MOGI_PRIOR)            # fields and their ranges
+print(DEFAULT_CDM_PRIORS["dyke"])    # styles: sphere / prolate / oblate / dyke / sill
+```
+
+Rolling your own is a one-liner — a bundle is just per-parameter distributions
+named after the model's `forward` arguments:
+
+```python
+from torchdeform.simulation import MogiPrior, LogUniformPrior, SignedLogUniformPrior
+
+my_prior = MogiPrior(
+    depth=LogUniformPrior(500.0, 4_000.0),       # e.g. shallow sources only
+    delta_v=SignedLogUniformPrior(1e5, 1e7),
+)
+my_prior.sample((8,))                            # -> {"depth": [8], "delta_v": [8]}
+```
+
+The same applies to `OkadaPrior`, `PCDMPrior`, `CDMPrior`, etc. — pass any
+`UniformPrior` / `LogUniformPrior` / `ConstantPrior` (or your own `Prior`
+subclass) per field. The CDM magmatic-style presets in particular use
+torchdeform's own sampling ranges, not the inversion bounds of any study; see
+[`docs/cdm_style_provenance.md`](docs/cdm_style_provenance.md) for what each
+style means and where it comes from.
+
 ## Conventions
 
 - **Units**: distances in metres, angles in radians inside the models
