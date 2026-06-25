@@ -104,7 +104,13 @@ def fpkernel_vec(h, t, r, n, *, eps=NUM_EPS, dlt=1e-6):
     -------
     tensor broadcast over h, t, r
     """
-    p = 4.0 * h * h
+    # Floor p (= 4h²) away from 0. At depth 0 (h == 0, p == 0) the kernel
+    # building blocks kg/kern and the log argument all collapse to 0/0 → NaN on
+    # the diagonal (where t == r, so t ± r and the log numerator vanish). Every
+    # kernel carries an overall factor of p or h, so it still → 0 as h → 0; the
+    # floor only keeps the intermediates finite. clamp is inert for any
+    # realistic depth (4h² ≫ eps), so existing results are unchanged.
+    p = torch.clamp(4.0 * h * h, min=eps)
 
     if n == 1:  # KN
         return p * h * (kg(t - r, p) - kg(t + r, p))
@@ -409,6 +415,12 @@ class PennySource(SourceModel):
             {"source_x": source_x, "source_y": source_y, "depth": depth,
              "radius": radius, "pressure": pressure},
         )
+
+        # radius == 0 collapses the penny to a point: dx, dy, h and Pf all divide
+        # by it, poisoning the whole batch with NaN (forward and gradient) with no
+        # clean way to recover. Fail loudly instead.
+        if torch.any(radius <= 0):
+            raise ValueError("radius must be strictly positive (> 0)")
 
         dtype = self.internal_dtype
         device = x_obs.device
