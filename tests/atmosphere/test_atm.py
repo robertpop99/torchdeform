@@ -507,6 +507,38 @@ class TestCovarianceEstimation:
         var, cl = fit_exponential_covariance(f, psizex=300.0, psizey=300.0)
         assert var.ndim == 0 and cl.ndim == 0
 
+    def test_nls_is_more_accurate_than_loglinear(self):
+        """The default NLS fit recovers corr_len far closer than log-linear."""
+        true_cl = 3000.0
+        f = self._field(true_cl, N=32)
+        _, cl_nls = fit_exponential_covariance(
+            f, psizex=300.0, psizey=300.0, demean=False, method="nls")
+        _, cl_log = fit_exponential_covariance(
+            f, psizex=300.0, psizey=300.0, demean=False, method="loglinear")
+        err_nls = abs(cl_nls.mean().item() - true_cl) / true_cl
+        err_log = abs(cl_log.mean().item() - true_cl) / true_cl
+        assert err_nls < 0.1            # within ~10% on the exact-covariance ref
+        assert err_nls < err_log        # and strictly better than the legacy fit
+
+    def test_nls_variance_is_zero_lag_sample_variance(self):
+        """NLS reports the unbiased sill, not the fitted nuisance amplitude."""
+        f = self._field(3000.0, N=16)
+        var, _ = fit_exponential_covariance(
+            f, psizex=300.0, psizey=300.0, demean=False, method="nls")
+        sample_var = f.pow(2).mean(dim=(-2, -1))
+        assert torch.allclose(var, sample_var.clamp_min(1e-12))
+
+    def test_unknown_method_raises(self):
+        with pytest.raises(ValueError, match="unknown method"):
+            fit_exponential_covariance(self._field(3000.0, N=1), method="bogus")
+
+    def test_nls_fit_is_differentiable(self):
+        f = self._field(3000.0, N=2).clone().requires_grad_(True)
+        var, cl = fit_exponential_covariance(f, psizex=300.0, psizey=300.0,
+                                             demean=False, method="nls")
+        (var.sum() + cl.sum()).backward()
+        assert f.grad is not None and torch.isfinite(f.grad).all()
+
 
 if __name__ == "__main__":
     import sys

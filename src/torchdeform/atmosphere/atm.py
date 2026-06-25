@@ -93,7 +93,10 @@ Calibrating from data
 :func:`fit_exponential_covariance` fits ``maxvar exp(-alpha r)`` to it, so the
 generator parameters (variance, ``correlation_length = 1/alpha``) can be measured
 from a real interferogram and fed straight back into the exponential
-:func:`turbulent_aps` / :func:`correlated_noise_cholesky`.
+:func:`turbulent_aps` / :func:`correlated_noise_cholesky`. The fit defaults to a
+linear-space nonlinear least squares (``method="nls"``), which recovers the
+correlation length far more accurately than the legacy log-linear closed form
+(``method="loglinear"``); see that function's docstring.
 """
 import math
 from typing import Optional, Union
@@ -753,6 +756,44 @@ def covariance_vs_distance(
     return distance, (cov[0] if squeeze else cov)
 
 
+def _fit_alpha_nls(
+    distance: torch.Tensor,
+    cov: torch.Tensor,
+    var: torch.Tensor,
+    iters: int,
+    eps: float,
+) -> torch.Tensor:
+    """Recover ``alpha`` of ``a*exp(-alpha r)`` by damped Gauss-Newton (batched).
+
+    Fits amplitude ``a`` and rate ``alpha`` jointly to the binned covariance
+    ``cov`` ``[B, n_bins]`` in *linear* space (least squares), returning only
+    ``alpha`` ``[B]`` (the amplitude is a nuisance parameter, see
+    :func:`fit_exponential_covariance`). Fixed iteration count and pure tensor
+    ops keep it differentiable.
+    """
+    B = cov.shape[0]
+    r = distance[None].expand(B, -1)                    # [B, n_bins]
+    # init: a third of the largest binned lag is a robust correlation length
+    # across scales, and starts inside the well-conditioned part of the curve.
+    alpha = (1.0 / (0.3 * distance[-1])).expand(B).clone()
+    a = var.clone()
+    for _ in range(iters):
+        e = torch.exp(-alpha[:, None] * r)
+        resid = cov - a[:, None] * e
+        Ja = e                                          # d model / d a
+        Jal = -a[:, None] * r * e                       # d model / d alpha
+        Jaa = (Ja * Ja).sum(1)
+        Jaal = (Ja * Jal).sum(1)
+        Jalal = (Jal * Jal).sum(1)
+        lam = 1e-9 * (Jaa + Jalal)                      # Levenberg-Marquardt floor
+        ga = (Ja * resid).sum(1)
+        gal = (Jal * resid).sum(1)
+        det = ((Jaa + lam) * (Jalal + lam) - Jaal * Jaal).clamp_min(eps)
+        a = a + ((Jalal + lam) * ga - Jaal * gal) / det
+        alpha = (alpha + (-Jaal * ga + (Jaa + lam) * gal) / det).clamp_min(eps)
+    return alpha
+
+
 def fit_exponential_covariance(
     field: torch.Tensor,
     psizex: float = 1.0,
@@ -760,6 +801,8 @@ def fit_exponential_covariance(
     n_bins: int = 50,
     max_distance: Optional[float] = None,
     demean: bool = True,
+    method: str = "nls",
+    nls_iters: int = 60,
     eps: float = 1e-12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fit ``maxvar * exp(-alpha r)`` to a field's radial autocovariance.
@@ -769,11 +812,30 @@ def fit_exponential_covariance(
     exponential :func:`turbulent_aps`, and ``(maxvar, alpha)`` for
     :func:`correlated_noise_cholesky`.
 
-    ``maxvar`` is the zero-lag variance (per image); ``alpha`` is recovered from
-    the binned covariance curve (:func:`covariance_vs_distance`) by a stable,
-    closed-form weighted log-linear fit -- ``log cov ~ log maxvar - alpha r``,
-    weighted by the (positive) covariance so the reliable near field dominates
-    and the noisy/negative tail is ignored.
+    ``maxvar`` is always the zero-lag variance (per image) -- the unbiased,
+    closed-form estimate of the sill, which the generators set exactly. Only the
+    way ``alpha`` (hence ``correlation_length``) is recovered depends on
+    ``method``:
+
+    * ``method="nls"`` (default) -- a few damped Gauss-Newton steps that fit
+      ``a*exp(-alpha r)`` to the *binned covariance curve* in linear space, with
+      ``a`` a free nuisance amplitude. Working in linear space the near-zero far
+      field contributes negligible residual, so the noisy / negative tail no
+      longer biases the slope, and letting the amplitude float off the zero-lag
+      value absorbs the discretisation "nugget" near ``r=0``. This is markedly
+      more accurate than the log-linear fit (typically a few percent vs tens of
+      percent on the exact-covariance :func:`correlated_noise_cholesky`
+      reference, and robust where the log-linear ``alpha`` underflows). The free
+      amplitude ``a`` is discarded; the returned variance is still the zero-lag
+      sample variance. On a finite scene with ``correlation_length`` approaching
+      the scene size the recovery is still biased short -- the realised field
+      genuinely lacks that long-range structure -- but that limit is fundamental,
+      not a fitting artefact.
+    * ``method="loglinear"`` -- the legacy stable closed form: a weighted fit of
+      ``log cov ~ log maxvar - alpha r`` with the intercept pinned to ``maxvar``
+      and weights ``max(cov, 0)``. Fast and dependency-free, but biases
+      ``correlation_length`` long (the ``cov*r^2`` weighting in the normal
+      equations lets small positive far-field noise drag the slope shallow).
 
     Parameters
     ----------
@@ -782,6 +844,11 @@ def fit_exponential_covariance(
     psizex, psizey, n_bins, max_distance, demean
         Passed to :func:`covariance_vs_distance` (see its note on the finite-scene
         bias from ``demean``).
+    method : {'nls', 'loglinear'}
+        How ``alpha`` is recovered from the covariance curve (see above).
+    nls_iters : int
+        Gauss-Newton iterations for ``method='nls'``. The default converges
+        comfortably; the cost is a handful of cheap ``2x2`` solves.
     eps : float
         Numerical floor.
 
@@ -791,6 +858,8 @@ def fit_exponential_covariance(
         ``variance`` and ``correlation_length`` (= ``1 / alpha``), each a scalar
         for a 2-D input or ``[B]`` for a batch.
     """
+    if method not in ("nls", "loglinear"):
+        raise ValueError(f"unknown method {method!r} (use 'nls' or 'loglinear')")
     squeeze = field.ndim == 2
     if squeeze:
         field = field[None]
@@ -806,13 +875,16 @@ def fit_exponential_covariance(
     r = distance[None]                                  # [1, n_bins]
     maxvar = var[:, None]                               # [B, 1]
 
-    # weighted log-linear fit: log(cov) ~ log(maxvar) - alpha r, weighted by the
-    # positive covariance (down-weights the noisy / negative far-field tail)
-    w = cov.clamp_min(0.0)
-    log_ratio = torch.log(cov.clamp_min(eps)) - torch.log(maxvar)
-    num = (w * r * log_ratio).sum(dim=1)
-    den = (w * r * r).sum(dim=1).clamp_min(eps)
-    alpha = (-num / den).clamp_min(eps)
+    if method == "loglinear":
+        # weighted log-linear fit: log(cov) ~ log(maxvar) - alpha r, weighted by
+        # the positive covariance (down-weights the noisy / negative far tail)
+        w = cov.clamp_min(0.0)
+        log_ratio = torch.log(cov.clamp_min(eps)) - torch.log(maxvar)
+        num = (w * r * log_ratio).sum(dim=1)
+        den = (w * r * r).sum(dim=1).clamp_min(eps)
+        alpha = (-num / den).clamp_min(eps)
+    else:
+        alpha = _fit_alpha_nls(distance, cov, var, nls_iters, eps)
 
     corr_len = 1.0 / alpha
     if squeeze:
