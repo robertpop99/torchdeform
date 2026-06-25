@@ -21,7 +21,12 @@ fitting.
 
 - **Source models** (`torchdeform.sources`): Mogi point source, the full Okada
   rectangular finite-fault dislocation (`OkadaSource`) and its surface-only
-  fast path (`OkadaSourceSimple`), and a penny-shaped crack. All differentiable
+  fast path (`OkadaSourceSimple`), and a penny-shaped crack. For magmatic
+  sources there is a compound-dislocation family — `PCDMSource` (point compound
+  dislocation, a triaxial volcanic point source), `CDMSource` (its finite
+  counterpart, with a `cdm_params_from_shape` helper and sphere/prolate/oblate/
+  dyke/sill style presets), and `PECMSource` (point ellipsoidal cavity, a
+  uniformly pressurised point ellipsoid). All differentiable
   in their parameters. The Okada sources take two optional gradient modes
   (default: plain autograd of the exact forward): `analytic_grad=True` returns
   closed-form Okada strains for gradients that stay accurate even at the singular
@@ -31,7 +36,9 @@ fitting.
   geometry and displacement ⇄ phase conversions, phase wrapping and a
   wrap-invariant loss.
 - **Atmosphere** (`torchdeform.atmosphere`): spectral turbulent atmospheric phase
-  screens (Kolmogorov / exponential) and topography-correlated stratified delay.
+  screens (Kolmogorov / exponential) and topography-correlated stratified delay,
+  plus covariance diagnostics (`covariance_vs_distance`,
+  `fit_exponential_covariance`) for measuring and calibrating screen statistics.
 - **Simulation helpers** (`torchdeform.simulation`): synthetic fractal DEMs and
   parameter priors for randomised scene generation.
 - **Geometry & core** (`torchdeform.geometry`, `torchdeform.core`): WGS84
