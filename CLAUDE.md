@@ -36,7 +36,17 @@ optimisation/inversion loop.
   - `mogi.py` → `MogiSource` (point source)
   - `okada.py` → `OkadaSource` (full rectangular finite-fault dislocation),
     `OkadaSourceSimple` (surface-only fast path), `okada_params_from_fault`.
-    Biggest file (~2000 lines). `training_safe=True` smooths singularities for finite gradients.
+    Biggest file (~2600 lines). Reference Fortran: `DC3D.f90` (root, used to
+    port the strain kernels).
+    Two mutually-exclusive gradient modes on both classes (default: plain
+    autograd of the exact forward): `smooth_grad=True` smooths singularities for
+    finite (approximate) gradients; `analytic_grad=True` keeps exact forward
+    values and returns the closed-form DC3D strain as the backward (kernels
+    `ua_/ub_/uc_displacement_and_derivatives`) — exact obs-coordinate + source
+    gradients even on singular fault planes, geometry/slips via autograd of the
+    exact forward, dip via a wide central difference (accurate through vertical).
+    `analytic_grad` routes through `_evaluate` + an autograd.Function; the
+    forward-only path skips the strain so data-gen pays nothing.
   - `penny.py` → `PennySource` (penny-shaped crack)
   - `pcdm.py` → `PCDMSource` (point compound dislocation model)
 

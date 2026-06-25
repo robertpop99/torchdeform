@@ -1,5 +1,9 @@
 from .mogi import MogiSource
-from .okada import OkadaSource, OkadaSourceSimple, okada_params_from_fault
+from .okada import (
+    OkadaSource,
+    OkadaSourceSimple,
+    okada_params_from_fault,
+)
 from .penny import PennySource
 from .pcdm import PCDMSource
 from .cdm import CDMSource, cdm_params_from_shape, CDM_STYLES

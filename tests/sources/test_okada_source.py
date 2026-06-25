@@ -20,8 +20,8 @@ Validation strategy
      continuity of FullZ as z -> 0-.
 
 4. Numerical health: singular on-trace points return finite values,
-   training_safe mode produces finite gradients on a grid crossing the
-   fault trace, and torch.autograd.gradcheck passes in training_safe
+   smooth_grad mode produces finite gradients on a grid crossing the
+   fault trace, and torch.autograd.gradcheck passes in smooth_grad
    mode at a benign configuration.
 
 Geometry conversion for the Okada-85 Case 2 test
@@ -229,19 +229,17 @@ def _checklist_inputs(x, y, d, dip_deg, L, W):
     return depth_c, de, dn, dip
 
 
-# Only Case 2 has a smooth displacement field at the observation point.
-# Cases 3 and 4 are vertical, surface-breaking faults observed ON the fault
-# trace, where the strike/dip slip makes displacement DISCONTINUOUS across
-# the plane. The displacement there is well-defined (the average of the two
-# sides -- which is why the displacement checklist passes on-trace), but the
-# spatial derivative ACROSS the discontinuity is not: its value depends on
-# the approach direction. Okada's analytic table reports one limiting
-# convention; autograd of a (smoothed) field reports another; neither is
-# "wrong", the quantity is simply ill-defined there. So derivatives are only
-# checked against the analytic table where the field is smooth -- Case 2.
-# (On-trace gradient *finiteness* for the singular cases is already covered
-# by test_no_nan_values_or_gradients_training_safe.)
-OKADA85_DERIV_ROWS = [r for r in OKADA85_CHECKLIST if r[0] == "case2"]
+# All three checklist cases have a well-defined horizontal spatial derivative.
+# Cases 3 and 4 sit directly above a *buried* vertical fault (top edge at depth
+# 2 and 4 respectively, since centroid_depth = d - (W/2) sin(dip)), so the
+# displacement field is continuous there and the cross-trace derivative has a
+# single value -- equal to Okada's Table-2 entry, confirmed by symmetric finite
+# differences. The reason these rows previously could not be checked by autograd
+# is the `smooth_grad` SMOOTHING: at a vertical dip (cd = cos(dip) = 0) the
+# smoothed kernel's gradient drifts far from the analytic value. The analytic
+# backend (OkadaSourceSimple(analytic_grad=True)) returns the closed-form Okada strain
+# instead and reproduces the table for every case.
+OKADA85_DERIV_ROWS = list(OKADA85_CHECKLIST)
 
 
 def _benign_inputs_simplified(dtype, device="cpu"):
@@ -294,14 +292,13 @@ class TestOkada85Reference:
         "row", OKADA85_DERIV_ROWS,
         ids=[f"{r[0]}-{r[1]}" for r in OKADA85_DERIV_ROWS],
     )
-    @pytest.mark.parametrize("which", ["simplified", "fullz"])
-    def test_okada85_checklist_derivatives(self, row, which):
+    def test_okada85_checklist_derivatives(self, row):
         """Columns 4-9 of the Okada-85 checklist: horizontal spatial derivatives
-        of displacement, obtained by autograd of the (differentiable) forward
-        pass w.r.t. the observation coordinates rather than analytic formulas.
-
-        Restricted to Case 2, the only checklist geometry whose displacement
-        field is smooth at the observation point (see OKADA85_DERIV_ROWS note).
+        of displacement, obtained by autograd of OkadaSourceSimple(analytic_grad=True) w.r.t.
+        the observation coordinates. Its backward returns the closed-form Okada
+        strain, so it reproduces the table for *every* checklist case -- including
+        the vertical-dip Cases 3 and 4 where autograd of the smoothed forward
+        drifts (see OKADA85_DERIV_ROWS note).
 
         Frame/coordinate mapping (strike = 0):
             un = ux_okada, ue = uy_okada, uu = uz_okada
@@ -311,9 +308,6 @@ class TestOkada85Reference:
             dux/dx = d(un)/d(y_obs)     dux/dy = d(un)/d(x_obs)
             duy/dx = d(ue)/d(y_obs)     duy/dy = d(ue)/d(x_obs)
             duz/dx = d(uu)/d(y_obs)     duz/dy = d(uu)/d(x_obs)
-
-        Run in training_safe=True for consistency with the gradient-health
-        tests; Case 2 is off-fault so exact mode would also work here.
         """
         name, comp, x, y, d, dip_deg, L, W, slip_table, _disp = row
         d1, d2, d3 = slip_table[comp]
@@ -329,12 +323,8 @@ class TestOkada85Reference:
             centroid_depth=t([depth_c]), length=t([float(L)]), width=t([float(W)]),
             disl1=t([d1]), disl2=t([d2]), disl3=t([d3]),
         )
-        if which == "simplified":
-            model = OkadaSourceSimple(training_safe=True)
-            out = model(x_obs=x_obs, y_obs=y_obs, **kw)
-        else:
-            model = OkadaSource(training_safe=True)
-            out = model(x_obs=x_obs, y_obs=y_obs, z_obs=t([0.0]), **kw)
+        model = OkadaSourceSimple(analytic_grad=True)
+        out = model(x_obs=x_obs, y_obs=y_obs, **kw)
 
         def grads(scalar_field):
             # Single observation point: .sum() picks out the lone entry; its
@@ -353,14 +343,287 @@ class TestOkada85Reference:
         got = torch.stack([duxdx, duxdy, duydx, duydy, duzdx, duzdy])
         want = t(OKADA85_DERIV[(name, comp)])
 
-        # Case 2 is off-fault and smooth, so autograd should match the analytic
-        # table to its 4-sig-fig precision. A small absolute floor covers
-        # entries near zero.
+        # The analytic strain matches the table to its 4-sig-fig precision for
+        # every case. A small absolute floor covers entries near zero.
         assert torch.allclose(got, want, rtol=3e-3, atol=5e-6), (
-            f"{name}/{comp}/{which} derivatives:\n"
+            f"{name}/{comp} derivatives:\n"
             f"  got  {[f'{v:+.3e}' for v in got.tolist()]}\n"
             f"  want {[f'{v:+.3e}' for v in want.tolist()]}"
         )
+
+class TestAnalyticBackend:
+    """OkadaSourceSimple(analytic_grad=True): exact forward + closed-form Okada-strain backward.
+
+    Gradients w.r.t. observation coords, source location, length, width,
+    centroid_depth and strike are analytic (closed-form Okada strain); dip and
+    the slips are delegated to an exact-forward pass.
+    """
+
+    def test_forward_matches_exact_simplified(self):
+        """Forward values are identical to the exact OkadaSourceSimple (drop-in)."""
+        p = random_params(5, batch=3, n=7)
+        ref = OkadaSourceSimple(smooth_grad=False)
+        ana = OkadaSourceSimple(analytic_grad=True)
+        kw = dict(
+            x_obs=p["x_obs"], y_obs=p["y_obs"],
+            source_x=p["source_x"], source_y=p["source_y"],
+            dip=p["dip"], strike=p["strike"], centroid_depth=p["depth"],
+            length=p["length"], width=p["width"],
+            disl1=p["d1"], disl2=p["d2"], disl3=p["d3"],
+        )
+        a, b = ana(**kw), ref(**kw)
+        for nm in ("e", "n", "u"):
+            assert torch.allclose(getattr(a, nm), getattr(b, nm),
+                                  rtol=1e-12, atol=1e-15)
+
+    def test_obs_gradient_matches_finite_difference(self):
+        """Analytic observation-coordinate gradient matches central differences
+        of the exact forward at a benign (smooth) configuration."""
+        ana = OkadaSourceSimple(analytic_grad=True)
+        ref = OkadaSourceSimple(smooth_grad=False)
+        kw = dict(
+            source_x=t([0.0]), source_y=t([0.0]),
+            dip=t([0.9]), strike=t([0.7]), centroid_depth=t([9e3]),
+            length=t([8e3]), width=t([4e3]),
+            disl1=t([1.0]), disl2=t([-0.5]), disl3=t([0.2]),
+        )
+        x0, y0 = t([[3e3, -7e3]]), t([[5e3, 9e3]])
+        xg = x0.clone().requires_grad_(True)
+        out = ana(x_obs=xg, y_obs=y0.clone(), **kw)
+        (gx,) = torch.autograd.grad(out.u.sum(), xg)
+
+        h = 1.0
+        up = ref(x_obs=x0 + h, y_obs=y0, **kw).u
+        dn = ref(x_obs=x0 - h, y_obs=y0, **kw).u
+        fd = (up - dn) / (2 * h)
+        assert torch.allclose(gx, fd, rtol=1e-5, atol=1e-9)
+
+    @pytest.mark.parametrize(
+        "param,h",
+        [("centroid_depth", 1.0), ("length", 1.0), ("width", 1.0),
+         ("source_x", 1.0), ("source_y", 1.0), ("strike", 1e-6)],
+    )
+    def test_geometry_gradient_matches_finite_difference(self, param, h):
+        """Each analytic geometry/location gradient (everything except dip and
+        the slips) matches central differences of the exact forward."""
+        ana = OkadaSourceSimple(analytic_grad=True)
+        ref = OkadaSourceSimple(smooth_grad=False)
+        base = dict(
+            x_obs=t([[3e3, -7e3, 12e3]]), y_obs=t([[5e3, 9e3, -4e3]]),
+            source_x=t([0.0]), source_y=t([0.0]),
+            dip=t([0.9]), strike=t([0.7]), centroid_depth=t([9e3]),
+            length=t([8e3]), width=t([4e3]),
+            disl1=t([1.0]), disl2=t([-0.5]), disl3=t([0.2]),
+        )
+
+        def loss(model, **kw):
+            o = model(**kw)
+            return (o.e**2 + o.n**2 + o.u**2).sum()
+
+        kw = {k: (v.clone().requires_grad_(True) if k == param else v.clone())
+              for k, v in base.items()}
+        loss(ana, **kw).backward()
+        analytic = kw[param].grad
+
+        kp = dict(base); kp[param] = base[param] + h
+        km = dict(base); km[param] = base[param] - h
+        fd = (loss(ref, **kp) - loss(ref, **km)) / (2 * h)
+        # FD of a scalar loss -> gradient summed over the param's entries.
+        assert torch.allclose(analytic.sum(), fd, rtol=1e-5, atol=1e-9)
+
+    @pytest.mark.parametrize("dip_deg", [45.0, 89.0, 89.99, 90.0, 90.001])
+    def test_dip_gradient_accurate_through_vertical(self, dip_deg):
+        """dip gradient matches the exact forward's derivative right through the
+        vertical manifold -- including exactly dip = 90 deg -- where the smoothed
+        path drifts by orders of magnitude and naive autograd is ill-conditioned.
+
+        Reference is a wide (1e-3 rad) central difference of the exact forward:
+        the kernel's 1/cos(dip)^2 terms lose precision for |cos(dip)| <~ 1e-3, so
+        a narrow-step FD is itself unreliable near vertical (this is exactly why
+        the module uses a wide step internally)."""
+        ana = OkadaSourceSimple(analytic_grad=True)
+        ref = OkadaSourceSimple(smooth_grad=False)
+        base = dict(
+            x_obs=t([[3e3, -7e3, 12e3]]), y_obs=t([[5e3, 9e3, -4e3]]),
+            source_x=t([0.0]), source_y=t([0.0]),
+            dip=t([math.radians(dip_deg)]), strike=t([0.7]),
+            centroid_depth=t([6e3]), length=t([8e3]), width=t([4e3]),
+            disl1=t([1.0]), disl2=t([-0.5]), disl3=t([0.2]),
+        )
+
+        def loss(model, **kw):
+            o = model(**kw)
+            return (o.e**2 + o.n**2 + o.u**2).sum()
+
+        kw = {k: (v.clone().requires_grad_(True) if k == "dip" else v.clone())
+              for k, v in base.items()}
+        loss(ana, **kw).backward()
+        g = kw["dip"].grad
+
+        h = 1e-3
+        kp = dict(base); kp["dip"] = base["dip"] + h
+        km = dict(base); km["dip"] = base["dip"] - h
+        fd = (loss(ref, **kp) - loss(ref, **km)) / (2 * h)
+        assert torch.isfinite(g).all()
+        assert torch.allclose(g.sum(), fd, rtol=1e-3, atol=1e-9)
+
+    @pytest.mark.parametrize("device", DEVICES)
+    def test_gradcheck_all_params(self, device):
+        """gradcheck through the analytic module for every continuous input:
+        analytic obs/source gradients + delegated geometry/slip gradients."""
+        m = OkadaSourceSimple(analytic_grad=True).to(device)
+
+        def td(x):
+            return t(x, device=device)
+
+        base = dict(
+            x_obs=td([[3e3, -7e3, 12e3]]), y_obs=td([[5e3, 9e3, -4e3]]),
+            source_x=td([0.0]), source_y=td([0.0]),
+            dip=td([0.9]), strike=td([0.7]), centroid_depth=td([9e3]),
+            length=td([8e3]), width=td([4e3]),
+            disl1=td([1.0]), disl2=td([-0.5]), disl3=td([0.2]),
+        )
+        names = ("x_obs", "y_obs", "source_x", "source_y", "dip",
+                 "centroid_depth", "length", "width", "disl1", "disl2", "disl3")
+        leaves = {k: base[k].clone().requires_grad_(True) for k in names}
+
+        def f(*vals):
+            kw = dict(base)
+            kw.update({n: v for n, v in zip(names, vals)})
+            out = m(**kw)
+            return torch.cat([out.e.reshape(-1), out.n.reshape(-1),
+                              out.u.reshape(-1)])
+
+        assert torch.autograd.gradcheck(
+            f, tuple(leaves[k] for k in names), eps=1e-6, atol=1e-6, rtol=1e-3)
+
+    def test_obs_gradient_finite_on_trace(self):
+        """On a surface-crossing grid the analytic obs-gradient stays finite
+        (the closed-form strain has no NaN trap that plain autograd of the exact
+        forward hits at cd = 0)."""
+        L, W = 10e3, 5e3
+        n = 21
+        g = torch.linspace(-8e3, 8e3, n, dtype=DTYPE)
+        X, Y = torch.meshgrid(g, g, indexing="xy")
+        x_obs = X.reshape(1, -1).requires_grad_(True)
+        y_obs = Y.reshape(1, -1)
+        out = OkadaSourceSimple(analytic_grad=True)(
+            x_obs=x_obs, y_obs=y_obs,
+            source_x=t([0.0]), source_y=t([0.0]),
+            dip=t([math.pi / 2.0]), strike=t([0.3]),   # vertical dip: cd = 0
+            centroid_depth=t([0.5 * W]), length=t([L]), width=t([W]),
+            disl1=t([1.0]), disl2=t([0.5]), disl3=t([0.0]),
+        )
+        (gx,) = torch.autograd.grad((out.e**2 + out.n**2 + out.u**2).sum(), x_obs)
+        assert torch.isfinite(gx).all()
+
+
+class TestFullAnalyticBackend:
+    """OkadaSource(analytic_grad=True) (z != 0): exact forward + closed-form DC3D-strain backward.
+
+    Observation-coordinate gradients (x/y/z_obs, source) are analytic; geometry
+    and slips via autograd of the exact forward; dip via a wide central difference.
+    """
+
+    def _base(self, dip=0.9, z=None):
+        if z is None:
+            z = t([[-2e3, -5e3, -0.5e3]])
+        return dict(
+            x_obs=t([[4e3, -9e3, 15e3]]), y_obs=t([[7e3, 3e3, -6e3]]), z_obs=z,
+            source_x=t([0.0]), source_y=t([0.0]),
+            dip=t([dip]), strike=t([0.6]), centroid_depth=t([9e3]),
+            length=t([12e3]), width=t([6e3]),
+            disl1=t([1.3]), disl2=t([-0.7]), disl3=t([0.2]),
+        )
+
+    def test_forward_matches_exact(self):
+        a = OkadaSource(analytic_grad=True)(**self._base())
+        b = OkadaSource(smooth_grad=False)(**self._base())
+        for nm in ("e", "n", "u"):
+            assert torch.allclose(getattr(a, nm), getattr(b, nm),
+                                  rtol=1e-12, atol=1e-15)
+
+    @pytest.mark.parametrize("coord", ["x_obs", "y_obs", "z_obs"])
+    def test_obs_strain_matches_finite_difference(self, coord):
+        """Analytic d(e,n,u)/d(coord) matches central differences of the exact
+        forward (the full real+image+UC strain assembly)."""
+        ana = OkadaSource(analytic_grad=True)
+        ref = OkadaSource(smooth_grad=False)
+        base = self._base()
+        cg = {k: (v.clone().requires_grad_(True) if k == coord else v.clone())
+              for k, v in base.items()}
+        out = ana(**cg)
+        # accumulate the analytic gradient of a fixed linear functional
+        w = (1.3, -0.4, 0.8)
+        (w[0] * out.e.sum() + w[1] * out.n.sum() + w[2] * out.u.sum()).backward()
+        g = cg[coord].grad
+
+        h = 1.0
+        kp = dict(base); kp[coord] = base[coord] + h
+        km = dict(base); km[coord] = base[coord] - h
+        op, om = ref(**kp), ref(**km)
+        fd = (w[0] * (op.e - om.e) + w[1] * (op.n - om.n)
+              + w[2] * (op.u - om.u)) / (2 * h)
+        assert torch.allclose(g, fd, rtol=1e-6, atol=1e-9)
+
+    @pytest.mark.parametrize("z_kind", ["per_pixel", "scalar"])
+    def test_gradcheck_all_params(self, z_kind):
+        m = OkadaSource(analytic_grad=True)
+        z = t([[-2e3, -5e3, -0.5e3]]) if z_kind == "per_pixel" else t([-3e3])
+        base = self._base(z=z)
+        names = ("x_obs", "y_obs", "z_obs", "source_x", "source_y", "dip",
+                 "strike", "centroid_depth", "length", "width",
+                 "disl1", "disl2", "disl3")
+        leaves = {k: base[k].clone().requires_grad_(True) for k in names}
+
+        def f(*vals):
+            kw = dict(base)
+            kw.update({n: v for n, v in zip(names, vals)})
+            o = m(**kw)
+            return torch.cat([o.e.reshape(-1), o.n.reshape(-1), o.u.reshape(-1)])
+
+        assert torch.autograd.gradcheck(
+            f, tuple(leaves[k] for k in names), eps=1e-6, atol=1e-6, rtol=1e-3)
+
+    @pytest.mark.parametrize("dip_deg", [45.0, 89.99, 90.0, 90.001])
+    def test_dip_gradient_through_vertical(self, dip_deg):
+        ana = OkadaSource(analytic_grad=True)
+        ref = OkadaSource(smooth_grad=False)
+        base = self._base(dip=math.radians(dip_deg))
+
+        def loss(model, **kw):
+            o = model(**kw)
+            return (o.e**2 + o.n**2 + o.u**2).sum()
+
+        kw = {k: (v.clone().requires_grad_(True) if k == "dip" else v.clone())
+              for k, v in base.items()}
+        loss(ana, **kw).backward()
+        g = kw["dip"].grad
+
+        h = 1e-3
+        kp = dict(base); kp["dip"] = base["dip"] + h
+        km = dict(base); km["dip"] = base["dip"] - h
+        fd = (loss(ref, **kp) - loss(ref, **km)) / (2 * h)
+        assert torch.isfinite(g).all()
+        assert torch.allclose(g.sum(), fd, rtol=1e-3, atol=1e-9)
+
+    def test_obs_gradient_finite_on_fault_plane(self):
+        """Observation points on the fault plane hit the singular configuration;
+        the analytic obs-gradient must stay finite."""
+        n = 21
+        g = torch.linspace(-10e3, 10e3, n, dtype=DTYPE)
+        x_obs = g.reshape(1, -1).requires_grad_(True)
+        out = OkadaSource(analytic_grad=True)(
+            x_obs=x_obs, y_obs=torch.zeros(1, n, dtype=DTYPE),
+            z_obs=torch.full((1, n), -3e3, dtype=DTYPE),
+            source_x=t([0.0]), source_y=t([0.0]),
+            dip=t([math.pi / 2.0]), strike=t([0.0]),
+            centroid_depth=t([5e3]), length=t([12e3]), width=t([6e3]),
+            disl1=t([1.0]), disl2=t([0.5]), disl3=t([0.0]),
+        )
+        (gx,) = torch.autograd.grad((out.e**2 + out.n**2 + out.u**2).sum(), x_obs)
+        assert torch.isfinite(gx).all()
+
 
 class TestFullZConsistency:
     """OkadaSource vs the z=0 Simplified path, the DC3D cross-check, and z-behaviour."""
@@ -560,8 +823,8 @@ class TestNumericalHealth:
         for v in (ue, un, uu):
             assert torch.isfinite(v).all(), "NaN/inf on or near the fault trace"
 
-    def test_no_nan_values_or_gradients_training_safe(self):
-        """training_safe mode: forward and backward must stay finite on a
+    def test_no_nan_values_or_gradients_smooth_grad(self):
+        """smooth_grad mode: forward and backward must stay finite on a
         grid that crosses the surface trace of a surface-breaking fault."""
         L, W = 10e3, 5e3
         dip = t([math.radians(89.0)]).requires_grad_(True)
@@ -576,7 +839,7 @@ class TestNumericalHealth:
         x_obs = X.reshape(1, -1)
         y_obs = Y.reshape(1, -1)
 
-        model = OkadaSourceSimple(training_safe=True)
+        model = OkadaSourceSimple(smooth_grad=True)
         out = model(
             x_obs=x_obs, y_obs=y_obs,
             source_x=t([0.0]), source_y=t([0.0]),
@@ -595,12 +858,12 @@ class TestDifferentiability:
     """Autograd through the model: gradcheck and finite-gradient coverage."""
 
     @pytest.mark.parametrize("device", DEVICES)
-    def test_gradcheck_training_safe(self, device):
+    def test_gradcheck_smooth_grad(self, device):
         """Full autograd gradcheck at a benign configuration (float64).
 
         Parametrized over DEVICES so autograd is exercised on CUDA too when
         available (matching the Mogi/Penny suites)."""
-        model = OkadaSourceSimple(training_safe=True).to(device)
+        model = OkadaSourceSimple(smooth_grad=True).to(device)
 
         def td(x):
             return t(x, device=device)
@@ -627,11 +890,11 @@ class TestDifferentiability:
         assert torch.autograd.gradcheck(f, args, eps=1e-6, atol=1e-7, rtol=1e-4)
 
     @pytest.mark.parametrize("device", DEVICES)
-    def test_gradcheck_fullz_training_safe(self, device):
-        """gradcheck through OkadaSource at depth (training_safe), where the
+    def test_gradcheck_fullz_smooth_grad(self, device):
+        """gradcheck through OkadaSource at depth (smooth_grad), where the
         UC kernel and z-dependence engage -- complements the Simplified
         gradcheck above."""
-        model = OkadaSource(training_safe=True).to(device)
+        model = OkadaSource(smooth_grad=True).to(device)
 
         def td(x):
             return t(x, device=device)
@@ -659,10 +922,10 @@ class TestDifferentiability:
         assert torch.autograd.gradcheck(f, args, eps=1e-6, atol=1e-7, rtol=1e-4)
 
     def test_exact_mode_gradients_finite_off_fault(self):
-        """Exact mode (training_safe=False) must give finite, non-zero gradients
+        """Exact mode (smooth_grad=False) must give finite, non-zero gradients
         at an off-fault configuration, where the analytic kernels are smooth.
-        Complements the training_safe on-trace gradient-health test."""
-        model = OkadaSourceSimple(training_safe=False)
+        Complements the smooth_grad on-trace gradient-health test."""
+        model = OkadaSourceSimple(smooth_grad=False)
         x_obs = t([[3e3, -7e3, 12e3, 20e3]])
         y_obs = t([[5e3, 9e3, -4e3, -15e3]])
         dip = t([0.9]).requires_grad_(True)
@@ -767,7 +1030,7 @@ class TestDtypeAndDevice:
         def to(k):
             return p[k].to(device)
 
-        simp = OkadaSourceSimple(training_safe=True).to(device)
+        simp = OkadaSourceSimple(smooth_grad=True).to(device)
         out_s = simp(
             x_obs=to("x_obs"), y_obs=to("y_obs"),
             source_x=to("source_x"), source_y=to("source_y"),
@@ -778,7 +1041,7 @@ class TestDtypeAndDevice:
         assert out_s.e.device.type == "cuda"
         assert torch.isfinite(out_s.e).all() and torch.isfinite(out_s.u).all()
 
-        full = OkadaSource(training_safe=True).to(device)
+        full = OkadaSource(smooth_grad=True).to(device)
         out_f = full(
             x_obs=to("x_obs"), y_obs=to("y_obs"),
             z_obs=torch.full_like(p["x_obs"], -2e3).to(device),

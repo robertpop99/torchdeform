@@ -22,8 +22,11 @@ fitting.
 - **Source models** (`torchdeform.sources`): Mogi point source, the full Okada
   rectangular finite-fault dislocation (`OkadaSource`) and its surface-only
   fast path (`OkadaSourceSimple`), and a penny-shaped crack. All differentiable
-  in their parameters, with a `training_safe=True` mode that smooths the Okada
-  singularities for finite gradients.
+  in their parameters. The Okada sources take two optional gradient modes
+  (default: plain autograd of the exact forward): `analytic_grad=True` returns
+  closed-form Okada strains for gradients that stay accurate even at the singular
+  fault geometries (vertical dip, on-fault points); `smooth_grad=True` instead
+  smooths the singularities. See [Gradients](#gradients).
 - **Observation operators** (`torchdeform.observation`): Sentinel-1 line-of-sight
   geometry and displacement ⇄ phase conversions, phase wrapping and a
   wrap-invariant loss.
@@ -72,7 +75,7 @@ x_obs = xx.reshape(1, -1).expand(B, -1)
 y_obs = yy.reshape(1, -1).expand(B, -1)
 
 # 1. Surface deformation from an Okada fault (parameters batched over B)
-src = OkadaSourceSimple(training_safe=True)
+src = OkadaSourceSimple()
 disp = src(
     x_obs, y_obs,
     source_x=torch.zeros(B), source_y=torch.zeros(B),
@@ -108,6 +111,65 @@ Because the whole chain is differentiable, you can also backpropagate a loss on
 `ifg` (or `phase`) all the way to the source/atmosphere parameters — see
 `tests/test_pipeline_gradients.py`.
 
+## Gradients
+
+Every model outputs a `Displacement` (the field values). The *derivatives* —
+e.g. how the displacement changes with fault dip or depth — come from PyTorch's
+autograd: mark the inputs you care about with `requires_grad_()`, build any
+scalar from the output, and call `.backward()`. The derivatives then appear in
+each input's `.grad`.
+
+```python
+import torch
+from torchdeform import OkadaSource
+
+# Fault parameters whose gradients we want. requires_grad_(True) tells PyTorch
+# to track them; analytic_grad=True gives gradients that stay accurate even for
+# near-vertical faults (where the default autograd is ill-conditioned).
+dip   = torch.tensor([1.20], requires_grad=True)   # radians (~69 deg)
+depth = torch.tensor([6000.0], requires_grad=True) # centroid depth, metres
+
+g = torch.linspace(-2e4, 2e4, 32)                  # a 32x32 observation grid
+xx, yy = torch.meshgrid(g, g, indexing="ij")
+x_obs, y_obs = xx.reshape(1, -1), yy.reshape(1, -1)
+z_obs = torch.zeros_like(x_obs)                    # surface
+
+model = OkadaSource(analytic_grad=True)
+disp = model(
+    x_obs, y_obs, z_obs,
+    source_x=torch.zeros(1), source_y=torch.zeros(1),
+    dip=dip, strike=torch.full((1,), 0.5),
+    centroid_depth=depth, length=torch.full((1,), 1e4),
+    width=torch.full((1,), 5e3),
+    disl1=torch.zeros(1), disl2=torch.ones(1), disl3=torch.zeros(1),  # dip-slip
+)
+
+# A scalar to differentiate. In an inversion this is your data misfit; here we
+# just use the summed squared vertical displacement as an example.
+objective = disp.u.pow(2).sum()
+objective.backward()           # populates .grad on dip and depth
+
+print(dip.grad, depth.grad)    # d(objective)/d(dip), d(objective)/d(depth)
+```
+
+The same pattern differentiates w.r.t. the observation coordinates
+(`x_obs.requires_grad_(True)`), which gives the spatial strain — the analytic
+backend returns these in closed form, matching Okada's published derivative
+tables. To fit a model to data, wrap this in a `torch.optim` loop:
+
+```python
+opt = torch.optim.Adam([dip, depth], lr=1e-2)
+for _ in range(200):
+    opt.zero_grad()
+    disp = model(x_obs, y_obs, z_obs, source_x=torch.zeros(1), ...)
+    loss = ((disp.u - observed) ** 2).mean()
+    loss.backward()
+    opt.step()
+```
+
+For forward-only use (synthetic data generation), leave `analytic_grad=False`
+(the default) — gradients aren't computed, and the analytic path costs nothing.
+
 ## Datasets
 
 For training you usually don't want to wire the pipeline by hand each time.
@@ -135,7 +197,7 @@ deformation = DeformationGenerator(
     sources={
         "mogi": SourceGenerator(MogiSource(), DEFAULT_MOGI_PRIOR),
         "quake": SourceGenerator(
-            OkadaSourceSimple(training_safe=True), DEFAULT_EARTHQUAKE_PRIOR,
+            OkadaSourceSimple(), DEFAULT_EARTHQUAKE_PRIOR,
             to_forward=okada_params_from_fault,
         ),
     },

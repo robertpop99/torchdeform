@@ -89,7 +89,7 @@ def test_source_generator_mogi():
 def test_source_generator_okada():
     grid = _grid()
     x, y = grid.coords(4)
-    sg = SourceGenerator(OkadaSourceSimple(training_safe=True), DEFAULT_EARTHQUAKE_PRIOR,
+    sg = SourceGenerator(OkadaSourceSimple(smooth_grad=True), DEFAULT_EARTHQUAKE_PRIOR,
                          to_forward=okada_params_from_fault)
     disp, params = sg.generate(x, y, torch.zeros(4, dtype=DTYPE), torch.zeros(4, dtype=DTYPE),
                                generator=_gen())

@@ -32,6 +32,19 @@ non-finite or discontinuous gradients. Passing ``training_safe=True`` replaces
 those with smooth blends/attenuations, trading a tiny accuracy loss away from
 the singular manifolds for finite, well-behaved gradients during optimisation.
 The handful of ``*_EPS`` module constants set the regularisation scales.
+
+There is also an *analytic-backward* mode, ``analytic_grad=True`` (on both
+:class:`OkadaSource` and :class:`OkadaSourceSimple`): it keeps the exact
+(un-smoothed) forward values and supplies the closed-form Okada strain (the
+``ua_``/``ub_``/``uc_displacement_and_derivatives`` kernels) as the
+observation-coordinate gradient. Unlike the smoothed path this is exact to the
+Okada-85 table even on the singular manifolds (vertical dip, on-trace points),
+and unlike plain autograd of the exact forward it has no ``cd = 0`` NaN trap.
+``dip`` (whose explicit ``1/cos(dip)`` terms have no closed-form strain) comes
+from a wide central difference of the exact forward. ``smooth_grad`` and
+``analytic_grad`` are mutually exclusive gradient modes; with neither set the
+forward is exact and gradients are plain autograd (which can be non-finite right
+on the singular manifolds).
 """
 import torch
 from dataclasses import dataclass
@@ -704,6 +717,122 @@ def ua_displacement(
 
 
 @dataclass(slots=True)
+class UAResult:
+    """UA kernel output: 3 displacements + 9 spatial derivatives.
+
+    Field order matches the Fortran ``uA`` output ``du(1..12)``: ``ux, uy, uz``
+    then the fault-frame derivatives ``u{x,y,z}{x,y,z}``. ``[B, 2, 2, N]``.
+    """
+    ux: torch.Tensor
+    uy: torch.Tensor
+    uz: torch.Tensor
+    uxx: torch.Tensor
+    uyx: torch.Tensor
+    uzx: torch.Tensor
+    uxy: torch.Tensor
+    uyy: torch.Tensor
+    uzy: torch.Tensor
+    uxz: torch.Tensor
+    uyz: torch.Tensor
+    uzz: torch.Tensor
+
+
+def ua_displacement_and_derivatives(
+    disl1: torch.Tensor,
+    disl2: torch.Tensor,
+    disl3: torch.Tensor,
+    c0: DCCon0,
+    c2: DCCon2,
+):
+    """Exact UA kernel: displacement + 9 spatial derivatives (Fortran ``uA``).
+
+    Adds the strain block (``du4..12``) to the displacement-only
+    :func:`ua_displacement`, for the analytic Jacobian of the full
+    :class:`OkadaSource`. Exact-mode only.
+    """
+    pi2 = 2.0 * math.pi
+
+    d1 = disl1[:, None, None, None]
+    d2 = disl2[:, None, None, None]
+    d3 = disl3[:, None, None, None]
+
+    alp1 = c0.alp1[:, None, None, None]
+    alp2 = c0.alp2[:, None, None, None]
+    sd = c0.sd[:, None, None, None]
+    cd = c0.cd[:, None, None, None]
+
+    xi = c2.xi
+    et = c2.et
+    q = c2.q
+    r = c2.r
+    r3 = c2.r3
+    y = c2.y      # ytilde
+    d = c2.d      # dtilde
+    x11 = c2.x11
+    y11 = c2.y11
+    y32 = c2.y32
+    ey, ez = c2.ey, c2.ez
+    fy, fz = c2.fy, c2.fz
+    gy, gz = c2.gy, c2.gz
+    hy, hz = c2.hy, c2.hz
+    theta = c2.tt
+    alx = c2.alx
+    ale = c2.ale
+
+    xi2 = xi * xi
+    q2 = q * q
+    xy = xi * y11
+    qx = q * x11
+    qy = q * y11
+
+    du = [torch.zeros_like(xi) for _ in range(12)]
+
+    # strike-slip
+    du[0] = du[0] + d1 / pi2 * (theta / 2.0 + alp2 * xi * qy)
+    du[1] = du[1] + d1 / pi2 * (alp2 * q / r)
+    du[2] = du[2] + d1 / pi2 * (alp1 * ale - alp2 * q * qy)
+    du[3] = du[3] + d1 / pi2 * (-alp1 * qy - alp2 * xi2 * q * y32)
+    du[4] = du[4] + d1 / pi2 * (-alp2 * xi * q / r3)
+    du[5] = du[5] + d1 / pi2 * (alp1 * xy + alp2 * xi * q2 * y32)
+    du[6] = du[6] + d1 / pi2 * (alp1 * xy * sd + alp2 * xi * fy + d / 2.0 * x11)
+    du[7] = du[7] + d1 / pi2 * (alp2 * ey)
+    du[8] = du[8] + d1 / pi2 * (alp1 * (cd / r + qy * sd) - alp2 * q * fy)
+    du[9] = du[9] + d1 / pi2 * (alp1 * xy * cd + alp2 * xi * fz + y / 2.0 * x11)
+    du[10] = du[10] + d1 / pi2 * (alp2 * ez)
+    du[11] = du[11] + d1 / pi2 * (-alp1 * (sd / r - qy * cd) - alp2 * q * fz)
+
+    # dip-slip
+    du[0] = du[0] + d2 / pi2 * (alp2 * q / r)
+    du[1] = du[1] + d2 / pi2 * (theta / 2.0 + alp2 * et * qx)
+    du[2] = du[2] + d2 / pi2 * (alp1 * alx - alp2 * q * qx)
+    du[3] = du[3] + d2 / pi2 * (-alp2 * xi * q / r3)
+    du[4] = du[4] + d2 / pi2 * (-qy / 2.0 - alp2 * et * q / r3)
+    du[5] = du[5] + d2 / pi2 * (alp1 / r + alp2 * q2 / r3)
+    du[6] = du[6] + d2 / pi2 * (alp2 * ey)
+    du[7] = du[7] + d2 / pi2 * (alp1 * d * x11 + xy / 2.0 * sd + alp2 * et * gy)
+    du[8] = du[8] + d2 / pi2 * (alp1 * y * x11 - alp2 * q * gy)
+    du[9] = du[9] + d2 / pi2 * (alp2 * ez)
+    du[10] = du[10] + d2 / pi2 * (alp1 * y * x11 + xy / 2.0 * cd + alp2 * et * gz)
+    du[11] = du[11] + d2 / pi2 * (-alp1 * d * x11 - alp2 * q * gz)
+
+    # tensile
+    du[0] = du[0] + d3 / pi2 * (-alp1 * ale - alp2 * q * qy)
+    du[1] = du[1] + d3 / pi2 * (-alp1 * alx - alp2 * q * qx)
+    du[2] = du[2] + d3 / pi2 * (theta / 2.0 - alp2 * (et * qx + xi * qy))
+    du[3] = du[3] + d3 / pi2 * (-alp1 * xy + alp2 * xi * q2 * y32)
+    du[4] = du[4] + d3 / pi2 * (-alp1 / r + alp2 * q2 / r3)
+    du[5] = du[5] + d3 / pi2 * (-alp1 * qy - alp2 * q * q2 * y32)
+    du[6] = du[6] + d3 / pi2 * (-alp1 * (cd / r + qy * sd) - alp2 * q * fy)
+    du[7] = du[7] + d3 / pi2 * (-alp1 * y * x11 - alp2 * q * gy)
+    du[8] = du[8] + d3 / pi2 * (alp1 * (d * x11 + xy * sd) + alp2 * q * hy)
+    du[9] = du[9] + d3 / pi2 * (alp1 * (sd / r - qy * cd) - alp2 * q * fz)
+    du[10] = du[10] + d3 / pi2 * (alp1 * d * x11 - alp2 * q * gz)
+    du[11] = du[11] + d3 / pi2 * (alp1 * (y * x11 + xy * cd) + alp2 * q * hz)
+
+    return UAResult(*du)
+
+
+@dataclass(slots=True)
 class UBDisplacement:
     """UB (half-space surface) displacement kernel output; fault-frame ``ux/uy/uz``."""
     ux: torch.Tensor
@@ -946,6 +1075,179 @@ def ub_displacement(
         uy=uy,
         uz=uz,
     )
+
+
+@dataclass(slots=True)
+class UBResult:
+    """UB kernel output: 3 displacements + 9 spatial derivatives.
+
+    Field order matches the Fortran ``uB`` output ``du(1..12)``: ``ux, uy, uz``
+    followed by the fault-frame derivatives ``u{x,y,z}{x,y,z}`` (e.g. ``uyx`` is
+    ``d(uy)/dx``). All fields are ``[B, 2, 2, N]`` over the corner grid.
+    """
+    ux: torch.Tensor
+    uy: torch.Tensor
+    uz: torch.Tensor
+    uxx: torch.Tensor
+    uyx: torch.Tensor
+    uzx: torch.Tensor
+    uxy: torch.Tensor
+    uyy: torch.Tensor
+    uzy: torch.Tensor
+    uxz: torch.Tensor
+    uyz: torch.Tensor
+    uzz: torch.Tensor
+
+
+def ub_displacement_and_derivatives(
+    disl1: torch.Tensor,
+    disl2: torch.Tensor,
+    disl3: torch.Tensor,
+    c0: DCCon0,
+    c2: DCCon2,
+):
+    """Exact UB kernel returning displacement *and* its 9 spatial derivatives.
+
+    Faithful port of the Fortran ``uB`` subroutine (``DC3D.f90``), which returns
+    all 12 ``du`` components.  The existing :func:`ub_displacement` keeps only the
+    displacement (``du1..3``); this adds the strain block (``du4..12``) needed for
+    an analytic Jacobian of the Okada forward.
+
+    Exact-mode only (no ``training_safe`` smoothing): the derivatives are the
+    closed-form analytic strains, so they stay finite and Okada-table-accurate
+    even on the singular manifolds where autograd of a smoothed forward drifts.
+
+    Returns
+    -------
+    UBResult
+        12 fault-frame components over the ``[B, 2, 2, N]`` corner grid.
+    """
+    pi2 = 2.0 * math.pi
+
+    d1 = disl1[:, None, None, None]
+    d2 = disl2[:, None, None, None]
+    d3 = disl3[:, None, None, None]
+
+    xi = c2.xi
+    et = c2.et
+    q = c2.q
+    r = c2.r
+    r3 = c2.r3
+    y = c2.y
+    d = c2.d
+    x11 = c2.x11
+    x32 = c2.x32
+    y11 = c2.y11
+    y32 = c2.y32
+    ey, ez = c2.ey, c2.ez
+    fy, fz = c2.fy, c2.fz
+    gy, gz = c2.gy, c2.gz
+    hy, hz = c2.hy, c2.hz
+    theta = c2.tt
+    ale = c2.ale
+
+    alp3 = c0.alp3[:, None, None, None]
+    sd = c0.sd[:, None, None, None]
+    cd = c0.cd[:, None, None, None]
+
+    xi2 = xi * xi
+    q2 = q * q
+    rd = r + d
+    d11 = 1.0 / (r * rd)
+    aj2 = xi * y / rd * d11
+    aj5 = -(d + y * y / rd) * d11
+
+    # cd != 0 and cd == 0 branches (Okada p.1034), mirroring ub_displacement.
+    cd_mask = torch.abs(cd) > GEOM_EPS
+    x_ = torch.sqrt(xi2 + q2)
+    xi_mask = xi != 0.0
+    den = xi * (r + x_) * cd
+    den_safe = torch.where(xi_mask, den, torch.ones_like(den))
+    ai4_a = torch.where(
+        xi_mask,
+        (xi / rd * sd * cd
+         + 2.0 * torch.atan((et * (x_ + q * cd) + x_ * (r + x_) * sd) / den_safe))
+        / (cd * cd),
+        torch.zeros_like(xi),
+    )
+    ai3_a = (y * cd / rd - ale + sd * torch.log(rd)) / (cd * cd)
+    ak1_a = xi * (d11 - y11 * sd) / cd
+    ak3_a = (q * y11 - y * d11) / cd
+    aj3_a = (ak1_a - aj2 * sd) / cd
+    aj6_a = (ak3_a - aj5 * sd) / cd
+
+    rd2 = rd * rd
+    ai3_b = (et / rd + y * q / rd2 - ale) / 2.0
+    ai4_b = xi * y / rd2 / 2.0
+    ak1_b = xi * q / rd * d11
+    ak3_b = sd / rd * (xi2 * d11 - 1.0)
+    aj3_b = -xi / rd2 * (q2 * d11 - 0.5)
+    aj6_b = -y / rd2 * (xi2 * d11 - 0.5)
+
+    ai3 = torch.where(cd_mask, ai3_a, ai3_b)
+    ai4 = torch.where(cd_mask, ai4_a, ai4_b)
+    ak1 = torch.where(cd_mask, ak1_a, ak1_b)
+    ak3 = torch.where(cd_mask, ak3_a, ak3_b)
+    aj3 = torch.where(cd_mask, aj3_a, aj3_b)
+    aj6 = torch.where(cd_mask, aj6_a, aj6_b)
+
+    xy = xi * y11
+    ai1 = -xi / rd * cd - ai4 * sd
+    ai2 = torch.log(rd) + ai3 * sd
+    ak2 = 1.0 / r + ak3 * sd
+    ak4 = xy * cd - ak1 * sd
+    aj1 = aj5 * cd - aj6 * sd
+    aj4 = -xy - aj2 * cd + aj3 * sd
+
+    qx = q * x11
+    qy = q * y11
+
+    # du[i] accumulates disl1/2/3 contributions, exactly as the Fortran loops.
+    du = [torch.zeros_like(xi) for _ in range(12)]
+
+    # strike-slip
+    du[0] = du[0] + d1 / pi2 * (-xi * qy - theta - alp3 * ai1 * sd)
+    du[1] = du[1] + d1 / pi2 * (-q / r + alp3 * y / rd * sd)
+    du[2] = du[2] + d1 / pi2 * (q * qy - alp3 * ai2 * sd)
+    du[3] = du[3] + d1 / pi2 * (xi2 * q * y32 - alp3 * aj1 * sd)
+    du[4] = du[4] + d1 / pi2 * (xi * q / r3 - alp3 * aj2 * sd)
+    du[5] = du[5] + d1 / pi2 * (-xi * q2 * y32 - alp3 * aj3 * sd)
+    du[6] = du[6] + d1 / pi2 * (-xi * fy - d * x11 + alp3 * (xy + aj4) * sd)
+    du[7] = du[7] + d1 / pi2 * (-ey + alp3 * (1.0 / r + aj5) * sd)
+    du[8] = du[8] + d1 / pi2 * (q * fy - alp3 * (qy - aj6) * sd)
+    du[9] = du[9] + d1 / pi2 * (-xi * fz - y * x11 + alp3 * ak1 * sd)
+    du[10] = du[10] + d1 / pi2 * (-ez + alp3 * y * d11 * sd)
+    du[11] = du[11] + d1 / pi2 * (q * fz + alp3 * ak2 * sd)
+
+    # dip-slip
+    du[0] = du[0] + d2 / pi2 * (-q / r + alp3 * ai3 * sd * cd)
+    du[1] = du[1] + d2 / pi2 * (-et * qx - theta - alp3 * xi / rd * sd * cd)
+    du[2] = du[2] + d2 / pi2 * (q * qx + alp3 * ai4 * sd * cd)
+    du[3] = du[3] + d2 / pi2 * (xi * q / r3 + alp3 * aj4 * sd * cd)
+    du[4] = du[4] + d2 / pi2 * (et * q / r3 + qy + alp3 * aj5 * sd * cd)
+    du[5] = du[5] + d2 / pi2 * (-q2 / r3 + alp3 * aj6 * sd * cd)
+    du[6] = du[6] + d2 / pi2 * (-ey + alp3 * aj1 * sd * cd)
+    du[7] = du[7] + d2 / pi2 * (-et * gy - xy * sd + alp3 * aj2 * sd * cd)
+    du[8] = du[8] + d2 / pi2 * (q * gy + alp3 * aj3 * sd * cd)
+    du[9] = du[9] + d2 / pi2 * (-ez - alp3 * ak3 * sd * cd)
+    du[10] = du[10] + d2 / pi2 * (-et * gz - xy * cd - alp3 * xi * d11 * sd * cd)
+    du[11] = du[11] + d2 / pi2 * (q * gz - alp3 * ak4 * sd * cd)
+
+    # tensile
+    du[0] = du[0] + d3 / pi2 * (q * qy - alp3 * ai3 * sd * sd)
+    du[1] = du[1] + d3 / pi2 * (q * qx + alp3 * xi / rd * sd * sd)
+    du[2] = du[2] + d3 / pi2 * (et * qx + xi * qy - theta - alp3 * ai4 * sd * sd)
+    du[3] = du[3] + d3 / pi2 * (-xi * q2 * y32 - alp3 * aj4 * sd * sd)
+    du[4] = du[4] + d3 / pi2 * (-q2 / r3 - alp3 * aj5 * sd * sd)
+    du[5] = du[5] + d3 / pi2 * (q * q2 * y32 - alp3 * aj6 * sd * sd)
+    du[6] = du[6] + d3 / pi2 * (q * fy - alp3 * aj1 * sd * sd)
+    du[7] = du[7] + d3 / pi2 * (q * gy - alp3 * aj2 * sd * sd)
+    du[8] = du[8] + d3 / pi2 * (-q * hy - alp3 * aj3 * sd * sd)
+    du[9] = du[9] + d3 / pi2 * (q * fz + alp3 * ak3 * sd * sd)
+    du[10] = du[10] + d3 / pi2 * (q * gz + alp3 * xi * d11 * sd * sd)
+    du[11] = du[11] + d3 / pi2 * (-q * hz + alp3 * ak4 * sd * sd)
+
+    return UBResult(*du)
 
 
 @dataclass(slots=True)
@@ -1268,7 +1570,8 @@ class _OkadaBase(SourceModel):
         self,
         poisson_ratio: float = 0.25,
         internal_dtype: torch.dtype = torch.float64,
-        training_safe: bool = False,
+        smooth_grad: bool = False,
+        analytic_grad: bool = False,
         num_eps: float = NUM_EPS,
         geom_eps: float = GEOM_EPS,
         rd_eps: float = RD_EPS,
@@ -1282,9 +1585,19 @@ class _OkadaBase(SourceModel):
             Poisson's ratio of the elastic half-space (sets ``alpha``).
         internal_dtype : torch.dtype, default torch.float64
             Dtype used for the internal computation; inputs are cast to it.
-        training_safe : bool, default False
-            If True, replace the hard singularity branches with smooth
-            blends/attenuations so gradients stay finite (see module docstring).
+        smooth_grad : bool, default False
+            Gradient mode. If True, replace the hard singularity branches with
+            smooth blends/attenuations so gradients stay finite everywhere (see
+            module docstring). This also perturbs the *forward values* slightly
+            near the singular manifolds. Mutually exclusive with ``analytic_grad``.
+        analytic_grad : bool, default False
+            Gradient mode. If True, keep the exact (un-smoothed) forward values
+            and return closed-form Okada strains as the backward, giving gradients
+            that are accurate even on the singular manifolds (vertical dip,
+            on-fault/on-trace points) where ``smooth_grad`` drifts and plain
+            autograd hits a ``cos(dip) = 0`` NaN. Costs ~2x the backward (the
+            forward is unchanged); see the README example. Mutually exclusive with
+            ``smooth_grad``.
         num_eps : float, default NUM_EPS
             Numerical guard for denominators/logs/sqrt.
         geom_eps : float, default GEOM_EPS
@@ -1292,14 +1605,20 @@ class _OkadaBase(SourceModel):
         rd_eps : float, default RD_EPS
             Guard for the ``r + d -> 0`` singularity in the UB kernel.
         smooth_eps : float, default 1e-8
-            Smoothing scale for the ``training_safe`` reciprocals/divisions.
+            Smoothing scale for the ``smooth_grad`` reciprocals/divisions.
         blend_eps : float, default 1e-4
-            Smoothing scale for the ``training_safe`` ``cd != 0`` / ``cd ~ 0`` blend.
+            Smoothing scale for the ``smooth_grad`` ``cd != 0`` / ``cd ~ 0`` blend.
         """
         super().__init__()
+        if smooth_grad and analytic_grad:
+            raise ValueError(
+                "smooth_grad and analytic_grad are mutually exclusive gradient "
+                "modes; set at most one to True."
+            )
         self.alpha = 1.0 / (2.0 * (1.0 - poisson_ratio))
         self.internal_dtype = internal_dtype
-        self.training_safe = training_safe
+        self.smooth_grad = smooth_grad
+        self.analytic_grad = analytic_grad
         self.num_eps = num_eps
         self.geom_eps = geom_eps
         self.rd_eps = rd_eps
@@ -1342,6 +1661,28 @@ class OkadaSource(_OkadaBase):
 
     def forward(
         self,
+        x_obs: Tensor, y_obs: Tensor, z_obs: Tensor,
+        source_x: Tensor, source_y: Tensor, dip: Tensor, strike: Tensor,
+        centroid_depth: Tensor, length: Tensor, width: Tensor,
+        disl1: Tensor, disl2: Tensor, disl3: Tensor,
+    ) -> Displacement:
+        """Displacement of a finite rectangular fault at observation depth ``z``.
+
+        With ``analytic_grad=True`` and gradients required, routes through the
+        closed-form analytic backward; otherwise evaluates directly. The forward
+        values are identical either way. See :meth:`_evaluate` for the full
+        parameter docs.
+        """
+        args = (x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
+                centroid_depth, length, width, disl1, disl2, disl3)
+        if (self.analytic_grad and torch.is_grad_enabled()
+                and any(a.requires_grad for a in args)):
+            e, n, u = _OkadaAnalyticFn.apply(self, *args)
+            return Displacement(e=e, n=n, u=u)
+        return self._evaluate(*args)
+
+    def _evaluate(
+        self,
         x_obs: Tensor,          # [B, N]
         y_obs: Tensor,          # [B, N]
         z_obs: Tensor,          # [B] or [B, N], Okada convention: z <= 0
@@ -1355,6 +1696,7 @@ class OkadaSource(_OkadaBase):
         disl1: Tensor,               # [B], meters
         disl2: Tensor,               # [B], meters
         disl3: Tensor,               # [B], meters
+        return_strain: bool = False,
     ) -> Displacement:
         """Displacement of a finite rectangular fault at observation depth ``z``.
 
@@ -1440,7 +1782,7 @@ class OkadaSource(_OkadaBase):
             alpha=torch.as_tensor(self.alpha, device=x.device, dtype=dtype),
             dip_rad=dip.to(dtype),
             internal_dtype=dtype,
-            training_safe=self.training_safe,
+            training_safe=self.smooth_grad,
             geom_eps=self.geom_eps,
         )
 
@@ -1501,7 +1843,7 @@ class OkadaSource(_OkadaBase):
             ket=ket_r,
             internal_dtype=dtype,
             eps=self.num_eps,
-            training_safe=self.training_safe,
+            training_safe=self.smooth_grad,
             smooth_eps=self.smooth_eps,
         )
 
@@ -1581,7 +1923,7 @@ class OkadaSource(_OkadaBase):
             ket=ket_i,
             internal_dtype=dtype,
             eps=self.num_eps,
-            training_safe=self.training_safe,
+            training_safe=self.smooth_grad,
             smooth_eps=self.smooth_eps,
         )
 
@@ -1600,7 +1942,7 @@ class OkadaSource(_OkadaBase):
             c0=c0,
             c2=c2_img,
             eps=self.num_eps,
-            training_safe=self.training_safe,
+            training_safe=self.smooth_grad,
             smooth_eps=self.smooth_eps,
             blend_eps=self.blend_eps,
             rd_eps=self.rd_eps,
@@ -1694,11 +2036,159 @@ class OkadaSource(_OkadaBase):
         un = torch.where(singular, torch.zeros_like(un), un)
         uu = torch.where(singular, torch.zeros_like(uu), uu)
 
-        return Displacement(
-            e=ue,
-            n=un,
-            u=uu,
+        disp = Displacement(e=ue, n=un, u=uu)
+        if not return_strain:
+            return disp
+
+        # ------------------------------------------------------------------
+        # Analytic Jacobian d(ue, un, uu) / d(x_obs, y_obs, z_obs) via the full
+        # DC3D strain assembly: real source (UA, z-derivative group sign-flipped)
+        # + image source (UA + UB + z*UC, z-derivative group gets an extra +UC
+        # displacement term).  Each of the 12 components is assembled in the fault
+        # frame, then rotated to ENU and chained to the observation coordinates.
+        # ------------------------------------------------------------------
+        uaR = ua_displacement_and_derivatives(disl1, disl2, disl3, c0, c2_real)
+        uaI = ua_displacement_and_derivatives(disl1, disl2, disl3, c0, c2_img)
+        ubI = ub_displacement_and_derivatives(disl1, disl2, disl3, c0, c2_img)
+        ucI = uc_displacement_and_derivatives(z_b, disl1, disl2, disl3, c0, c2_img)
+        z4 = z_b[:, None, None, :]
+
+        def _grp(R, g):
+            return (
+                (R.ux, R.uy, R.uz),
+                (R.uxx, R.uyx, R.uzx),
+                (R.uxy, R.uyy, R.uzy),
+                (R.uxz, R.uyz, R.uzz),
+            )[g]
+
+        uc_disp = (ucI.ux, ucI.uy, ucI.uz)   # UC displacement (extra z-deriv term)
+
+        def _fault_group(g):
+            """Assemble fault-frame (Fx, Fy, Fz) for derivative group g (0=disp,
+            1=d/dx, 2=d/dy, 3=d/dz), summed over corners."""
+            ar, br, cr = _grp(uaR, g)
+            if g != 3:
+                rx = -ar
+                ry = -br * cd4 + cr * sd4
+                rz = -br * sd4 - cr * cd4
+            else:                            # z-derivative group: sign flipped
+                rx = ar
+                ry = br * cd4 - cr * sd4
+                rz = br * sd4 + cr * cd4
+
+            aa, ba, ca = _grp(uaI, g)
+            ab, bb, cb = _grp(ubI, g)
+            ac, bc, cc = _grp(ucI, g)
+            sb = ba + bb
+            sc = ca + cb
+            ix = aa + ab + z4 * ac
+            iy = (sb + z4 * bc) * cd4 - (sc + z4 * cc) * sd4
+            iz = (sb - z4 * bc) * sd4 + (sc - z4 * cc) * cd4
+            if g == 3:                       # + UC displacement term
+                ix = ix + uc_disp[0]
+                iy = iy + uc_disp[1] * cd4 - uc_disp[2] * sd4
+                iz = iz - uc_disp[1] * sd4 - uc_disp[2] * cd4
+
+            return (corner_sum(rx + ix), corner_sum(ry + iy), corner_sum(rz + iz))
+
+        dFdx = _fault_group(1)   # d(fault disp)/dx_fault
+        dFdy = _fault_group(2)
+        dFdz = _fault_group(3)
+
+        def _enu(fx, fy, fz):
+            return fx * ss2 + fy * cs2, fx * cs2 - fy * ss2, fz
+
+        # chain fault directions -> observation coords (z unrotated by strike)
+        def _obs(gx, gy, gz):
+            # gx/gy/gz are fault-frame triples d(F)/d(x_f, y_f, z_f)
+            jx = _enu(*(ss2 * a + cs2 * b for a, b in zip(gx, gy)))
+            jy = _enu(*(cs2 * a - ss2 * b for a, b in zip(gx, gy)))
+            jz = _enu(*gz)
+            zero = torch.zeros_like(jx[0])
+            sg = lambda tup: tuple(torch.where(singular, zero, v) for v in tup)
+            return sg(jx), sg(jy), sg(jz)
+
+        jx, jy, jz = _obs(dFdx, dFdy, dFdz)
+        strain = {
+            "x_obs": jx,   # each: (d ue, d un, d uu) / d(coord)
+            "y_obs": jy,
+            "z_obs": jz,
+        }
+        return disp, strain
+
+
+class _OkadaAnalyticFn(torch.autograd.Function):
+    """Analytic-backward implementation of :class:`OkadaSource` (``analytic_grad``).
+
+    The forward runs the exact ``model._evaluate`` and the DC3D strain in one
+    pass.  The backward returns the closed-form observation-coordinate strain (and
+    translation-invariant source gradients), autograd of the exact forward for
+    geometry/slips, and a wide central difference for ``dip``."""
+
+    @staticmethod
+    def forward(ctx, model, x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
+                centroid_depth, length, width, disl1, disl2, disl3):
+        with torch.no_grad():
+            disp, strain = model._evaluate(
+                x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
+                centroid_depth, length, width, disl1, disl2, disl3,
+                return_strain=True,
+            )
+        ctx.model = model
+        ctx.z_ndim = z_obs.ndim
+        flat = [t for k in ("x_obs", "y_obs", "z_obs") for t in strain[k]]
+        ctx.save_for_backward(
+            x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
+            centroid_depth, length, width, disl1, disl2, disl3, *flat,
         )
+        return disp.e, disp.n, disp.u
+
+    @staticmethod
+    def backward(ctx, ge, gn, gu):
+        s = ctx.saved_tensors
+        (x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
+         centroid_depth, length, width, disl1, disl2, disl3) = s[:13]
+        strain = {k: s[13 + 3 * i: 16 + 3 * i]
+                  for i, k in enumerate(("x_obs", "y_obs", "z_obs"))}
+        ev = ctx.model._evaluate
+
+        def contract(key):
+            se, sn, su = strain[key]
+            return ge * se + gn * sn + gu * su
+
+        gx = contract("x_obs")             # [B, N]
+        gy = contract("y_obs")
+        gz = contract("z_obs")
+        gsx = -gx.sum(dim=1)               # translation invariance (x, y only)
+        gsy = -gy.sum(dim=1)
+        if ctx.z_ndim == 1:                # scalar z per image -> reduce over N
+            gz = gz.sum(dim=1)
+
+        # geometry + slips: autograd of the EXACT forward.
+        geo = [v.detach().clone().requires_grad_(True)
+               for v in (strike, centroid_depth, length, width,
+                         disl1, disl2, disl3)]
+        with torch.enable_grad():
+            out = ev(x_obs, y_obs, z_obs, source_x, source_y, dip,
+                     geo[0], geo[1], geo[2], geo[3], geo[4], geo[5], geo[6])
+            loss = (out.e * ge + out.n * gn + out.u * gu).sum()
+        g_strike, g_depth, g_length, g_width, g_d1, g_d2, g_d3 = \
+            torch.autograd.grad(loss, geo)
+
+        # dip: wide central difference of the exact forward (see _OkadaBase docs).
+        def _dip_loss(dip_value):
+            o = ev(x_obs, y_obs, z_obs, source_x, source_y, dip_value, strike,
+                   centroid_depth, length, width, disl1, disl2, disl3)
+            return (o.e * ge + o.n * gn + o.u * gu).sum(dim=1)
+
+        h = 1e-3
+        with torch.no_grad():
+            g_dip = (_dip_loss(dip + h) - _dip_loss(dip - h)) / (2.0 * h)
+
+        # order: model, x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
+        #        centroid_depth, length, width, disl1, disl2, disl3
+        return (None, gx, gy, gz, gsx, gsy, g_dip, g_strike, g_depth,
+                g_length, g_width, g_d1, g_d2, g_d3)
 
 
 class OkadaSourceSimple(_OkadaBase):
@@ -1719,6 +2209,27 @@ class OkadaSourceSimple(_OkadaBase):
 
     def forward(
             self,
+            x_obs: Tensor, y_obs: Tensor,
+            source_x: Tensor, source_y: Tensor, dip: Tensor, strike: Tensor,
+            centroid_depth: Tensor, length: Tensor, width: Tensor,
+            disl1: Tensor, disl2: Tensor, disl3: Tensor,
+    ) -> Displacement:
+        """Surface displacement of a finite rectangular fault (``z = 0``).
+
+        With ``analytic_grad=True`` and gradients required, routes through the
+        closed-form analytic backward; otherwise evaluates directly. The forward
+        values are identical either way. See :meth:`_evaluate` for full docs.
+        """
+        args = (x_obs, y_obs, source_x, source_y, dip, strike,
+                centroid_depth, length, width, disl1, disl2, disl3)
+        if (self.analytic_grad and torch.is_grad_enabled()
+                and any(a.requires_grad for a in args)):
+            e, n, u = _OkadaSimpleAnalyticFn.apply(self, *args)
+            return Displacement(e=e, n=n, u=u)
+        return self._evaluate(*args)
+
+    def _evaluate(
+            self,
             x_obs: Tensor,  # [B, N]
             y_obs: Tensor,  # [B, N]
             source_x: Tensor,  # [B]
@@ -1731,6 +2242,7 @@ class OkadaSourceSimple(_OkadaBase):
             disl1: Tensor,  # [B], meters
             disl2: Tensor,  # [B], meters
             disl3: Tensor,  # [B], meters
+            return_strain: bool = False,
     ) -> Displacement:
         """Surface displacement of a finite rectangular fault (``z = 0``).
 
@@ -1804,7 +2316,7 @@ class OkadaSourceSimple(_OkadaBase):
             ),
             dip_rad=dip,
             internal_dtype=self.internal_dtype,
-            training_safe=self.training_safe,
+            training_safe=self.smooth_grad,
             geom_eps=self.geom_eps,
         )
 
@@ -1887,7 +2399,7 @@ class OkadaSourceSimple(_OkadaBase):
             ket=ket,
             internal_dtype=self.internal_dtype,
             eps=self.num_eps,
-            training_safe=self.training_safe,
+            training_safe=self.smooth_grad,
             smooth_eps=self.smooth_eps,
         )
 
@@ -1898,7 +2410,7 @@ class OkadaSourceSimple(_OkadaBase):
             c0=c0,
             c2=c2,
             eps=self.num_eps,
-            training_safe=self.training_safe,
+            training_safe=self.smooth_grad,
             smooth_eps=self.smooth_eps,
             blend_eps=self.blend_eps,
             rd_eps=self.rd_eps,
@@ -1933,11 +2445,184 @@ class OkadaSourceSimple(_OkadaBase):
         un = torch.where(singular, torch.zeros_like(un), un)
         uu = torch.where(singular, torch.zeros_like(uu), uu)
 
-        return Displacement(
-            e=ue,
-            n=un,
-            u=uu,
+        disp = Displacement(e=ue, n=un, u=uu)
+        if not return_strain:
+            return disp
+
+        # ------------------------------------------------------------------
+        # Analytic Jacobian of (ue, un, uu) w.r.t. the inputs that enter the
+        # surface field only through (xi, et, q) or the strike rotation:
+        # observation coords, source location, length, width, depth, strike.
+        # (dip also enters sd/cd explicitly in the kernel, so it is not covered
+        # here -- the analytic_grad backward gets it by finite difference.)
+        #
+        # At z = 0 the UA (real+image) and z*UC contributions cancel for the
+        # derivative groups exactly as they do for displacement, so the surface
+        # strain comes purely from UB (see DC3D.f90 assembly).
+        # ------------------------------------------------------------------
+        dub = ub_displacement_and_derivatives(disl1, disl2, disl3, c0, c2)
+
+        def _assemble(triple, w):
+            # Fault-frame triple (ux/uy/uz parts) over the corner grid, with the
+            # dip rotation + signed corner sum + a per-corner weight w applied.
+            a, b, cc = triple
+            sw = sign * w
+            fx = (sw * a).sum(dim=(1, 2))
+            fy = (sw * (b * cd - cc * sd)).sum(dim=(1, 2))
+            fz = (sw * (b * sd + cc * cd)).sum(dim=(1, 2))
+            return fx, fy, fz
+
+        def _enu(fx, fy, fz):
+            return fx * ss + fy * cs, fx * cs - fy * ss, fz
+
+        one = torch.ones((), device=x.device, dtype=x.dtype)
+        # per-corner weights d(xi)/dL on the j-axis and d(et)/dW on the k-axis
+        wL = x.new_tensor([0.5, -0.5]).reshape(1, 2, 1, 1)
+        wW = x.new_tensor([0.5, -0.5]).reshape(1, 1, 2, 1)
+
+        disp_t = (dub.ux, dub.uy, dub.uz)
+        xstr_t = (dub.uxx, dub.uyx, dub.uzx)      # d/d(xi)        (= d/dx_station)
+        ystr_t = (dub.uxy, dub.uyy, dub.uzy)      # d/dy_station
+        # The kernel z-derivative is a rotation of the (et, q) partials:
+        #   du_y = cd u_et + sd u_q,   du_z = cd u_q - sd u_et
+        # so u_et = cd du_y - sd du_z  and  d/d(depth) = sd u_et - cd u_q = -du_z.
+        uet_t = (cd * dub.uxy - sd * dub.uxz,
+                 cd * dub.uyy - sd * dub.uyz,
+                 cd * dub.uzy - sd * dub.uzz)
+        # d/d(depth) triple = -(z-strain)
+        zstr_t = (-dub.uxz, -dub.uyz, -dub.uzz)
+
+        # fault-frame displacement and x/y strains (no corner weighting)
+        Fx, Fy, Fz = _assemble(disp_t, one)
+        SXx, SXy, SXz = _assemble(xstr_t, one)    # dF/dx_station
+        SYx, SYy, SYz = _assemble(ystr_t, one)    # dF/dy_station
+
+        # observation coords: x_station = dx ss + dy cs, y_station = dx cs - dy ss
+        xobs = _enu(SXx * ss + SYx * cs, SXy * ss + SYy * cs, SXz * ss + SYz * cs)
+        yobs = _enu(SXx * cs - SYx * ss, SXy * cs - SYy * ss, SXz * cs - SYz * ss)
+
+        # length (via xi) and width (via et), with per-corner weights
+        length_j = _enu(*_assemble(xstr_t, wL))
+        width_j = _enu(*_assemble(uet_t, wW))
+        # depth: d/d(depth) = d/dz_station  (both enter via d = depth + z)
+        depth_j = _enu(*_assemble(zstr_t, one))
+
+        # strike: enters x_station/y_station AND the outer ENU rotation.
+        xs = dx * cs - dy * ss          # d(x_station)/d(strike)
+        ys = -dx * ss - dy * cs         # d(y_station)/d(strike)
+        dFx_s = SXx * xs + SYx * ys
+        dFy_s = SXy * xs + SYy * ys
+        dFz_s = SXz * xs + SYz * ys
+        strike_j = (
+            dFx_s * ss + Fx * cs + dFy_s * cs - Fy * ss,
+            dFx_s * cs - Fx * ss - dFy_s * ss - Fy * cs,
+            dFz_s,
         )
+
+        def _zero_sing(triple):
+            z = torch.zeros_like(triple[0])
+            return tuple(torch.where(singular, z, g) for g in triple)
+
+        strain = {
+            "x_obs": _zero_sing(xobs),     # each: (d ue, d un, d uu) / d(param)
+            "y_obs": _zero_sing(yobs),
+            "length": _zero_sing(length_j),
+            "width": _zero_sing(width_j),
+            "depth": _zero_sing(depth_j),
+            "strike": _zero_sing(strike_j),
+        }
+        return disp, strain
+
+
+def _contract(strain, key, ge, gn, gu):
+    """VJP for one parameter: sum the per-output strain against grad_outputs."""
+    se, sn, su = strain[key]
+    return ge * se + gn * sn + gu * su
+
+
+class _OkadaSimpleAnalyticFn(torch.autograd.Function):
+    """Analytic-backward implementation of :class:`OkadaSourceSimple`.
+
+    Closed-form Okada surface strain for ``x_obs``/``y_obs``/``source``/``length``/
+    ``width``/``centroid_depth``/``strike``; slips via autograd of the exact
+    forward; ``dip`` via a wide central difference (its ``1/cos(dip)**2`` terms
+    make autograd ill-conditioned near vertical)."""
+
+    # which inputs get analytic gradients, in the strain-dict keys
+    _ANALYTIC = ("x_obs", "y_obs", "length", "width", "depth", "strike")
+
+    @staticmethod
+    def forward(ctx, model, x_obs, y_obs, source_x, source_y, dip, strike,
+                centroid_depth, length, width, disl1, disl2, disl3):
+        with torch.no_grad():
+            disp, strain = model._evaluate(
+                x_obs, y_obs, source_x, source_y, dip, strike,
+                centroid_depth, length, width, disl1, disl2, disl3,
+                return_strain=True,
+            )
+        ctx.model = model
+        # flatten the strain dict (6 params x 3 outputs) for save_for_backward
+        flat = [t for k in _OkadaSimpleAnalyticFn._ANALYTIC for t in strain[k]]
+        ctx.save_for_backward(
+            x_obs, y_obs, source_x, source_y, dip, strike, centroid_depth,
+            length, width, disl1, disl2, disl3, *flat,
+        )
+        return disp.e, disp.n, disp.u
+
+    @staticmethod
+    def backward(ctx, ge, gn, gu):
+        saved = ctx.saved_tensors
+        (x_obs, y_obs, source_x, source_y, dip, strike, centroid_depth,
+         length, width, disl1, disl2, disl3) = saved[:12]
+        keys = _OkadaSimpleAnalyticFn._ANALYTIC
+        strain = {k: saved[12 + 3 * i: 15 + 3 * i] for i, k in enumerate(keys)}
+        ev = ctx.model._evaluate
+
+        # Analytic gradients.
+        gx = _contract(strain, "x_obs", ge, gn, gu)     # d/dx_obs  [B, N]
+        gy = _contract(strain, "y_obs", ge, gn, gu)     # d/dy_obs  [B, N]
+        # Translation invariance: field depends on (x_obs - source_x).
+        gsx = -gx.sum(dim=1)
+        gsy = -gy.sum(dim=1)
+        # per-image scalar params: contract then sum over observation points
+        g_strike = _contract(strain, "strike", ge, gn, gu).sum(dim=1)
+        g_depth = _contract(strain, "depth", ge, gn, gu).sum(dim=1)
+        g_length = _contract(strain, "length", ge, gn, gu).sum(dim=1)
+        g_width = _contract(strain, "width", ge, gn, gu).sum(dim=1)
+
+        # slips: autograd of the EXACT forward (linear, so exact and stable).
+        slips = [disl1.detach().clone().requires_grad_(True),
+                 disl2.detach().clone().requires_grad_(True),
+                 disl3.detach().clone().requires_grad_(True)]
+        with torch.enable_grad():
+            out = ev(x_obs, y_obs, source_x, source_y, dip, strike,
+                     centroid_depth, length, width, slips[0], slips[1], slips[2])
+            loss = (out.e * ge + out.n * gn + out.u * gu).sum()
+        g_d1, g_d2, g_d3 = torch.autograd.grad(loss, slips)
+
+        # dip: central finite differences of the EXACT forward.  dip has no
+        # closed-form surface strain, and autograd of the kernel's 1/cos(dip)^2
+        # terms is ill-conditioned near the vertical manifold (and zeroed exactly
+        # on it, where dccon0 snaps cos(dip) to a constant).  The forward values
+        # themselves lose precision for |cos(dip)| <~ 1e-3, so a *wide* central
+        # step (1e-3 rad) is used: it brackets the vertical manifold with both
+        # samples in the well-conditioned region, giving a derivative accurate to
+        # ~5 significant figures everywhere -- including exactly dip = 90 deg --
+        # while remaining tight enough to match autograd off-vertical (the field
+        # is smooth in dip, so truncation error is negligible).
+        def _dip_loss(dip_value):
+            o = ev(x_obs, y_obs, source_x, source_y, dip_value, strike,
+                   centroid_depth, length, width, disl1, disl2, disl3)
+            return (o.e * ge + o.n * gn + o.u * gu).sum(dim=1)   # [B]
+
+        h = 1e-3
+        with torch.no_grad():
+            g_dip = (_dip_loss(dip + h) - _dip_loss(dip - h)) / (2.0 * h)
+
+        # order: model, x_obs, y_obs, source_x, source_y, dip, strike,
+        #        centroid_depth, length, width, disl1, disl2, disl3
+        return (None, gx, gy, gsx, gsy, g_dip, g_strike, g_depth,
+                g_length, g_width, g_d1, g_d2, g_d3)
 
 
 # Geophysical fault parameter names consumed by okada_params_from_fault.
