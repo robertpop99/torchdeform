@@ -75,6 +75,29 @@ def test_runs_at_zero_orientation():
         assert torch.isfinite(t).all()
 
 
+def test_gradients_finite_at_vertical_sides():
+    """At omega = 0 (and any omega_z-only rotation) some rectangle sides are
+    exactly vertical. The forward masks them, but ``acos(+/-1)`` / ``sqrt(0)`` have
+    infinite slope, so a naive backward returns NaN for every geometry parameter.
+    Guard that all gradients stay finite for these degenerate orientations."""
+    B = 2
+    x, y = _grid(B, 9)
+    for omega in ((0.0, 0.0, 0.0), (0.0, 0.0, 0.7)):
+        params = {
+            "source_x": _f(B, 0), "source_y": _f(B, 0), "depth": _f(B, 4000),
+            "omega_x": _f(B, omega[0]), "omega_y": _f(B, omega[1]),
+            "omega_z": _f(B, omega[2]),
+            "a_x": _f(B, 900), "a_y": _f(B, 700), "a_z": _f(B, 300),
+            "opening": _f(B, 3.0),
+        }
+        for p in params.values():
+            p.requires_grad_(True)
+        out = CDMSource()(x, y, **params)
+        (out.e.sum() + out.n.sum() + out.u.sum()).backward()
+        for name, p in params.items():
+            assert p.grad is not None and torch.isfinite(p.grad).all(), name
+
+
 # --------------------------------------------------------------------------- #
 # Correctness: far-field reduction to the point CDM
 # --------------------------------------------------------------------------- #

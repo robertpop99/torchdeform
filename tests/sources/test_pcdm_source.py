@@ -57,6 +57,30 @@ def test_output_shape_and_finite():
         assert torch.isfinite(t).all()
 
 
+def test_gradients_finite_at_vertical_normal():
+    """omega = 0 (and omega_z-only) leaves a PTD with an exactly vertical normal.
+    ``h = sqrt(nx^2 + ny^2)`` has infinite slope at 0 and feeds the output, so a
+    naive backward returns NaN for the orientation gradients. Guard finiteness
+    for these degenerate orientations (the field is axisymmetric there, so the
+    fixed-frame value is exact even though the orientation gradient is only
+    approximate)."""
+    B, n = 2, 9
+    x, y = _grid(B, n)
+    for omega in ((0.0, 0.0, 0.0), (0.0, 0.0, 0.8)):
+        params = {
+            "source_x": _f(B, 0), "source_y": _f(B, 0), "depth": _f(B, 3000),
+            "omega_x": _f(B, omega[0]), "omega_y": _f(B, omega[1]),
+            "omega_z": _f(B, omega[2]),
+            "dv_x": _f(B, 5e6), "dv_y": _f(B, 4e6), "dv_z": _f(B, 6e6),
+        }
+        for p in params.values():
+            p.requires_grad_(True)
+        out = PCDMSource()(x, y, **params)
+        (out.e.sum() + out.n.sum() + out.u.sum()).backward()
+        for name, p in params.items():
+            assert p.grad is not None and torch.isfinite(p.grad).all(), name
+
+
 # --------------------------------------------------------------------------- #
 # Isotropic case: rotation-invariant, radial, Mogi-shaped, uplift
 # --------------------------------------------------------------------------- #

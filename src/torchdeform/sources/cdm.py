@@ -40,7 +40,14 @@ from .pcdm import _rotation_matrix
 from ..core import Displacement
 
 NUM_EPS = 1e-12       # float64 denominator/sqrt safety
-DEGENERATE_SIN = 1e-9  # |sin(beta)| below this => side is treated as vertical
+# |sin(beta)| below this => side is treated as vertical (its contribution is
+# masked to zero, the exact limit). Set well above the machine-eps used by the
+# reference: the half-space angular-dislocation surface formula suffers
+# catastrophic cancellation for *near*-vertical sides (spurious O(1)..O(1e13)
+# spikes for sin(beta) ~ 1e-9..1e-4 in float64), and a side within this angle of
+# vertical contributes negligibly, so folding it onto the vertical limit is both
+# accurate and numerically safe.
+DEGENERATE_SIN = 1e-4
 
 
 def _ang_dis_disp_surf(
@@ -150,14 +157,19 @@ def _ang_setup_fsc(
     """
     side = PB - PA                                   # [B, 3]
     length = torch.linalg.norm(side, dim=-1, keepdim=True).clamp_min(eps)  # [B, 1]
-    hlen = torch.sqrt(side[:, 0] ** 2 + side[:, 1] ** 2)  # [B] horizontal length
+    hlen = torch.sqrt(side[:, 0] ** 2 + side[:, 1] ** 2 + eps * eps)  # [B] horiz length
     sin_beta = (hlen / length[:, 0])                 # [B]
     degenerate = sin_beta <= DEGENERATE_SIN          # [B] (vertical side)
 
+    # Both ``acos`` (slope -inf at +/-1) and ``hlen = sqrt(.)`` (slope +inf at 0)
+    # are singular for an exactly vertical side. The output of such a side is
+    # masked to zero, but ``torch.where`` still routes a 0 cotangent into the
+    # unused branch and ``0 * inf = NaN`` would poison every geometry gradient.
+    # Substitute a safe argument *before* the singular op (acos(0) = pi/2, and the
+    # +eps*eps inside the sqrt) so the masked branch carries no NaN backward.
     cos_arg = (-side[:, 2] / length[:, 0]).clamp(-1.0, 1.0)
-    beta = torch.acos(cos_arg)                       # [B] in (0, pi)
-    # safe value where the side is vertical (output is masked to zero anyway)
-    beta = torch.where(degenerate, torch.full_like(beta, math.pi / 2.0), beta)
+    cos_arg = torch.where(degenerate, torch.zeros_like(cos_arg), cos_arg)
+    beta = torch.acos(cos_arg)                       # [B] in (0, pi); pi/2 if degenerate
 
     # ADCS basis (columns of A), expressed in EFCS
     hlen_safe = hlen.clamp_min(eps)

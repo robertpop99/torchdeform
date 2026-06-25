@@ -156,8 +156,21 @@ def _shape_tensor_ecm(a1: Tensor, a2: Tensor, a3: Tensor, nu: float, eps: float)
     I22_t = (four_pi / a2s - I23_t - I12_t) / 3.0
     I33_t = (four_pi / a3s - I13_t - I23_t) / 3.0
 
+    # relative closeness -> branch membership. Computed here (rather than just
+    # before ``pick`` below) because the oblate/prolate branches need ``sphere``
+    # to keep the discarded spherical result's gradient finite.
+    rel12 = (a1 - a2) / a1
+    rel23 = (a2 - a3) / a1
+    oblate = rel12 < BRANCH_TOL
+    prolate = rel23 < BRANCH_TOL
+    sphere = oblate & prolate
+
     # --- oblate ( a1 = a2 > a3 ) ----------------------------------------- #
+    # For an exact sphere rat -> 1, where acos'(1) and sqrt'(0) are infinite and
+    # the oblate result is discarded (overridden by the sphere closed form). Feed
+    # a safe rat there so the dead branch carries no NaN into the backward pass.
     rat = (a3 / a1).clamp(-1.0, 1.0)
+    rat = torch.where(sphere, torch.full_like(rat, 0.5), rat)
     I1_o = 2.0 * math.pi * abc / d13 ** 1.5 * (
         torch.acos(rat) - rat * torch.sqrt((1.0 - rat * rat).clamp_min(0.0)))
     I3_o = four_pi - 2.0 * I1_o
@@ -169,7 +182,10 @@ def _shape_tensor_ecm(a1: Tensor, a2: Tensor, a3: Tensor, nu: float, eps: float)
     I12_o = I11_o
 
     # --- prolate ( a1 > a2 = a3 ) ---------------------------------------- #
+    # Same guard as the oblate branch: for a sphere ar -> 1 (acosh'(1), sqrt'(0)
+    # infinite) and this result is discarded.
     ar = (a1 / a3).clamp_min(1.0)
+    ar = torch.where(sphere, torch.full_like(ar, 2.0), ar)
     I2_p = 2.0 * math.pi * abc / d13 ** 1.5 * (
         ar * torch.sqrt((ar * ar - 1.0).clamp_min(0.0)) - torch.acosh(ar))
     I1_p = four_pi - 2.0 * I2_p
@@ -179,13 +195,6 @@ def _shape_tensor_ecm(a1: Tensor, a2: Tensor, a3: Tensor, nu: float, eps: float)
     I23_p = I22_p
     I13_p = I12_p
     I33_p = (four_pi / a3s - I13_p - I23_p) / 3.0
-
-    # relative closeness -> branch membership
-    rel12 = (a1 - a2) / a1
-    rel23 = (a2 - a3) / a1
-    oblate = rel12 < BRANCH_TOL
-    prolate = rel23 < BRANCH_TOL
-    sphere = oblate & prolate
 
     def pick(t, o, p):
         return torch.where(oblate, o, torch.where(prolate, p, t))

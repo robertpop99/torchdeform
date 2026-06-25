@@ -33,6 +33,14 @@ from .base import SourceModel
 from ..core import Displacement
 
 NUM_EPS = 1e-12   # float64 denominator/sqrt safety
+# |sin(dip)| (= horizontal magnitude of the unit normal) below this => the PTD is
+# treated as vertical and the in-plane frame is fixed to (1, 0). The frame
+# ``(-ny, -nx)/h`` suffers catastrophic cancellation in its gradient for a
+# *near*-vertical normal (the orientation gradient blows up to ~1e9 as h -> 0 in
+# float64), so this is set well above machine eps; a normal within ~1e-6 rad of
+# vertical is axisymmetric to O(1e-6), making the fixed-frame choice negligible in
+# the forward while keeping the backward bounded.
+DEGENERATE_SIN = 1e-6
 
 
 def _rotation_matrix(ox: Tensor, oy: Tensor, oz: Tensor) -> Tensor:
@@ -78,9 +86,13 @@ def _ptd_disp_surf(dx, dy, depth, nx, ny, nz, dv, nu, eps):
         ``(ue, un, uv)`` each ``[B, N]``.
     """
     # sin(dip) = horizontal magnitude of the normal; cos(dip) = vertical comp.
-    h = torch.sqrt(nx * nx + ny * ny)
+    # The +eps*eps inside the sqrt keeps its slope finite at a vertical normal
+    # (nx = ny = 0): ``h`` feeds the output directly as ``sd`` and also the
+    # ``-n/h_safe`` branch of the frame below, so a bare sqrt(0) (slope +inf)
+    # would make ``0 * inf = NaN`` poison every orientation gradient there.
+    h = torch.sqrt(nx * nx + ny * ny + eps * eps)
     h_safe = h.clamp_min(eps)
-    vertical = h <= eps
+    vertical = h <= DEGENERATE_SIN
     # horizontal rotation by beta = strike - 90, expressed via the normal:
     #   cos(beta) = -ny / h,  sin(beta) = -nx / h
     # (at a vertical normal the field is axisymmetric, so any frame works -> (1,0))
@@ -142,6 +154,35 @@ class PCDMSource(SourceModel):
     - Potencies ``dv_x/y/z`` in m^3 and must share a sign per item (a coherent
       inflation or deflation); mixed signs raise ``ValueError``.
     - Returns ENU surface displacement in metres.
+
+    Known limitation (orientation gradient at an exactly vertical PTD normal)
+    ------------------------------------------------------------------------
+    When the orientation makes one of the three PTD normals *exactly* vertical
+    (an axis-aligned box, ``omega_x = omega_y = 0`` for any ``omega_z``), the
+    in-plane frame ``(-ny, -nx)/h`` -- with ``h`` the horizontal magnitude of the
+    unit normal -- is built around an azimuth that is undefined at the pole. The
+    forward stays correct (the field is axisymmetric there, so the fixed ``(1, 0)``
+    frame is exact) and the gradient is finite and bounded, but the *orientation*
+    gradient (``d/d omega``) at that exact configuration is only approximate
+    (correctly signed, right order of magnitude, but not exact). For any tilt
+    beyond ``DEGENERATE_SIN`` (~1e-6 rad) the gradient is exact, so this affects
+    only a measure-zero set that :class:`~torchdeform.simulation.PCDMPrior` (which
+    samples ``omega`` continuously) does not hit; the axis-aligned presets that
+    *do* fix ``omega = 0`` route through :class:`~torchdeform.sources.CDMSource` /
+    :class:`~torchdeform.sources.PECMSource`, whose degenerate-case gradients are
+    exact. In practice the worst case is a single bounded, correctly-signed step
+    when an optimisation is initialised exactly at ``omega = 0``.
+
+    The cause is purely the ``1/h`` strike-frame parametrisation, not a missing
+    closed-form derivative: the field is genuinely smooth in the unit normal (and
+    hence in ``omega``) through the pole, so a hand-written analytic backward would
+    hit the same ``0/0`` and need the same special-casing. The proper fix, if
+    pole-exact orientation gradients are ever needed, is to make the *forward*
+    singularity-free -- express the strike rotation directly via ``nx, ny, nz``
+    (so the explicit ``1/h`` azimuth never appears and the ``1/h`` factors cancel
+    against the ``sd = h`` terms and the outer inverse rotation) -- after which
+    plain autograd is exact everywhere with no degenerate special case. That is
+    cheaper and lower-risk than authoring a closed-form Jacobian.
     """
 
     def __init__(

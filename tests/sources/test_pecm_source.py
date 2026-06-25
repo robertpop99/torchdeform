@@ -85,6 +85,29 @@ def test_output_shape_and_finite():
         assert torch.isfinite(t).all()
 
 
+def test_gradients_finite_for_sphere_and_spheroids():
+    """At an exact sphere (a_x = a_y = a_z) the oblate branch's ``acos(a3/a1)`` and
+    the prolate branch's ``acosh(a1/a3)`` hit their infinite-slope point at +/-1
+    while being discarded by the spherical override -- a naive backward returns
+    NaN for the semi-axis gradients. Guard finiteness for the sphere and both
+    spheroid degeneracies."""
+    B, n = 2, 9
+    x, y = _grid(B, n)
+    for axes in ((500, 500, 500), (500, 500, 300), (500, 300, 300)):
+        params = {
+            "source_x": _f(B, 0), "source_y": _f(B, 0), "depth": _f(B, 4000),
+            "omega_x": _f(B, 0.3), "omega_y": _f(B, 0.2), "omega_z": _f(B, 0.6),
+            "a_x": _f(B, axes[0]), "a_y": _f(B, axes[1]), "a_z": _f(B, axes[2]),
+            "pressure": _f(B, 8e6),
+        }
+        for p in params.values():
+            p.requires_grad_(True)
+        out = _src()(x, y, **params)
+        (out.e.sum() + out.n.sum() + out.u.sum()).backward()
+        for name, p in params.items():
+            assert p.grad is not None and torch.isfinite(p.grad).all(), (axes, name)
+
+
 # --------------------------------------------------------------------------- #
 # Spherical cavity == centre of dilatation
 # --------------------------------------------------------------------------- #
