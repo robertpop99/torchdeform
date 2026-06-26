@@ -1,364 +1,149 @@
 """
-Penny-shaped (circular) crack source, differentiable.
+Fialko, Khazan & Simons (2001) pressurized horizontal circular ("penny-shaped")
+crack in an elastic half-space.
 
-Surface displacement from a pressurised horizontal penny-shaped crack in an
-elastic half-space (Fialko et al., 2001) -- a sill-like analogue to the Mogi
-point source that captures the flatter, broader signal of a shallow horizontal
-intrusion. There is no closed form: the solution reduces to a Fredholm integral
-equation, which is discretised with Gauss-Legendre quadrature, solved as a dense
-linear system, and integrated over the crack. Every step is implemented with
-batched tensor ops and a linear solve, so the whole model is differentiable in
-the source parameters.
+This is a clean-room implementation derived **solely** from the published paper:
 
-Pipeline (all batched over ``B`` source instances)
--------------------------------------------------
-1. ``build_quadrature`` -- Gauss-Legendre nodes/weights on ``[0, 1]`` (16-point
-   rule, ``ROOT16``/``WEIGHT16``, subdivided into ``nis`` panels).
-2. ``fpkernel_vec`` / ``kg`` / ``kern`` -- the integral-equation kernels.
-3. ``fredholm_solve_differentiable`` -- solves for the auxiliary functions
-   ``fi``, ``psi`` via :func:`torch.linalg.solve`.
-4. ``q_all`` + ``intgr_batched`` -- integrate to get dimensionless vertical and
-   radial displacement, which :class:`PennySource` rescales to metres.
+    Y. Fialko, Y. Khazan & M. Simons (2001), "Deformation due to a pressurized
+    horizontal circular crack in an elastic half-space, with applications to
+    volcano geodesy", Geophys. J. Int. 146, 181-190.
+
+A horizontal circular crack of radius ``R`` is buried at depth ``H`` in an
+elastic half-space and loaded by a uniform (hydrostatic) excess pressure
+``dP``. The free surface displacement has no elementary closed form: it follows
+from a pair of coupled Fredholm integral equations of the second kind for two
+auxiliary "image" functions phi(t), psi(t) (the paper's eq 27 / Appendix A),
+after which the surface displacements are recovered from a second integral with
+closed-form kernels (eq 30 / Appendix B).
+
+Pipeline (all dimensionless lengths normalised by the crack radius ``R`` and all
+stresses by the shear modulus ``mu``, paper section 3):
+
+1. ``build_quadrature`` -- composite 16-point Gauss-Legendre grid on [0, 1].
+2. ``_fredholm_kernels`` -- the smooth bounded kernels ``T1..T4`` (eqs A2-A5),
+   built from ``R1..R3`` (eq 25) and ``P1..P4`` (Appendix A).
+3. ``_solve_fredholm`` -- discretise the coupled system (eq A1) as a *single*
+   dense linear system ``M x = b`` and solve once with ``torch.linalg.solve``
+   (no successive-approximation iteration), so gradients flow through the solve
+   and the whole batch is solved together.
+4. ``_surface_kernels`` -- the closed-form ``S/C`` improper-integral kernels
+   (eqs B5-B13).
+5. ``_surface_displacement`` -- assemble eq 30 (from eqs B1-B2) to get the
+   dimensionless vertical / radial surface displacements, then scale by
+   ``Pf = 2(1-nu) R dP / mu`` (the dimensional factor of eqs B1-B2, C12) to get
+   metres.
+
+All steps are batched over ``B`` and differentiable in the source parameters.
+
+Conventions (matching the rest of torchdeform):
+- ``z`` positive downward, crack centred at ``depth`` with ``radius``.
+- Output vertical ``u`` is positive **upward** (uplift) for positive pressure;
+  the paper's ``Uz`` points downward (its ``z`` axis), so we negate it.
+- The horizontal surface field is purely radial; we decompose it into E/N along
+  the unit vector from the crack centre to each observation point.
 """
-import math
 import torch
 from torch import Tensor
 
 from .base import SourceModel
 from ..core import Displacement
 
-NUM_EPS = 1e-12  # float64 denominator/log/sqrt safety
+
+# --------------------------------------------------------------------------- #
+# 16-point Gauss-Legendre nodes / weights on [-1, 1] (Abramowitz & Stegun).
+# Used because Appendix A states the numerical integration is performed with
+# 16-point Gaussian quadrature on each subinterval.
+# --------------------------------------------------------------------------- #
+_GL16_NODES = (
+    0.0950125098376374401853193354250,
+    0.2816035507792589132304605014605,
+    0.4580167776572273863424194429513,
+    0.6178762444026437484466717640413,
+    0.7554044083550030338951011948474,
+    0.8656312023878317438804678977124,
+    0.9445750230732325760779884155343,
+    0.9894009349916499325961541734504,
+)
+_GL16_WEIGHTS = (
+    0.1894506104550684962853967232083,
+    0.1826034150449235888667636679692,
+    0.1691565193950025381893120790304,
+    0.1495959888165767320815017305474,
+    0.1246289712555338720524762821920,
+    0.0951585116824927848099251076022,
+    0.0622535239386478928628438369944,
+    0.0271524594117540948517805724560,
+)
+
+# Full symmetric 16-node / 16-weight vectors (negative half mirrors the positive
+# half; nodes ordered ascending to match numpy.polynomial.legendre.leggauss).
+ROOT16 = torch.tensor(
+    [-n for n in reversed(_GL16_NODES)] + list(_GL16_NODES),
+    dtype=torch.float64,
+)
+WEIGHT16 = torch.tensor(
+    list(reversed(_GL16_WEIGHTS)) + list(_GL16_WEIGHTS),
+    dtype=torch.float64,
+)
 
 
-ROOT16 = torch.tensor([
-    -0.989400934991649932596,
-    -0.944575023073232576078,
-    -0.865631202387831743880,
-    -0.755404408355003033895,
-    -0.617876244402643748447,
-    -0.458016777657227386342,
-    -0.281603550779258913230,
-    -0.095012509837637440185,
-     0.095012509837637440185,
-     0.281603550779258913230,
-     0.458016777657227386342,
-     0.617876244402643748447,
-     0.755404408355003033895,
-     0.865631202387831743880,
-     0.944575023073232576078,
-     0.989400934991649932596,
-], dtype=torch.float64)
+def build_quadrature(
+    nis: int,
+    root: Tensor,
+    weight: Tensor,
+    *,
+    device=None,
+    dtype: torch.dtype = torch.float64,
+) -> tuple[Tensor, Tensor]:
+    """Composite Gauss-Legendre quadrature on [0, 1].
 
-WEIGHT16 = torch.tensor([
-    0.027152459411754094852,
-    0.062253523938647892863,
-    0.095158511682492784810,
-    0.124628971255533872052,
-    0.149595988816576732081,
-    0.169156519395002538189,
-    0.182603415044923588867,
-    0.189450610455068496285,
-    0.189450610455068496285,
-    0.182603415044923588867,
-    0.169156519395002538189,
-    0.149595988816576732081,
-    0.124628971255533872052,
-    0.095158511682492784810,
-    0.062253523938647892863,
-    0.027152459411754094852,
-], dtype=torch.float64)
-
-
-def kg(s, p):
-    """Elementary kernel term ``(3p - s^2) / (p + s^2)^3`` used by ``fpkernel_vec``.
-
-    ``s`` and ``p`` are broadcast-compatible tensors (``p = 4 h^2``).
-    """
-    z = s * s
-    y = p + z
-    return (3.0 * p - z) / (y ** 3)
-
-
-def kern(w, p):
-    """Elementary kernel term ``2 (p^2/2 + w^4 - p w^2/2) / (p + w^2)^3``.
-
-    Companion to :func:`kg`, used to assemble the ``n = 2`` (KN1) kernel.
-    ``w`` and ``p`` are broadcast-compatible tensors.
-    """
-    u = (p + w * w) ** 3
-    return 2.0 * (0.5 * p * p + w**4 - 0.5 * p * w * w) / u
-
-
-def fpkernel_vec(h, t, r, n, *, eps=NUM_EPS, dlt=1e-6):
-    """
-    Fully tensorized, differentiable version of fpkernel.
+    Subdivide [0, 1] into ``nis`` equal panels and map the reference nodes /
+    weights (``root``/``weight`` on [-1, 1]) into each panel (Appendix A:
+    "Numerical integration is performed by subdividing the interval of
+    integration into ... equal intervals and using the 16-point Gaussian
+    quadrature on each interval").
 
     Parameters
     ----------
-    h : tensor broadcastable with t and r
-    t : tensor
-    r : tensor
-    n : int in {1,2,3,4}
+    nis : int
+        Number of equal panels on [0, 1].
+    root, weight : Tensor
+        Gauss-Legendre nodes and weights on [-1, 1] (e.g. ``ROOT16``/``WEIGHT16``).
 
     Returns
     -------
-    tensor broadcast over h, t, r
-    """
-    # Floor p (= 4h²) away from 0. At depth 0 (h == 0, p == 0) the kernel
-    # building blocks kg/kern and the log argument all collapse to 0/0 → NaN on
-    # the diagonal (where t == r, so t ± r and the log numerator vanish). Every
-    # kernel carries an overall factor of p or h, so it still → 0 as h → 0; the
-    # floor only keeps the intermediates finite. clamp is inert for any
-    # realistic depth (4h² ≫ eps), so existing results are unchanged.
-    p = torch.clamp(4.0 * h * h, min=eps)
-
-    if n == 1:  # KN
-        return p * h * (kg(t - r, p) - kg(t + r, p))
-
-    elif n == 2:  # KN1
-        a = t + r
-        b = t - r
-        y = a * a
-        z = b * b
-
-        g = 2.0 * p * h * (p * p + 6.0 * p * (t * t + r * r) + 5.0 * (a * b) ** 2)
-        s = g / (((p + z) * (p + y)) ** 2)
-
-        safe_t = torch.where(torch.abs(t) < eps, torch.full_like(t, eps), t)
-        safe_r = torch.where(torch.abs(r) < eps, torch.full_like(r, eps), r)
-
-        trbl_general = h / (safe_t * safe_r) * torch.log((p + z) / (p + y))
-
-        trbl_t0 = -4.0 * h / (p + r * r)
-        trbl_r0 = -4.0 * h / (p + t * t)
-
-        # Match original branch order:
-        # if |t| < dlt: use trbl_t0
-        # elif r > dlt: use general expression
-        # else: use trbl_r0
-        trbl = torch.where(
-            torch.abs(t) < dlt,
-            trbl_t0,
-            torch.where(r > dlt, trbl_general, trbl_r0)
-        )
-
-        return trbl + s + h * (kern(b, p) + kern(a, p))
-
-    elif n == 3:  # KM
-        y = (t + r) ** 2
-        z = (t - r) ** 2
-        a = ((p + y) * (p + z)) ** 2
-        c = t + r
-        d = t - r
-        b = p * t * ((3.0 * p * p - (c * d) ** 2 + 2.0 * p * (t * t + r * r)) / a)
-        a2 = p / 2.0 * (c * kg(c, p) + d * kg(d, p))
-        return b - a2
-
-    elif n == 4:  # KM1(t,r)=KM(r,t)
-        y = (t + r) ** 2
-        z = (t - r) ** 2
-        a = ((p + y) * (p + z)) ** 2
-        c = t + r
-        d = -t + r
-        b = p * r * ((3.0 * p * p - (c * d) ** 2 + 2.0 * p * (t * t + r * r)) / a)
-        a2 = p / 2.0 * (c * kg(c, p) + d * kg(d, p))
-        return b - a2
-
-    else:
-        raise ValueError(f"Unknown kernel index n={n}")
-
-
-def build_quadrature(nis, root, weight, *, device, dtype):
-    """
-    Build t and Wt without Python loops.
+    (t, Wt) : tuple of Tensor
+        Quadrature nodes ``t`` in (0, 1) and weights ``Wt`` scaled so that
+        ``Wt.sum() == 1`` (the length of [0, 1]); each of length ``nis * len(root)``.
     """
     root = root.to(device=device, dtype=dtype)
     weight = weight.to(device=device, dtype=dtype)
 
-    k = torch.arange(nis, device=device, dtype=dtype)  # [0, ..., nis-1]
-    d1 = 1.0 / nis
+    panel = 1.0 / nis                                  # panel width
+    # left edges of the nis panels: 0, panel, 2*panel, ...
+    edges = torch.arange(nis, device=device, dtype=dtype) * panel  # [nis]
+    centres = edges + 0.5 * panel                                  # [nis]
+    half = 0.5 * panel
 
-    t_left = d1 * k[:, None]         # [nis, 1]
-    t_right = d1 * (k + 1)[:, None]  # [nis, 1]
+    # map reference nodes/weights into every panel -> [nis, len(root)]
+    t = centres[:, None] + half * root[None, :]
+    Wt = half * weight[None, :].expand(nis, -1)
 
-    rr = root[None, :]               # [1, 16]
-    ww = weight[None, :]             # [1, 16]
-
-    t = (rr * (t_right - t_left) * 0.5 + (t_right + t_left) * 0.5).reshape(-1)
-    Wt = (0.5 / nis * ww).expand(nis, -1).reshape(-1)
-
-    return t, Wt
-
-
-def fredholm_solve_differentiable(h, t, Wt):
-    """
-    Solve the Fredholm system directly as a linear system.
-
-    Parameters
-    ----------
-    h : tensor [B] or scalar tensor
-        Dimensionless crack depth.
-    t : tensor [M]
-    Wt : tensor [M]
-
-    Returns
-    -------
-    fi, psi : tensors [B, M] if h is batched, otherwise [1, M]
-    """
-    lamda = 2.0 / math.pi
-
-    if h.ndim == 0:
-        h = h[None]
-
-    B = h.shape[0]
-    M = t.numel()
-    dtype = t.dtype
-    device = t.device
-
-    H = h[:, None, None]          # [B,1,1]
-    T = t[None, :, None]          # [1,M,1]
-    R = t[None, None, :]          # [1,1,M]
-
-    # Kernels [B, M, M]
-    K1 = fpkernel_vec(H, T, R, 1)
-    K2 = fpkernel_vec(H, T, R, 2)
-    K3 = fpkernel_vec(H, T, R, 3)
-    K4 = fpkernel_vec(H, T, R, 4)
-
-    # Fold in quadrature weights on the "integration" dimension (columns)
-    W = Wt[None, None, :]         # [1,1,M]
-    K1w = K1 * W
-    K2w = K2 * W
-    K3w = K3 * W
-    K4w = K4 * W
-
-    I = torch.eye(M, dtype=dtype, device=device)[None, :, :]  # [1,M,M]
-
-    A11 = I - lamda * K1w
-    A12 = -lamda * K3w
-    A21 = -lamda * K4w
-    A22 = I - lamda * K2w
-
-    A_top = torch.cat([A11, A12], dim=-1)   # [B,M,2M]
-    A_bot = torch.cat([A21, A22], dim=-1)   # [B,M,2M]
-    A = torch.cat([A_top, A_bot], dim=-2)   # [B,2M,2M]
-
-    rhs_f = -lamda * t[None, :]             # [1,M]
-    rhs_p = torch.zeros((B, M), dtype=dtype, device=device)
-    rhs = torch.cat([rhs_f.expand(B, -1), rhs_p], dim=-1)  # [B,2M]
-
-    # A = A + 1e-12 * torch.eye(A.shape[-1], device=A.device, dtype=A.dtype)[None] # mitigation
-    sol = torch.linalg.solve(A, rhs.unsqueeze(-1)).squeeze(-1)  # [B,2M]
-
-    fi = sol[:, :M]
-    psi = sol[:, M:]
-    return fi, psi
-
-
-def q_all(h, t, r, *, eps=NUM_EPS):
-    """
-    Compute Q1..Q8 in one differentiable pass.
-
-    Parameters
-    ----------
-    h : tensor broadcastable with t and r
-    t : tensor
-    r : tensor
-
-    Returns
-    -------
-    q1..q8 : tensors of broadcast shape
-    """
-    e = h * h + r * r - t * t
-    d = torch.sqrt(e * e + 4.0 * h * h * t * t + eps)
-    d3 = d * d * d
-
-    sqrt2 = math.sqrt(2.0)
-    sqrt_dp = torch.sqrt(d + e + eps)
-    sqrt_dm = torch.sqrt(d - e + eps)
-
-    safe_r = torch.where(torch.abs(r) < eps, torch.full_like(r, eps), r)
-
-    q1 = sqrt2 * h * t / (d * sqrt_dp)
-
-    q2 = (
-        h * sqrt_dm * (2.0 * e + d)
-        - t * sqrt_dp * (2.0 * e - d)
-    ) / (sqrt2 * d3)
-
-    q3 = (
-        h * sqrt_dp * (2.0 * e - d)
-        + t * sqrt_dm * (2.0 * e + d)
-    ) / (sqrt2 * d3)
-
-    q4 = t / safe_r - sqrt_dm / (safe_r * sqrt2)
-
-    q5 = -(h * sqrt_dm - t * sqrt_dp) / (d * safe_r * sqrt2)
-
-    q6 = 1.0 / safe_r - (h * sqrt_dp + t * sqrt_dm) / (d * safe_r * sqrt2)
-
-    q7 = safe_r * sqrt_dp * (2.0 * e - d) / (d3 * sqrt2)
-
-    q8 = safe_r * sqrt_dm * (2.0 * e + d) / (d3 * sqrt2)
-
-    return q1, q2, q3, q4, q5, q6, q7, q8
-
-
-def intgr_batched(r, fi, psi, h, Wt, t, *, eps=NUM_EPS):
-    """
-    Batched/vectorized version of intgr.
-
-    Parameters
-    ----------
-    r : tensor [B, N]
-    fi, psi : tensors [B, M]
-    h : tensor [B]
-    Wt, t : tensors [M]
-
-    Returns
-    -------
-    Uz, Ur : tensors [B, N]
-    """
-    B, N = r.shape
-    M = t.numel()
-
-    H = h[:, None, None]       # [B,1,1]
-    R = r[:, :, None]          # [B,N,1]
-    T = t[None, None, :]       # [1,1,M]
-
-    q1, q2, q3, q4, q5, q6, q7, q8 = q_all(H, T, R, eps=eps)  # [B,N,M]
-
-    inv_t = 1.0 / torch.clamp(T, min=eps)   # [1,1,M]
-    W = Wt[None, None, :]                   # [1,1,M]
-    FI = fi[:, None, :]                     # [B,1,M]
-    PSI = psi[:, None, :]                   # [B,1,M]
-
-    Uz = torch.sum(
-        W * (
-            FI * (q1 + H * q2)
-            + PSI * (q1 * inv_t - q3)
-        ),
-        dim=-1
-    )  # [B,N]
-
-    Ur = torch.sum(
-        W * (
-            PSI * (
-                (q4 - H * q5) * inv_t
-                - q6
-                + H * q7
-            )
-            - H * FI * q8
-        ),
-        dim=-1
-    )  # [B,N]
-
-    return Uz, Ur
+    return t.reshape(-1), Wt.reshape(-1)
 
 
 class PennySource(SourceModel):
-    """
-    Differentiable, vectorized penny-shaped crack source.
+    """Fialko et al. (2001) pressurized penny-shaped (horizontal circular) crack.
+
+    Surface displacement of an elastic half-space due to a horizontal circular
+    crack of ``radius`` at ``depth`` loaded by uniform excess ``pressure``.
+
+    Conventions
+    -----------
+    - All distances in metres, pressure in Pa.
+    - Depth positive downward; crack centred at ``(source_x, source_y, depth)``.
+    - Returns ENU :class:`~torchdeform.core.Displacement` in metres, vertical
+      positive upward (uplift) for positive pressure.
     """
 
     def __init__(
@@ -366,8 +151,8 @@ class PennySource(SourceModel):
         poisson_ratio: float = 0.25,
         shear_modulus: float = 3e10,
         internal_dtype: torch.dtype = torch.float64,
-        nis:int=2,
-        num_eps:float = NUM_EPS,
+        nis: int = 2,
+        num_eps: float = 1e-12,
     ):
         super().__init__()
         self.v = poisson_ratio
@@ -376,97 +161,379 @@ class PennySource(SourceModel):
         self.nis = nis
         self.num_eps = num_eps
 
-        self.register_buffer("root16", ROOT16.to(internal_dtype))
-        self.register_buffer("weight16", WEIGHT16.to(internal_dtype))
+    # ------------------------------------------------------------------ #
+    # Appendix A kernels T1..T4  (eqs A2-A5)
+    # ------------------------------------------------------------------ #
+    def _fredholm_kernels(self, t: Tensor, r: Tensor, h: Tensor) -> tuple[Tensor, ...]:
+        """Closed-form Fredholm kernels ``T1, T2, T3, T4`` (eqs A2-A5).
 
+        Parameters
+        ----------
+        t, r : Tensor
+            Quadrature node vectors (length ``M``), forming the [M, M] grids
+            ``t`` (rows, the equation index) and ``r`` (cols, the integration
+            variable).
+        h : Tensor
+            Per-batch dimensionless depth ``h = depth / radius``, shape [B, 1, 1].
+
+        Returns
+        -------
+        (T1, T2, T3, T4) : tuple of Tensor
+            Each shaped [B, M, M].
+        """
+        eps = self.num_eps
+        # outer grids: t varies down rows, r across cols  -> [M, M]
+        tt = t[:, None]
+        rr = r[None, :]
+        # broadcast against batch dimension via h [B,1,1]
+        h2 = h * h
+        h3 = h2 * h
+        h4 = h2 * h2
+
+        # P1..P4 (Appendix A), functions of x = (t -/+ r):
+        #   P1(x) = (12 h^2 - x^2) / (4 h^2 + x^2)^3
+        #   P2(x) = ln(4 h^2 + x^2) + (8 h^4 + 2 x^2 h^2 - x^4) / (4 h^2 + x^2)^2
+        #   P3(x) = 2 (8 h^4 - 2 x^2 h^2 + x^4) / (4 h^2 + x^2)^3
+        #   P4(x) = (4 h^2 - x^2) / (4 h^2 + x^2)^2
+        def _P(x):
+            d = 4.0 * h2 + x * x                       # 4h^2 + x^2 (>0)
+            d2 = d * d
+            d3 = d2 * d
+            x2 = x * x
+            x4 = x2 * x2
+            P1 = (12.0 * h2 - x2) / d3
+            P2 = torch.log(d) + (8.0 * h4 + 2.0 * x2 * h2 - x4) / d2
+            P3 = 2.0 * (8.0 * h4 - 2.0 * x2 * h2 + x4) / d3
+            P4 = (4.0 * h2 - x2) / d2
+            return P1, P2, P3, P4
+
+        xm = tt - rr      # (t - r)
+        xp = tt + rr      # (t + r)
+
+        P1m, P2m, P3m, P4m = _P(xm)
+        P1p, P2p, P3p, P4p = _P(xp)
+
+        # eq (A2): T1(t,r) = 4 h^3 [ P1(t-r) - P1(t+r) ]
+        T1 = 4.0 * h3 * (P1m - P1p)
+
+        # eq (A3): T2(t,r) = (h/(t r)) [ P2(t-r) - P2(t+r) ] + h [ P3(t-r) + P3(t+r) ]
+        tr = (tt * rr) + eps
+        T2 = (h / tr) * (P2m - P2p) + h * (P3m + P3p)
+
+        # eq (A4): T3(t,r) = (h^2 / r) [ P4(t-r) - P4(t+r)
+        #                                - 2 r ( (t-r) P1(t-r) + (t+r) P1(t+r) ) ]
+        rsafe = rr + eps
+        T3 = (h2 / rsafe) * (
+            P4m - P4p - 2.0 * rsafe * (xm * P1m + xp * P1p)
+        )
+
+        # eq (A5): T4(t,r) = T3(r,t)  -> swap the roles of t and r.
+        # Rebuild T3 with t<->r: r/t arguments swapped.
+        xm_s = rr - tt    # (r - t)  (note P depends on x^2 so sign is irrelevant,
+        xp_s = rr + tt    # (r + t)   but kept explicit for clarity)
+        P1ms, _, _, P4ms = _P(xm_s)
+        P1ps, _, _, P4ps = _P(xp_s)
+        tsafe = tt + eps
+        T4 = (h2 / tsafe) * (
+            P4ms - P4ps - 2.0 * tsafe * (xm_s * P1ms + xp_s * P1ps)
+        )
+
+        return T1, T2, T3, T4
+
+    # ------------------------------------------------------------------ #
+    # Fredholm solve (eq A1) as a single dense linear system.
+    # ------------------------------------------------------------------ #
+    def _solve_fredholm(
+        self, t: Tensor, Wt: Tensor, h: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Solve the coupled Fredholm system (eq A1) on the quadrature grid.
+
+        For a uniformly (hydrostatic) pressurized crack, eq (A1) reads (with
+        normalised functions ``phibar = phi/p0``, ``psibar = psi/p0``):
+
+            phibar(t) = -2 t / pi + (2/pi) integral[ T1 phibar + T3 psibar ] dr
+            psibar(t) =             (2/pi) integral[ T2 psibar + T4 phibar ] dr
+
+        Discretising the integrals with the quadrature weights ``Wt`` and
+        collocating at the nodes ``t`` turns this into a 2M x 2M linear system
+
+            (I - K) [phibar; psibar] = b,
+
+        which we solve once per batch with ``torch.linalg.solve`` (no iteration),
+        keeping the whole thing autograd-differentiable.
+
+        Returns
+        -------
+        (phibar, psibar) : tuple of Tensor
+            Node values of the auxiliary functions, each [B, M].
+        """
+        dtype = t.dtype
+        device = t.device
+        B = h.shape[0]
+        M = t.shape[0]
+        c = 2.0 / torch.pi
+
+        # kernels on the [M, M] grid, batched [B, M, M]
+        T1, T2, T3, T4 = self._fredholm_kernels(t, r=t, h=h)
+
+        # Quadrature: integral f(r) dr ~ sum_j Wt_j f(r_j).  Fold the weights
+        # into the kernel columns so each block is (c * T * Wt).
+        Wcol = (c * Wt)[None, None, :]            # [1, 1, M]
+        K11 = T1 * Wcol                           # phibar <- phibar (eq A1, T1)
+        K12 = T3 * Wcol                           # phibar <- psibar (T3)
+        K22 = T2 * Wcol                           # psibar <- psibar (T2)
+        K21 = T4 * Wcol                           # psibar <- phibar (T4)
+
+        eye = torch.eye(M, dtype=dtype, device=device).expand(B, M, M)
+        # Assemble the 2M x 2M operator  A = I - K  with block layout
+        #   [ I - K11 ,   -K12 ]   [phibar]   [ -2 t / pi ]
+        #   [   -K21  , I - K22 ]   [psibar] = [    0      ]
+        top = torch.cat([eye - K11, -K12], dim=2)        # [B, M, 2M]
+        bot = torch.cat([-K21, eye - K22], dim=2)        # [B, M, 2M]
+        A = torch.cat([top, bot], dim=1)                 # [B, 2M, 2M]
+
+        # rhs: phibar forcing -2 t / pi (eq A1), psibar forcing 0.
+        b_phi = (-c * t).expand(B, M)                    # [B, M]
+        b_psi = torch.zeros(B, M, dtype=dtype, device=device)
+        b = torch.cat([b_phi, b_psi], dim=1)[..., None]  # [B, 2M, 1]
+
+        sol = torch.linalg.solve(A, b)[..., 0]           # [B, 2M]
+        phibar = sol[:, :M]
+        psibar = sol[:, M:]
+        return phibar, psibar
+
+    # ------------------------------------------------------------------ #
+    # Appendix B surface kernels (eqs B5-B13)
+    # ------------------------------------------------------------------ #
+    def _surface_kernels(self, r: Tensor, t: Tensor, h: Tensor) -> tuple[Tensor, ...]:
+        """Closed-form surface-displacement kernels (eqs B5-B13).
+
+        Parameters
+        ----------
+        r : Tensor
+            Dimensionless observation radius, shape [B, N, 1].
+        t : Tensor
+            Quadrature nodes, shape [1, 1, M].
+        h : Tensor
+            Dimensionless depth, shape [B, 1, 1].
+
+        Returns
+        -------
+        (S0_0, S0_1, C0_1, S1_m1, S1_0, C1_0, C1_1, S1_1) : tuple of Tensor
+            The eight ``S/C`` kernels of eqs B5-B12, each broadcast to [B, N, M].
+        """
+        eps = self.num_eps
+        # eq (B13): X1 = h^2 + r^2 - t^2 ,  X2 = sqrt(X1^2 + 4 h^2 t^2)
+        h2 = h * h
+        X1 = h2 + r * r - t * t
+        X2 = torch.sqrt(X1 * X1 + 4.0 * h2 * t * t + eps)
+
+        # Common radicals sqrt((X2 +/- X1)/2)  (so that, e.g., these are the real
+        # and imaginary parts arising from the improper integrals B3-B4).
+        sp = torch.sqrt(torch.clamp(0.5 * (X2 + X1), min=0.0) + eps)  # ~ sqrt((X2+X1)/2)
+        sm = torch.sqrt(torch.clamp(0.5 * (X2 - X1), min=0.0) + eps)  # ~ sqrt((X2-X1)/2)
+        # In eqs B5-B12 these appear as sqrt(X2+X1)/sqrt(2) and sqrt(X2-X1)/sqrt(2).
+        Sp = sp        # = sqrt(X2 + X1) / sqrt(2)
+        Sm = sm        # = sqrt(X2 - X1) / sqrt(2)
+
+        rsafe = r + eps
+        X2_3 = X2 * X2 * X2
+
+        # eq (B5):  S0^0 = sqrt(2) h t / (X2 sqrt(X2 + X1))
+        #         = h t / (X2 * Sp)            since sqrt(X2+X1) = sqrt(2) Sp
+        S0_0 = h * t / (X2 * Sp)
+
+        # eq (B6):  S0^1 = [ h sqrt(X2 - X1)(2 X1 + X2) - t sqrt(X2 + X1)(2 X1 - X2) ]
+        #                   / (sqrt(2) X2^3)
+        #         = [ h Sm (2 X1 + X2) - t Sp (2 X1 - X2) ] / X2^3
+        S0_1 = (h * Sm * (2.0 * X1 + X2) - t * Sp * (2.0 * X1 - X2)) / X2_3
+
+        # eq (B7):  C0^1 = [ h sqrt(X2 + X1)(2 X1 - X2) + t sqrt(X2 - X1)(2 X1 + X2) ]
+        #                   / (sqrt(2) X2^3)
+        #         = [ h Sp (2 X1 - X2) + t Sm (2 X1 + X2) ] / X2^3
+        C0_1 = (h * Sp * (2.0 * X1 - X2) + t * Sm * (2.0 * X1 + X2)) / X2_3
+
+        # eq (B8):  S1^-1 = t / r - sqrt(X2 - X1) / (sqrt(2) r)
+        #         = t / r - Sm / r
+        S1_m1 = t / rsafe - Sm / rsafe
+
+        # eq (B9):  S1^0 = [ t sqrt(X2 + X1) - h sqrt(X2 - X1) ] / (sqrt(2) r X2)
+        #         = ( t Sp - h Sm ) / (r X2)
+        S1_0 = (t * Sp - h * Sm) / (rsafe * X2)
+
+        # eq (B10): C1^0 = 1/r - [ h sqrt(X2 + X1) + t sqrt(X2 - X1) ] / (sqrt(2) r X2)
+        #         = 1/r - ( h Sp + t Sm ) / (r X2)
+        C1_0 = 1.0 / rsafe - (h * Sp + t * Sm) / (rsafe * X2)
+
+        # eq (B11): C1^1 = r sqrt(X2 + X1)(2 X1 - X2) / (sqrt(2) X2^3)
+        #         = r Sp (2 X1 - X2) / X2^3
+        C1_1 = r * Sp * (2.0 * X1 - X2) / X2_3
+
+        # eq (B12): S1^1 = r sqrt(X2 - X1)(2 X1 + X2) / (sqrt(2) X2^3)
+        #         = r Sm (2 X1 + X2) / X2^3
+        S1_1 = r * Sm * (2.0 * X1 + X2) / X2_3
+
+        return S0_0, S0_1, C0_1, S1_m1, S1_0, C1_0, C1_1, S1_1
+
+    # ------------------------------------------------------------------ #
+    # Surface displacement (eq 30 via Appendix B, eqs B1-B2)
+    # ------------------------------------------------------------------ #
+    def _surface_displacement(
+        self,
+        r: Tensor,            # [B, N] dimensionless observation radius
+        t: Tensor,            # [M] quadrature nodes
+        Wt: Tensor,           # [M] quadrature weights
+        phibar: Tensor,       # [B, M]
+        psibar: Tensor,       # [B, M]
+        h: Tensor,            # [B] dimensionless depth
+    ) -> tuple[Tensor, Tensor]:
+        """Dimensionless vertical / radial surface displacement (eqs B1-B2).
+
+        From eqs (28)-(29) with the auxiliary representations (24), (26) and the
+        closed-form ``S/C`` improper integrals (B3-B12), the surface
+        displacements (in units of ``2(1-nu) p0`` with ``p0`` the dimensionless
+        pressure) are
+
+            Uz / [2(1-nu) p0] = integral[ (S0^0 + h S0^1) phibar ] dt        # B1
+                              + integral[ (S0^0 / t - C0^1) psibar ] dt
+            Ur / [2(1-nu) p0] = integral[ (S1^-1/t - C1^0
+                                           - (h/t) S1^0 + h C1^1) psibar ] dt # B2
+                              - h integral[ S1^1 phibar ] dt
+
+        (The integrals are over t in [0, 1]; we evaluate them with the composite
+        Gauss-Legendre weights ``Wt``.)
+
+        Returns
+        -------
+        (uz, ur) : tuple of Tensor
+            Dimensionless displacements, each [B, N], with ``uz`` in the paper's
+            downward-positive convention and ``ur`` radially outward positive.
+            (Multiply by ``Pf`` and negate ``uz`` for upward-positive metres.)
+        """
+        eps = self.num_eps
+
+        # reshape for [B, N, M] broadcasting
+        r_ = r[:, :, None]                       # [B, N, 1]
+        t_ = t[None, None, :]                    # [1, 1, M]
+        h_ = h[:, None, None]                    # [B, 1, 1]
+        phib = phibar[:, None, :]                # [B, 1, M]
+        psib = psibar[:, None, :]                # [B, 1, M]
+        W = Wt[None, None, :]                    # [1, 1, M]
+
+        (S0_0, S0_1, C0_1, S1_m1,
+         S1_0, C1_0, C1_1, S1_1) = self._surface_kernels(r_, t_, h_)
+
+        tsafe = t_ + eps
+
+        # eq (B1): integrand for Uz
+        #   [ S0^0 + h S0^1 ] phibar + [ S0^0 / t - C0^1 ] psibar
+        integ_z = (S0_0 + h_ * S0_1) * phib + (S0_0 / tsafe - C0_1) * psib
+
+        # eq (B2): integrand for Ur, obtained by substituting eqs (24), (26) into
+        # eq (29).  With Psi(xi) = int (sin(xi t)/(xi t) - cos(xi t)) psi(t) dt and
+        # Phi(xi) = int sin(xi t) phi(t) dt, eq (29) is
+        #     Ur^s/[2(1-nu) p0] = int [ (1 - xi h) Psi(xi) - xi h Phi(xi) ]
+        #                              e^{-xi h} J1(xi r) dxi ,
+        # and expanding via the S/C improper integrals (B3-B12) gives
+        #   psi(t) coefficient:  S1^-1/t - C1^0 - (h/t) S1^0 + h C1^1
+        #   phi(t) coefficient:  -h S1^1
+        integ_r = (
+            (S1_m1 / tsafe - C1_0 - (h_ / tsafe) * S1_0 + h_ * C1_1) * psib
+            - h_ * S1_1 * phib
+        )
+
+        uz = (integ_z * W).sum(dim=-1)           # [B, N]
+        ur = (integ_r * W).sum(dim=-1)           # [B, N]
+        return uz, ur
+
+    # ------------------------------------------------------------------ #
     def forward(
         self,
-        x_obs: Tensor,      # [B, N]
-        y_obs: Tensor,      # [B, N]
-        source_x: Tensor,   # [B]
-        source_y: Tensor,   # [B]
-        depth: Tensor,      # [B]
-        radius: Tensor,     # [B]
-        pressure: Tensor,   # [B]
+        x_obs: Tensor,      # [B, N] east observation coordinates (m)
+        y_obs: Tensor,      # [B, N] north observation coordinates (m)
+        source_x: Tensor,   # [B] crack centre east (m)
+        source_y: Tensor,   # [B] crack centre north (m)
+        depth: Tensor,      # [B] crack depth, positive downward (m)
+        radius: Tensor,     # [B] crack radius (m)
+        pressure: Tensor,   # [B] uniform excess pressure (Pa)
     ) -> Displacement:
-        """Surface displacement from a pressurised penny-shaped crack.
+        """Surface displacement from a Fialko penny-shaped crack.
 
         Parameters
         ----------
         x_obs, y_obs : Tensor
             East/north observation coordinates [B, N] in metres.
         source_x, source_y : Tensor
-            East/north position of the crack centre [B] in metres.
+            Crack centre [B] in metres.
         depth : Tensor
-            Depth of the crack centre [B] in metres (positive down).
+            Crack depth [B], positive downward, metres.
         radius : Tensor
-            Crack radius [B] in metres.
+            Crack radius [B] in metres (must be > 0).
         pressure : Tensor
-            Excess (boundary) pressure [B] in Pa; scaled by the configured shear
-            modulus and Poisson ratio.
+            Uniform excess pressure [B] in Pa (positive = inflation).
 
         Returns
         -------
         Displacement
-            ENU surface displacement [B, N] in metres.
+            ENU surface displacement [B, N] in metres (``u`` positive upward).
         """
         self._validate_inputs(
             x_obs, y_obs,
-            {"source_x": source_x, "source_y": source_y, "depth": depth,
-             "radius": radius, "pressure": pressure},
+            {"source_x": source_x, "source_y": source_y,
+             "depth": depth, "radius": radius, "pressure": pressure},
         )
-
-        # radius == 0 collapses the penny to a point: dx, dy, h and Pf all divide
-        # by it, poisoning the whole batch with NaN (forward and gradient) with no
-        # clean way to recover. Fail loudly instead.
-        if torch.any(radius <= 0):
-            raise ValueError("radius must be strictly positive (> 0)")
 
         dtype = self.internal_dtype
         device = x_obs.device
 
-        x_obs = x_obs.to(dtype=dtype, device=device)
-        y_obs = y_obs.to(dtype=dtype, device=device)
-        source_x = source_x.to(dtype=dtype, device=device)
-        source_y = source_y.to(dtype=dtype, device=device)
-        depth = depth.to(dtype=dtype, device=device)
-        radius = radius.to(dtype=dtype, device=device)
-        pressure = pressure.to(dtype=dtype, device=device)
+        x_obs = x_obs.to(dtype)
+        y_obs = y_obs.to(dtype)
+        source_x = source_x.to(dtype)
+        source_y = source_y.to(dtype)
+        depth = depth.to(dtype)
+        radius = radius.to(dtype)
+        pressure = pressure.to(dtype)
 
-        # Dimensionless coordinates relative to source center
-        dx = (x_obs - source_x[:, None]) / radius[:, None]   # [B,N]
-        dy = (y_obs - source_y[:, None]) / radius[:, None]   # [B,N]
-        r = torch.sqrt(dx * dx + dy * dy + self.num_eps)     # [B,N]
+        if bool((radius <= 0).any()):
+            raise ValueError("radius must be strictly positive")
 
-        # Dimensionless crack depth
-        h = depth / radius                                   # [B]
+        # --- dimensionless geometry (paper section 3) ---------------------- #
+        # normalise lengths by the crack radius R.
+        R = radius                                       # [B]
+        h = depth / R                                    # [B] dimensionless depth
 
-        # Pressure scaling
-        Pf = 2.0 * (1.0 - self.v) * radius * pressure / self.mu   # [B]
+        dx = x_obs - source_x[:, None]                   # [B, N] east offset
+        dy = y_obs - source_y[:, None]                   # [B, N] north offset
+        rho = torch.sqrt(dx * dx + dy * dy + self.num_eps)  # metric radial distance
+        r = rho / R[:, None]                             # [B, N] dimensionless radius
 
-        # Quadrature nodes
-        t, Wt = build_quadrature(
-            self.nis,
-            self.root16,
-            self.weight16,
-            device=device,
-            dtype=dtype,
+        # --- quadrature grid ------------------------------------------------ #
+        t, Wt = build_quadrature(self.nis, ROOT16, WEIGHT16,
+                                 device=device, dtype=dtype)
+
+        # --- solve the Fredholm system (eq A1) ----------------------------- #
+        h3 = h[:, None, None]                             # [B, 1, 1]
+        phibar, psibar = self._solve_fredholm(t, Wt, h3)
+
+        # --- assemble surface displacements (eq 30 / Appendix B) ----------- #
+        uz_dimless, ur_dimless = self._surface_displacement(
+            r, t, Wt, phibar, psibar, h
         )
 
-        # Solve Fredholm system for every batch item
-        fi, psi = fredholm_solve_differentiable(h, t, Wt)    # [B,M], [B,M]
+        # --- dimensional scaling (paper section 3 / eqs B1-B2, C12) -------- #
+        # The dimensionless displacements are in units of 2(1-nu) p0, with p0 the
+        # dimensionless excess pressure dP / mu and lengths in units of R. The
+        # dimensional displacement is therefore multiplied by Pf = 2(1-nu) R dP / mu.
+        Pf = 2.0 * (1.0 - self.v) * R * pressure / self.mu      # [B]
+        Pf = Pf[:, None]                                        # [B, 1]
 
-        # Integrate for all observation points
-        Uz_dimless, Ur_dimless = intgr_batched(r, fi, psi, h, Wt, t, eps=self.num_eps)
+        # paper's Uz is positive downward; flip sign so u is positive upward.
+        uu = -uz_dimless * Pf                                   # [B, N] up (m)
+        ur = ur_dimless * Pf                                    # [B, N] radial (m)
 
-        Uz = -Uz_dimless * Pf[:, None]
-        Ur =  Ur_dimless * Pf[:, None]
-
-        Nx = dx / r
-        Ny = dy / r
-
-        ue = Ur * Nx
-        un = Ur * Ny
-        uu = Uz
+        # decompose radial horizontal displacement into E/N along (dx, dy).
+        inv_rho = 1.0 / rho                                     # rho already eps-guarded
+        ue = ur * dx * inv_rho
+        un = ur * dy * inv_rho
 
         return Displacement(e=ue, n=un, u=uu)

@@ -41,6 +41,61 @@ Compound dislocation models (pCDM / CDM / pECM)
 
 -------------------------------------------------------------------------------
 
+Okada rectangular finite-fault model (DC3D)
+  src/torchdeform/sources/okada.py is a derivative work (a differentiable,
+  batched PyTorch port) of the "DC3D" subroutine from the Fortran90 file
+  DC3D.f90 by Takuya Miyashita (https://github.com/hydrocoast/DC3D.f90), a
+  free-form conversion of Y. Okada's original FORTRAN code, used under the
+  MIT License:
+
+    Copyright (c) 2020 Takuya Miyashita
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files
+    (the "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to permit
+    persons to whom the Software is furnished to do so, subject to the
+    following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+    NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+    DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+    OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+    USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+  The original DC3D code is copyright the National Research Institute for
+  Earth Science and Disaster Resilience (NIED); the Fortran90 conversion was
+  uploaded with the copyright holder's permission (see the upstream README).
+
+  Reference:
+    Okada, Y. (1992), "Internal deformation due to shear and tensile faults
+    in a half-space", Bulletin of the Seismological Society of America,
+    82(2), 1018-1040. (See also Okada, Y. (1985), BSSA 75(4), 1135-1154.)
+
+-------------------------------------------------------------------------------
+
+Acknowledgments (penny-shaped crack source)
+  src/torchdeform/sources/penny.py is an INDEPENDENT implementation of the
+  pressurised horizontal penny-shaped crack model, written solely from the
+  published equations of Fialko et al. (2001) (Appendices A and B); the
+  derivation is recorded in docs/penny_provenance.md. It contains no
+  third-party source code and carries no third-party copyright/attribution
+  obligation; the citation below is a scientific acknowledgment only.
+
+  Reference:
+    Fialko, Y., Khazan, Y. & Simons, M. (2001), "Deformation due to a
+    pressurized horizontal circular crack in an elastic half-space, with
+    applications to volcano geodesy", Geophysical Journal International,
+    146(1), 181-190.
+
+-------------------------------------------------------------------------------
+
 Acknowledgments (CDM magmatic-style parameterisation)
   The convenience layer that restricts the CDM to named magmatic styles
   (src/torchdeform/sources/cdm.py: cdm_params_from_shape, and the DEFAULT_CDM_*
