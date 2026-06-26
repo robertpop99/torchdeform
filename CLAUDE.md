@@ -36,8 +36,8 @@ optimisation/inversion loop.
   - `mogi.py` → `MogiSource` (point source)
   - `okada.py` → `OkadaSource` (full rectangular finite-fault dislocation),
     `OkadaSourceSimple` (surface-only fast path), `okada_params_from_fault`.
-    Biggest file (~2600 lines). Reference Fortran: `DC3D.f90` (root, used to
-    port the strain kernels).
+    Biggest file (~2600 lines). Reference Fortran: `scaffolding/DC3D.f90`
+    (used to port the strain kernels).
     Two mutually-exclusive gradient modes on both classes (default: plain
     autograd of the exact forward): `smooth_grad=True` smooths singularities for
     finite (approximate) gradients; `analytic_grad=True` keeps exact forward
@@ -47,6 +47,12 @@ optimisation/inversion loop.
     exact forward, dip via a wide central difference (accurate through vertical).
     `analytic_grad` routes through `_evaluate` + an autograd.Function; the
     forward-only path skips the strain so data-gen pays nothing.
+    Only the finite rectangular `DC3D` is ported, **not** the point source
+    `DC3D0` (deliberate): DC3D0's volumetric/tensile potencies are already
+    covered by `MogiSource`/`PCDMSource`, and its only unique part — the point
+    *shear* double-couple — is a far-field approximation, redundant for the
+    near-field static regime InSAR observes. If parity is ever wanted, check it
+    as a *test* (finite `DC3D` → `DC3D0` as `L,W→0`), not as a user-facing source.
   - `penny.py` → `PennySource` (penny-shaped crack)
   - `pcdm.py` → `PCDMSource` (point compound dislocation model)
 
