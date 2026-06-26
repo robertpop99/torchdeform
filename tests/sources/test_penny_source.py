@@ -387,6 +387,55 @@ class TestDtypeAndDevice:
         assert torch.isfinite(out.u).all()
 
 
+# --------------------------------------------------------------------------- #
+# External reference: original Fialko et al. (2001) MATLAB penny-crack code
+# --------------------------------------------------------------------------- #
+import json
+from pathlib import Path
+
+_GOLDEN = json.loads(
+    (Path(__file__).resolve().parent / "data" / "fialko_golden.json").read_text()
+)
+
+
+class TestFialkoReference:
+    """Golden values from the original Fialko, Khazan & Simons (2001) code.
+
+    Ground truth produced by ``tests/sources/reference/gen_fialko.m`` (run via
+    MATLAB). Observation points lie on the +East radius (``y = 0``), so the
+    horizontal field is purely radial: ``ue == Ur`` and ``uu == Uz``. Inputs use
+    crack radius ``a`` and pressure ``P`` from the data file; ``nu``/``mu`` enter
+    only through the scale ``Pf = 2(1-nu) a P / mu``.
+
+    NOTE: the public GeodMod mirror of Fialko's ``intgr.m`` has a bug in the
+    vertical displacement (its vectorized line factors ``fi`` over the ``psi``
+    terms); ``gen_fialko.m`` uses the *original* loop formula, which is what
+    ``PennySource`` implements. See ``reference/gen_fialko.m`` for details.
+    """
+
+    meta = _GOLDEN["meta"]
+
+    @pytest.mark.parametrize(
+        "case", _GOLDEN["cases"], ids=[f"h={c['h']}" for c in _GOLDEN["cases"]]
+    )
+    def test_penny_matches_matlab(self, case):
+        m = self.meta
+        a, P = float(m["a"]), float(m["P"])
+        r = torch.tensor(m["r"], dtype=DTYPE)
+        x = (r * a).reshape(1, -1)          # along +East
+        y = torch.zeros_like(x)
+        zero = torch.zeros(1, dtype=DTYPE)
+        out = PennySource(poisson_ratio=m["nu"], shear_modulus=m["mu"])(
+            x, y, zero, zero,
+            torch.tensor([case["depth"]], dtype=DTYPE),
+            torch.tensor([a], dtype=DTYPE),
+            torch.tensor([P], dtype=DTYPE),
+        )
+        # +East radial line: horizontal displacement is the radial component.
+        torch.testing.assert_close(out.e[0], torch.tensor(case["ur"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
+        torch.testing.assert_close(out.u[0], torch.tensor(case["uz"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

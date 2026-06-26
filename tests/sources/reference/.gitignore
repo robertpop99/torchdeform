@@ -1,0 +1,4 @@
+# Fialko penny-crack code is downloaded locally for regenerating
+# data/fialko_golden.json and must NOT be committed (no redistribution license).
+# See README.md / gen_fialko.m.
+penny/

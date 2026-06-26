@@ -331,3 +331,49 @@ def test_runs_on_cuda():
                  a_x=_f(B, 900).cuda(), a_y=_f(B, 600).cuda(),
                  a_z=_f(B, 300).cuda(), pressure=_f(B, 8e6).cuda())
     assert out.u.device.type == "cuda" and torch.isfinite(out.u).all()
+
+
+# --------------------------------------------------------------------------- #
+# External reference: original Nikkhoo (2017) MATLAB pECM.m
+# --------------------------------------------------------------------------- #
+import json
+import math
+from pathlib import Path
+
+_GOLDEN = json.loads(
+    (Path(__file__).resolve().parent / "data" / "nikkhoo_golden.json").read_text()
+)
+
+
+def _col(v):
+    return torch.tensor([float(v)], dtype=DTYPE)
+
+
+class TestNikkhooReference:
+    """Golden values from the original Nikkhoo et al. (2017) MATLAB ``pECM.m``.
+
+    Ground truth produced by ``tests/sources/reference/gen_nikkhoo.m`` (run via
+    MATLAB) with ``nu = 0.25`` and ``mu = 3e10`` (lambda = 3e10) -- matching the
+    ``PECMSource`` defaults. The Python port reproduces the reference code to
+    machine precision.
+    """
+
+    meta = _GOLDEN["meta"]
+
+    @pytest.mark.parametrize(
+        "row", _GOLDEN["pecm"], ids=[r["name"] for r in _GOLDEN["pecm"]]
+    )
+    def test_pecm_matches_matlab(self, row):
+        m = self.meta
+        x = torch.tensor(m["X"], dtype=DTYPE).reshape(1, -1)
+        y = torch.tensor(m["Y"], dtype=DTYPE).reshape(1, -1)
+        om = [math.radians(a) for a in row["omega"]]
+        out = PECMSource(poisson_ratio=m["nu"], shear_modulus=m["mu"])(
+            x, y, _col(m["X0"]), _col(m["Y0"]), _col(m["depth"]),
+            _col(om[0]), _col(om[1]), _col(om[2]),
+            _col(row["a"][0]), _col(row["a"][1]), _col(row["a"][2]),
+            _col(row["p"]),
+        )
+        torch.testing.assert_close(out.e[0], torch.tensor(row["ue"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
+        torch.testing.assert_close(out.n[0], torch.tensor(row["un"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
+        torch.testing.assert_close(out.u[0], torch.tensor(row["uv"], dtype=DTYPE), rtol=1e-6, atol=1e-12)

@@ -154,8 +154,8 @@ def random_params(seed, batch=4, n=12, surface_safe=True):
 #
 #   Case 2: dip=70, oblique observation, the canonical all-nonzero check.
 #   Case 3: dip=90 vertical, surface-breaking, observed at the origin.
-#   Case 4: simulates dip=-90 via dip=90 + rake=180. For strike-slip,
-#           rake=180 => disl1 = slip*cos(180) = -1.
+#   Case 4: dip=-90 vertical, the paper's geometry used directly (the model
+#           handles negative dip; no dip=90 + rake=180 emulation needed).
 #
 # Geometry placement matches Beauducel exactly:
 #   okada85(x - L/2, y - cos(dip)*W/2, d + sin(dip)*W/2, strike=90, dip, ...)
@@ -171,8 +171,6 @@ _SLIP = {
     "dip_slip":    (0.0, 1.0, 0.0),
     "tensile":     (0.0, 0.0, 1.0),
 }
-# Case-4 strike-slip is rake=180 (=> disl1 = -1); dip/tensile unchanged.
-_SLIP_RAKE180 = dict(_SLIP, strike_slip=(-1.0, 0.0, 0.0))
 
 # (name, component, x, y, d, dip_deg, L, W, slip_table, (ux, uy, uz))
 OKADA85_CHECKLIST = [
@@ -190,12 +188,16 @@ OKADA85_CHECKLIST = [
         (0.0, 0.0, 0.0)),
     ("case3", "tensile", 0, 0, 4, 90, 3, 2, _SLIP,
         (+1.223e-2, 0.0, -1.606e-2)),
-    # ---- Case 4: x=0, y=0, d=6, dip=90, L=3, W=2, rake=180 strike ----
-    ("case4", "strike_slip", 0, 0, 6, 90, 3, 2, _SLIP_RAKE180,
+    # ---- Case 4: x=0, y=0, d=4, dip=-90, L=3, W=2 (paper-faithful) ----
+    # Okada's Table 2 Case 4 is the same fault as Case 3 with dip = -90. The
+    # model handles negative dip directly, so the paper's geometry is used as-is
+    # (d=4, dip=-90), with no dip=+90 / rake=180 emulation. The placement
+    # centroid_depth = d - (W/2) sin(dip) = 4 - (1)(-1) = 5.
+    ("case4", "strike_slip", 0, 0, 4, -90, 3, 2, _SLIP,
         (0.0, -1.303e-3, 0.0)),
-    ("case4", "dip_slip", 0, 0, 6, 90, 3, 2, _SLIP_RAKE180,
+    ("case4", "dip_slip", 0, 0, 4, -90, 3, 2, _SLIP,
         (0.0, 0.0, 0.0)),
-    ("case4", "tensile", 0, 0, 6, 90, 3, 2, _SLIP_RAKE180,
+    ("case4", "tensile", 0, 0, 4, -90, 3, 2, _SLIP,
         (+3.507e-3, 0.0, -7.740e-3)),
 ]
 
@@ -218,6 +220,36 @@ OKADA85_DERIV = {
     ("case4", "dip_slip"):    (0.0, +5.157e-3, 0.0, 0.0, 0.0, -1.901e-2),
     ("case4", "tensile"):     (-1.770e-3, 0.0, 0.0, -7.345e-4, -1.843e-3, 0.0),
 }
+
+
+# ---------------------------------------------------------------------------
+# Okada (1985) Table 2, Case 1 -- the POINT source (x=2, y=3, d=4, dip=70).
+#
+# NOT exercised above: Case 1 uses Okada's point-source formulas (the `DC3D0`
+# routine), a different model from the finite rectangular dislocation (`DC3D`)
+# that OkadaSource / OkadaSourceSimple implement. torchdeform has no point-source
+# Okada class, so there is nothing to check these rows against -- they are
+# recorded here verbatim from the paper so the full table is captured. If a
+# DC3D0 forward model is ever added, promote this into OKADA85_CHECKLIST /
+# OKADA85_DERIV. Same fault-local frame and column order as the tables above:
+# displacement (ux, uy, uz); derivatives (dux/dx, dux/dy, duy/dx, duy/dy,
+# duz/dx, duz/dy).
+#
+# OKADA85_CASE1_POINT = {
+#     # (ux, uy, uz)
+#     "displacement": {
+#         "strike_slip": (-9.447e-4, -1.023e-3, -7.420e-4),
+#         "dip_slip":    (-1.172e-3, -2.082e-3, -2.532e-3),
+#         "tensile":     (-3.572e-4, +3.531e-4, -2.007e-4),
+#     },
+#     # (dux/dx, dux/dy, duy/dx, duy/dy, duz/dx, duz/dy)
+#     "derivatives": {
+#         "strike_slip": (-2.286e-4, -1.425e-4, -2.051e-4, -3.007e-4, -6.259e-5, -1.693e-4),
+#         "dip_slip":    (-1.526e-4, -3.544e-4, +6.983e-4, -1.154e-3, +8.707e-4, -6.345e-4),
+#         "tensile":     (-1.360e-4, +5.073e-4, -6.773e-5, +6.811e-4, +7.541e-5, +8.104e-4),
+#     },
+# }
+# ---------------------------------------------------------------------------
 
 
 def _checklist_inputs(x, y, d, dip_deg, L, W):

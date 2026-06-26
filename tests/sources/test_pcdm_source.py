@@ -268,3 +268,47 @@ def test_runs_on_cuda():
                        omega_y=_f(B, 0.2).cuda(), omega_z=_f(B, 1.0).cuda(),
                        dv_x=_f(B, 1e7).cuda(), dv_y=_f(B, 8e6).cuda(), dv_z=_f(B, 6e6).cuda())
     assert out.u.device.type == "cuda" and torch.isfinite(out.u).all()
+
+
+# --------------------------------------------------------------------------- #
+# External reference: original Nikkhoo (2017) MATLAB pCDM.m
+# --------------------------------------------------------------------------- #
+import json
+from pathlib import Path
+
+_GOLDEN = json.loads(
+    (Path(__file__).resolve().parent / "data" / "nikkhoo_golden.json").read_text()
+)
+
+
+def _col(v):
+    return torch.tensor([float(v)], dtype=DTYPE)
+
+
+class TestNikkhooReference:
+    """Golden values from the original Nikkhoo et al. (2017) MATLAB ``pCDM.m``.
+
+    Ground truth produced by ``tests/sources/reference/gen_nikkhoo.m`` (run via
+    MATLAB) with ``nu = 0.25`` -- matching ``PCDMSource`` defaults. The Python
+    port reproduces the reference code to machine precision; the tolerance here
+    is loose only to stay portable.
+    """
+
+    meta = _GOLDEN["meta"]
+
+    @pytest.mark.parametrize(
+        "row", _GOLDEN["pcdm"], ids=[r["name"] for r in _GOLDEN["pcdm"]]
+    )
+    def test_pcdm_matches_matlab(self, row):
+        m = self.meta
+        x = torch.tensor(m["X"], dtype=DTYPE).reshape(1, -1)
+        y = torch.tensor(m["Y"], dtype=DTYPE).reshape(1, -1)
+        om = [math.radians(a) for a in row["omega"]]
+        out = PCDMSource()(
+            x, y, _col(m["X0"]), _col(m["Y0"]), _col(m["depth"]),
+            _col(om[0]), _col(om[1]), _col(om[2]),
+            _col(row["dv"][0]), _col(row["dv"][1]), _col(row["dv"][2]),
+        )
+        torch.testing.assert_close(out.e[0], torch.tensor(row["ue"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
+        torch.testing.assert_close(out.n[0], torch.tensor(row["un"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
+        torch.testing.assert_close(out.u[0], torch.tensor(row["uv"], dtype=DTYPE), rtol=1e-6, atol=1e-12)

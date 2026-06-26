@@ -11,6 +11,15 @@ Focus areas, matching the design goals of the library:
   finite differences (``torch.autograd.gradcheck``), and stay finite at the
   regularised singularity.
 
+Unlike the other sources (Okada/penny/pCDM/CDM/pECM), Mogi has **no
+external reference-table or published-code test**, and deliberately so: the Mogi
+field is an elementary closed form (``u = C·(dx, dy, d) / r³``), so the
+independent un-vectorised ``reference_mogi_loop`` below *is* the exact ground
+truth to machine precision. A digitised table (Okada) or a run of the authors'
+MATLAB (Fialko/Nikkhoo, see ``tests/sources/reference/``) only adds value where
+the model is a quadrature/series/iterative solve that a re-implementation could
+get subtly wrong; for Mogi it would just restate the same one-line formula.
+
 Run with::
 
     pytest test_mogi_source.py -v
