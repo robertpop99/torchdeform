@@ -45,6 +45,18 @@ from a wide central difference of the exact forward. ``smooth_grad`` and
 ``analytic_grad`` are mutually exclusive gradient modes; with neither set the
 forward is exact and gradients are plain autograd (which can be non-finite right
 on the singular manifolds).
+
+Attribution
+-----------
+Derived from the ``DC3D`` subroutine of the Fortran90 file ``DC3D.f90`` by
+Takuya Miyashita (https://github.com/hydrocoast/DC3D.f90, MIT licensed), a
+free-form conversion of Y. Okada's original FORTRAN code (copyright NIED). The
+full MIT copyright and permission notice is reproduced in the project ``NOTICE``
+file.
+
+Reference: Okada, Y. (1992), "Internal deformation due to shear and tensile
+faults in a half-space", Bulletin of the Seismological Society of America,
+82(2), 1018-1040.
 """
 import torch
 from dataclasses import dataclass
