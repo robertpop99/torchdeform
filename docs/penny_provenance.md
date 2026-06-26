@@ -27,6 +27,19 @@ Everything in `penny.py` is derived from the equations of this paper (the
 self-contained Appendices A and B in particular). No other source was consulted
 for the mathematics. If you use this model, please cite the paper above.
 
+## Permission
+
+Beyond the clean-room derivation above, the lead author granted explicit
+permission to build on this work:
+
+> "You can use and distribute codes based on our 2001 paper. I'm glad people
+> find them useful."
+> — Yuri Fialko, personal communication, 26 June 2026
+
+This permission covers code based on Fialko et al. (2001) generally; together
+with the clean-room implementation it removes any ambiguity about the model's
+provenance in this repository (including earlier development history).
+
 ## Framework
 
 A horizontal circular ("penny-shaped") crack of radius `R` is buried at depth

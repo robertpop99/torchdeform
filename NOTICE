@@ -85,8 +85,10 @@ Acknowledgments (penny-shaped crack source)
   pressurised horizontal penny-shaped crack model, written solely from the
   published equations of Fialko et al. (2001) (Appendices A and B); the
   derivation is recorded in docs/penny_provenance.md. It contains no
-  third-party source code and carries no third-party copyright/attribution
-  obligation; the citation below is a scientific acknowledgment only.
+  third-party source code. In addition, Yuri Fialko has kindly granted
+  permission to use and distribute code based on the Fialko et al. (2001)
+  paper (Y. Fialko, personal communication, 26 June 2026). The reference below
+  is both a scientific acknowledgment and the basis of that grant.
 
   Reference:
     Fialko, Y., Khazan, Y. & Simons, M. (2001), "Deformation due to a
