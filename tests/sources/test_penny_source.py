@@ -207,6 +207,51 @@ class TestCorrectness:
 
 
 # --------------------------------------------------------------------------- #
+# Input validation
+# --------------------------------------------------------------------------- #
+class TestInputValidation:
+    """Degenerate geometry must raise up front, not return silent NaN.
+
+    ``radius`` and ``depth`` both normalise the paper's lengths (``r = rho/R``,
+    ``h = depth/R``); ``radius <= 0`` divides by zero and ``depth <= 0`` sends the
+    Fredholm ``P2`` kernel to ``log(0) -> -inf``, so both collapse the solve to
+    NaN. Guard them symmetrically.
+    """
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0])
+    def test_nonpositive_radius_raises(self, bad):
+        model = PennySource()
+        z = _t([0.0]); ctr = _t([[0.0]])
+        with pytest.raises(ValueError, match="radius"):
+            model(ctr, ctr, z, z.clone(), _t([2000.0]), _t([bad]), _t([1e6]))
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0])
+    def test_nonpositive_depth_raises(self, bad):
+        model = PennySource()
+        z = _t([0.0]); ctr = _t([[0.0]])
+        with pytest.raises(ValueError, match="depth"):
+            model(ctr, ctr, z, z.clone(), _t([bad]), _t([800.0]), _t([1e6]))
+
+    def test_raises_if_any_batch_element_degenerate(self):
+        # a single bad element in an otherwise valid batch must still raise.
+        model = PennySource()
+        x, y, sx, sy, d, a, P = make_inputs(3, 4)
+        bad_d = d.clone(); bad_d[1] = 0.0
+        with pytest.raises(ValueError, match="depth"):
+            model(x, y, sx, sy, bad_d, a, P)
+        bad_a = a.clone(); bad_a[2] = -5.0
+        with pytest.raises(ValueError, match="radius"):
+            model(x, y, sx, sy, d, bad_a, P)
+
+    def test_small_positive_depth_is_finite(self):
+        # just above the degenerate limit the solve is still well-defined.
+        model = PennySource()
+        z = _t([0.0]); ctr = _t([[0.0]])
+        out = model(ctr, ctr, z, z.clone(), _t([1.0]), _t([800.0]), _t([1e6]))
+        assert torch.isfinite(out.u).all()
+
+
+# --------------------------------------------------------------------------- #
 # Linearity & scaling invariants
 # --------------------------------------------------------------------------- #
 class TestLinearityAndScaling:
@@ -324,6 +369,25 @@ class TestDifferentiability:
             return o.e, o.n, o.u
 
         assert torch.autograd.gradcheck(f, (x, y), eps=1e-6, atol=1e-5, rtol=1e-3)
+
+    def test_gradcheck_shallow_depth(self):
+        # near-surface regime (h = depth/radius ~ 0.15): the kernels are far more
+        # peaked here than the h~1 case above, so gradients through the solve get
+        # a separate check close to the depth->0 degeneracy.
+        model = PennySource(shear_modulus=1.0)
+        x = _t([[0.6, 1.4, 2.2]])
+        y = _t([[0.2, -0.5, 0.9]])
+        sx = _t([0.0]); sy = _t([0.0])
+        d = _t([0.15]); a = _t([1.0]); P = _t([1.0])
+        for t in (sx, sy, d, a, P):
+            t.requires_grad_(True)
+
+        def f(sx, sy, d, a, P):
+            o = model(x, y, sx, sy, d, a, P)
+            return o.e, o.n, o.u
+
+        assert torch.autograd.gradcheck(f, (sx, sy, d, a, P), eps=1e-6,
+                                        atol=1e-5, rtol=1e-3)
 
     def test_gradgradcheck_small(self):
         # second order through the linear solve (small system, nis=1).

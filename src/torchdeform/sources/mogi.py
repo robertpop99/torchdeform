@@ -56,7 +56,8 @@ class MogiSource(SourceModel):
         source_x, source_y : Tensor
             East/north position of the source [B] in metres.
         depth : Tensor
-            Source depth [B] (or per-pixel [B, N]), positive downward, metres.
+            Source depth [B] (or per-pixel [B, N]), positive downward, metres
+            (must be > 0; the source is buried in the half-space).
         delta_v : Tensor
             Volume change [B] in m^3 (positive = inflation).
 
@@ -78,6 +79,9 @@ class MogiSource(SourceModel):
         source_x = source_x.to(dtype)
         source_y = source_y.to(dtype)
         delta_v = delta_v.to(dtype)
+
+        if bool((depth <= 0).any()):
+            raise ValueError("depth must be strictly positive")
 
         if depth.ndim == 1:
             depth_b = depth.to(dtype)[:, None]   # [B,1]

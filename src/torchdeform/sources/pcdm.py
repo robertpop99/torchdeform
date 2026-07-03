@@ -229,7 +229,8 @@ class PCDMSource(SourceModel):
         source_x, source_y : Tensor
             East/north position of the source [B] in metres.
         depth : Tensor
-            Source depth [B] in metres (positive down).
+            Source depth [B] in metres (positive down; must be > 0, the source
+            is buried in the half-space).
         omega_x, omega_y, omega_z : Tensor
             Clockwise rotation angles about the X/Y/Z axes [B] in radians,
             setting the source orientation.
@@ -262,6 +263,9 @@ class PCDMSource(SourceModel):
         dv_x = dv_x.to(dtype)
         dv_y = dv_y.to(dtype)
         dv_z = dv_z.to(dtype)
+
+        if bool((depth <= 0).any()):
+            raise ValueError("depth must be strictly positive")
 
         # physical constraint: a coherent volume change -> the potencies share a sign
         pos = (dv_x > 0) | (dv_y > 0) | (dv_z > 0)

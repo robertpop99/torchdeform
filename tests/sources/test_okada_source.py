@@ -1001,6 +1001,75 @@ class TestDifferentiability:
         assert float(d3.grad.abs().max()) > 0.0, \
             "zero gradient w.r.t. zero-initialized slip (dead `torch.any` branch?)"
 
+class TestInputValidation:
+    """Unphysical fault dimensions must raise, not silently misbehave.
+
+    A *negative* ``length``/``width`` flips the sign of the Chinnery corner
+    subtraction and returns a plausible but sign-flipped displacement (a zero
+    dimension collapses the fault to zero output); ``centroid_depth <= 0`` puts
+    the centroid at/above the free surface, outside the buried-fault half-space.
+    None of these raise on their own, so guard them for both Okada classes.
+    """
+
+    # base geometry known to be valid; each test overrides one dimension.
+    _base = dict(x_obs=[[1e3, 5e3]], y_obs=[[2e3, -3e3]],
+                 source_x=[0.0], source_y=[0.0], dip=[0.7], strike=[0.3],
+                 depth=[8e3], length=[10e3], width=[4e3],
+                 d1=[1.0], d2=[0.0], d3=[0.0])
+
+    @pytest.mark.parametrize("field,bad,msg", [
+        ("length", 0.0, "length"),
+        ("length", -10e3, "length"),
+        ("width", 0.0, "width"),
+        ("width", -4e3, "width"),
+        ("depth", 0.0, "centroid_depth"),
+        ("depth", -8e3, "centroid_depth"),
+    ])
+    def test_simple_rejects_degenerate_geometry(self, field, bad, msg):
+        p = dict(self._base); p[field] = [bad]
+        with pytest.raises(ValueError, match=msg):
+            run_simplified(**p)
+
+    @pytest.mark.parametrize("field,bad,msg", [
+        ("length", -10e3, "length"),
+        ("width", 0.0, "width"),
+        ("depth", -8e3, "centroid_depth"),
+    ])
+    def test_fullz_rejects_degenerate_geometry(self, field, bad, msg):
+        p = dict(self._base); p[field] = [bad]
+        with pytest.raises(ValueError, match=msg):
+            run_fullz(z_obs=[[0.0, 0.0]], **p)
+
+    def test_rejects_if_any_batch_element_degenerate(self):
+        # a single bad element in an otherwise valid batch must still raise.
+        p = random_params(7, batch=3, n=4)
+        p["width"] = p["width"].clone(); p["width"][1] = -1.0
+        with pytest.raises(ValueError, match="width"):
+            run_simplified(**p)
+
+    # dip = 90 deg vertical; top-edge depth = centroid_depth - width/2.
+    _vert = dict(_base, dip=[math.pi / 2], width=[4e3])
+
+    @pytest.mark.parametrize("runner", [run_simplified, run_fullz])
+    def test_protruding_fault_warns(self, runner):
+        # top edge above the free surface (centroid 1 km, half-width 2 km) is a
+        # soft error: it warns but still returns a result.
+        p = dict(self._vert); p["depth"] = [1e3]
+        if runner is run_fullz:
+            p = dict(p, z_obs=[[0.0, 0.0]])
+        with pytest.warns(UserWarning, match="top edge is above the free surface"):
+            runner(**p)
+
+    def test_surface_rupturing_fault_does_not_warn(self):
+        # top edge exactly at the surface (centroid = half-width) is a valid
+        # surface-rupturing fault and must stay silent.
+        import warnings
+        p = dict(self._vert); p["depth"] = [2e3]      # 2 km == width/2
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")            # any warning -> failure
+            run_simplified(**p)
+
+
 class TestBatching:
     """Batched calls match per-sample runs; scalar and per-point z agree."""
 

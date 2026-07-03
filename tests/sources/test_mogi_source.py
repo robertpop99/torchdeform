@@ -311,22 +311,31 @@ class TestDifferentiability:
         out = model(x_obs, y_obs, sx, sy, depth, dv)
         assert out.e.requires_grad and out.n.requires_grad and out.u.requires_grad
 
-    def test_gradient_finite_at_regularised_singularity(self, model):
-        # observation point exactly on the source, zero depth: the num_eps term
-        # must keep both forward and backward finite (no NaN / Inf).
+    def test_gradient_finite_on_source_axis(self, model):
+        # observation point directly above the source (dx = dy = 0) at a valid
+        # positive depth: the num_eps term must keep both forward and backward
+        # finite (no NaN / Inf) at this on-axis point.
         x = torch.zeros(1, 1, dtype=DTYPE, requires_grad=True)
         y = torch.zeros(1, 1, dtype=DTYPE, requires_grad=True)
         sx = torch.zeros(1, dtype=DTYPE, requires_grad=True)
         sy = torch.zeros(1, dtype=DTYPE, requires_grad=True)
-        depth = torch.zeros(1, dtype=DTYPE, requires_grad=True)
+        depth = torch.tensor([1000.0], dtype=DTYPE, requires_grad=True)
         dv = torch.tensor([1.0], dtype=DTYPE, requires_grad=True)
         out = model(x, y, sx, sy, depth, dv)
-        # forward is finite (and zero, since every numerator is zero)
         for comp in (out.e, out.n, out.u):
             assert torch.isfinite(comp).all()
         (out.e.sum() + out.n.sum() + out.u.sum()).backward()
         for t in (x, y, sx, sy, depth, dv):
             assert torch.isfinite(t.grad).all()
+
+    @pytest.mark.parametrize("bad", [0.0, -1000.0])
+    def test_nonpositive_depth_raises(self, model, bad):
+        # a source at/above the free surface is outside the buried half-space.
+        x = torch.zeros(1, 1, dtype=DTYPE); y = torch.zeros(1, 1, dtype=DTYPE)
+        z = torch.zeros(1, dtype=DTYPE)
+        with pytest.raises(ValueError, match="depth"):
+            model(x, y, z, z.clone(), torch.tensor([bad], dtype=DTYPE),
+                  torch.tensor([1.0], dtype=DTYPE))
 
 
 # --------------------------------------------------------------------------- #

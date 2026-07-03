@@ -190,6 +190,17 @@ def test_mixed_sign_potency_raises():
                      dv_x=_f(B, 1e7), dv_y=_f(B, -1e7), dv_z=_f(B, 1e7))
 
 
+@pytest.mark.parametrize("bad", [0.0, -3000.0])
+def test_nonpositive_depth_raises(bad):
+    # a source at/above the free surface is outside the buried half-space.
+    B = 2
+    x, y = _grid(B, 5)
+    with pytest.raises(ValueError, match="depth"):
+        PCDMSource()(x, y, source_x=_f(B, 0), source_y=_f(B, 0), depth=_f(B, bad),
+                     omega_x=_f(B, 0), omega_y=_f(B, 0), omega_z=_f(B, 0),
+                     dv_x=_f(B, 1e7), dv_y=_f(B, 1e7), dv_z=_f(B, 1e7))
+
+
 def test_bad_shape_raises():
     x, y = _grid(2, 5)
     with pytest.raises(ValueError):

@@ -466,7 +466,8 @@ class PennySource(SourceModel):
         source_x, source_y : Tensor
             Crack centre [B] in metres.
         depth : Tensor
-            Crack depth [B], positive downward, metres.
+            Crack depth [B], positive downward, metres (must be > 0; the crack
+            must be buried in the half-space).
         radius : Tensor
             Crack radius [B] in metres (must be > 0).
         pressure : Tensor
@@ -496,6 +497,10 @@ class PennySource(SourceModel):
 
         if bool((radius <= 0).any()):
             raise ValueError("radius must be strictly positive")
+        if bool((depth <= 0).any()):
+            # h = depth / radius = 0 makes the P2 kernel log(0) -> -inf and the
+            # solution collapses to NaN; the crack must be buried (half-space).
+            raise ValueError("depth must be strictly positive")
 
         # --- dimensionless geometry (paper section 3) ---------------------- #
         # normalise lengths by the crack radius R.

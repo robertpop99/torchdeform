@@ -61,6 +61,7 @@ faults in a half-space", Bulletin of the Seismological Society of America,
 import torch
 from dataclasses import dataclass
 import math
+import warnings
 from torch import Tensor
 
 from .base import SourceModel
@@ -1638,6 +1639,45 @@ class _OkadaBase(SourceModel):
         self.blend_eps = blend_eps
 
     @staticmethod
+    def _validate_geometry(centroid_depth, length, width, dip):
+        """Reject unphysical fault dimensions before they silently misbehave.
+
+        ``length``/``width`` scale ``al1/al2`` and ``aw1/aw2``; a *negative*
+        dimension flips the sign of the Chinnery subtraction and returns a
+        plausible-looking but sign-flipped displacement (a zero dimension
+        collapses the fault to zero output), neither of which raises on its own.
+        ``centroid_depth <= 0`` puts the centroid at/above the free surface,
+        outside the buried-fault half-space the Okada solution is derived for.
+
+        Protrusion (soft) : the shallowest edge of the dip-tilted rectangle sits
+        at ``centroid_depth - (width/2)|sin(dip)|``. At ``0`` the fault just
+        reaches the surface -- a valid surface-rupturing fault -- but a *negative*
+        top-edge depth means part of the dislocation lies above the free surface,
+        outside the elastic medium. That still evaluates (Chinnery's corner
+        superposition is oblivious to the surface) but is not a valid half-space
+        problem, so it is a ``warning`` rather than a hard error (it does not fail
+        numerically, the ``= 0`` boundary is legitimate, and callers may probe the
+        regime deliberately).
+        """
+        if bool((length <= 0).any()):
+            raise ValueError("length must be strictly positive")
+        if bool((width <= 0).any()):
+            raise ValueError("width must be strictly positive")
+        if bool((centroid_depth <= 0).any()):
+            raise ValueError("centroid_depth must be strictly positive")
+        # top (shallowest) edge depth; guard the == 0 surface-rupturing case with
+        # a tiny tolerance so floating-point noise there does not warn spuriously.
+        top_edge = centroid_depth - 0.5 * width * torch.sin(dip).abs()
+        if bool((top_edge < -1e-6).any()):
+            warnings.warn(
+                "Okada fault top edge is above the free surface "
+                "(centroid_depth < (width/2)*|sin(dip)|); part of the fault lies "
+                "outside the elastic half-space, so the solution is unphysical "
+                "there. Bury the fault or reduce its width.",
+                stacklevel=3,
+            )
+
+    @staticmethod
     def _fault_geometry(centroid_depth, length, width):
         """Centroid-based fault corners ``(al1, al2, aw1, aw2, depth)``.
 
@@ -1725,9 +1765,11 @@ class OkadaSource(_OkadaBase):
         dip, strike : Tensor
             Fault dip and strike [B] in radians.
         centroid_depth : Tensor
-            Depth of the fault centroid [B] in metres (positive down).
+            Depth of the fault centroid [B] in metres (positive down; must be
+            > 0, i.e. the fault is buried below the free surface).
         length, width : Tensor
-            Fault length (along strike) and width (down dip) [B] in metres.
+            Fault length (along strike) and width (down dip) [B] in metres
+            (both must be > 0).
         disl1, disl2, disl3 : Tensor
             Strike-slip, dip-slip and tensile (opening) dislocations [B] in metres.
 
@@ -1772,6 +1814,8 @@ class OkadaSource(_OkadaBase):
 
         if torch.any(z_b > 0):
             raise ValueError("Okada convention requires z <= 0. Use z=0 at surface, z<0 below surface.")
+
+        self._validate_geometry(centroid_depth, length, width, dip)
 
         al1, al2, aw1, aw2, depth = self._fault_geometry(
             centroid_depth.to(dtype),
@@ -2270,9 +2314,11 @@ class OkadaSourceSimple(_OkadaBase):
         dip, strike : Tensor
             Fault dip and strike [B] in radians.
         centroid_depth : Tensor
-            Depth of the fault centroid [B] in metres (positive down).
+            Depth of the fault centroid [B] in metres (positive down; must be
+            > 0, i.e. the fault is buried below the free surface).
         length, width : Tensor
-            Fault length (along strike) and width (down dip) [B] in metres.
+            Fault length (along strike) and width (down dip) [B] in metres
+            (both must be > 0).
         disl1, disl2, disl3 : Tensor
             Strike-slip, dip-slip and tensile (opening) dislocations [B] in metres.
 
@@ -2306,6 +2352,8 @@ class OkadaSourceSimple(_OkadaBase):
         disl1 = disl1.to(dtype)
         disl2 = disl2.to(dtype)
         disl3 = disl3.to(dtype)
+
+        self._validate_geometry(centroid_depth, length, width, dip)
 
         al1, al2, aw1, aw2, depth = self._fault_geometry(
             centroid_depth, length, width
