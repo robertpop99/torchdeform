@@ -374,9 +374,34 @@ class AtmosphereGenerator:
     turbulent_beta: float = 8.0 / 3.0
     turbulent_correlation_length: Optional[float] = None
 
+    @property
+    def uses_dem(self) -> bool:
+        """Whether a DEM is needed (the stratified term is enabled with a source)."""
+        return self.strat_coeff is not None and self.dem is not None
+
+    def draw_dem(self, batch: int,
+                 generator: Optional[torch.Generator] = None) -> Optional[Tensor]:
+        """Draw one DEM ``[B, rows, cols]``, or ``None`` if no stratified term.
+
+        Use to share a single topography across several :meth:`generate` calls
+        (e.g. one ground scene seen from several acquisition geometries): draw the
+        DEM once here, then pass it to each ``generate(..., dem=dem)`` so the
+        topography-correlated delay is consistent while the turbulent/orbital
+        components re-randomise per acquisition.
+        """
+        if not self.uses_dem:
+            return None
+        return self.dem(batch, generator)
+
     def generate(self, batch: int, *,
-                 generator: Optional[torch.Generator] = None) -> Tensor:
-        """Return the summed atmospheric screen ``[B, rows, cols]``."""
+                 generator: Optional[torch.Generator] = None,
+                 dem: Optional[Tensor] = None) -> Tensor:
+        """Return the summed atmospheric screen ``[B, rows, cols]``.
+
+        ``dem`` optionally supplies a precomputed topography ``[B, rows, cols]``
+        for the stratified term (see :meth:`draw_dem`); when ``None`` (default)
+        one is drawn from the configured ``dem`` source.
+        """
         grid = self.grid
         rows, cols = grid.rows, grid.cols
         device, dtype = grid.device, grid.dtype
@@ -389,9 +414,10 @@ class AtmosphereGenerator:
                                          generator=generator, device=device, dtype=dtype)
 
         if self.strat_coeff is not None:
-            if self.dem is None:
-                raise ValueError("strat_coeff is set but no dem source was given")
-            dem = self.dem(batch, generator)
+            if dem is None:
+                if self.dem is None:
+                    raise ValueError("strat_coeff is set but no dem source was given")
+                dem = self.dem(batch, generator)
             coeff = self.strat_coeff.sample((batch,), generator, device, dtype)
             total = total + stratified_aps(dem, coeff, model=self.strat_model,
                                            device=device, dtype=dtype)
@@ -489,4 +515,185 @@ class InterferogramGenerator:
         return InterferogramSample(
             deformation_phase=phase, atmosphere=aps,
             los=los, geometry=geo, deformation=defo,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Multi-geometry: one deformation observed from several acquisition geometries
+# --------------------------------------------------------------------------- #
+@dataclass
+class MultiGeometryGenerator:
+    """Sample several acquisition geometries per item -> stacked LOS vectors.
+
+    This is the multi-track / multi-look counterpart of :class:`GeometryGenerator`.
+    ``GeometryGenerator`` picks *one* geometry per item (a mixture chooses *which*
+    sensor an item came from); this projects *every* item through *all* of the
+    given geometries, adding a geometry axis ``G``.
+
+    Parameters
+    ----------
+    geometries : dict[str, PriorBundle | PriorMixture]
+        Acquisition-geometry priors keyed by name (e.g. ``{"asc": ..., "desc":
+        ...}``). Each entry is what a single :class:`GeometryGenerator` wraps -- a
+        :class:`GeometryPrior` (one sensor) or a :class:`PriorMixture` of them. The
+        key order fixes the geometry axis order (see :attr:`names`).
+    """
+
+    geometries: dict[str, PriorBundle | PriorMixture]
+
+    _gens: dict[str, GeometryGenerator] = field(init=False, repr=False)
+
+    def __post_init__(self):
+        if not self.geometries:
+            raise ValueError("geometries must be a non-empty mapping")
+        self._gens = {name: GeometryGenerator(g)
+                      for name, g in self.geometries.items()}
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        """Geometry names, in the fixed order of the stacked geometry axis."""
+        return tuple(self._gens)
+
+    @property
+    def n_geometries(self) -> int:
+        """Number of geometries ``G`` each item is projected through."""
+        return len(self._gens)
+
+    def generate(
+        self,
+        batch: int,
+        *,
+        generator: Optional[torch.Generator] = None,
+        device: Optional[DeviceLikeType] = "cpu",
+        dtype: torch.dtype = torch.float64,
+    ) -> tuple[LOSVector, dict[str, dict]]:
+        """Return ``(los, geometry)``.
+
+        ``los`` is a :class:`~torchdeform.core.LOSVector` whose components are
+        ``[B, G, 1]`` (broadcast against a ``[B, 1, N]`` displacement to give
+        ``[B, G, N]``). ``geometry`` maps each name to that geometry's ``[B]``
+        acquisition labels, in :attr:`names` order.
+        """
+        los_e, los_n, los_u = [], [], []
+        geometry: dict[str, dict] = {}
+        for name, gen in self._gens.items():
+            los_g, geo_g = gen.generate(batch, generator=generator,
+                                        device=device, dtype=dtype)
+            los_e.append(los_g.e)          # each [B, 1]
+            los_n.append(los_g.n)
+            los_u.append(los_g.u)
+            geometry[name] = geo_g
+
+        los = LOSVector(
+            e=torch.stack(los_e, dim=1),   # [B, G, 1]
+            n=torch.stack(los_n, dim=1),
+            u=torch.stack(los_u, dim=1),
+        )
+        return los, geometry
+
+
+@dataclass
+class MultiGeometryInterferogramSample:
+    """Output of :meth:`MultiGeometryInterferogramGenerator.generate`.
+
+    The shared deformation is projected through ``G`` acquisition geometries, so
+    the phase/atmosphere/LOS carry a geometry axis. As with
+    :class:`InterferogramSample`, every stored field is the *unwrapped* physical
+    signal; the wrapped observable is produced on demand by :meth:`wrapped`.
+
+    Attributes
+    ----------
+    deformation_phase : Tensor
+        Unwrapped deformation phase ``[B, G, rows, cols]`` (signal only).
+    atmosphere : Tensor or None
+        Unwrapped atmospheric screen ``[B, G, rows, cols]`` (independent turbulent
+        /orbital component per geometry, shared topography), or ``None``.
+    los : LOSVector
+        Line-of-sight vectors ``[B, G, 1]``.
+    geometry : dict[str, dict]
+        Per-geometry acquisition labels, keyed by name (see
+        :attr:`MultiGeometryGenerator.names` for the axis order).
+    names : tuple[str, ...]
+        Geometry names, in the order of the ``G`` axis.
+    deformation : DeformationSample
+        The shared source labels and displacement field (geometry-independent).
+    """
+
+    deformation_phase: Tensor
+    atmosphere: Optional[Tensor]
+    los: LOSVector
+    geometry: dict[str, dict]
+    names: tuple[str, ...]
+    deformation: DeformationSample
+
+    @property
+    def phase(self) -> Tensor:
+        """Total unwrapped phase ``[B, G, rows, cols]`` = deformation + atmosphere."""
+        if self.atmosphere is None:
+            return self.deformation_phase
+        return self.deformation_phase + self.atmosphere
+
+    def wrapped(self) -> Tensor:
+        """The observable interferograms: ``wrap_phase(self.phase)`` in ``[-pi, pi]``."""
+        return wrap_phase(self.phase)
+
+
+@dataclass
+class MultiGeometryInterferogramGenerator:
+    """Full pipeline for one deformation seen from several acquisition geometries.
+
+    The deformation is generated *once* and reused across all ``G`` geometries
+    (it is a property of the ground, not the sensor); only the line-of-sight
+    projection and the atmosphere differ per geometry. The atmosphere uses an
+    *independent* turbulent/orbital draw per geometry (separate acquisitions) but
+    a *shared* DEM, so the topography-correlated (stratified) delay is consistent
+    across geometries while the turbulence is not.
+
+    Parameters
+    ----------
+    deformation : DeformationGenerator
+        Produces the shared surface displacement (and source labels).
+    geometry : MultiGeometryGenerator
+        Produces the ``G`` stacked LOS vectors.
+    atmosphere : AtmosphereGenerator, optional
+        Adds a per-geometry atmospheric screen; ``None`` for clean phase.
+    wavelength : float
+        Radar wavelength for the displacement->phase conversion.
+    """
+
+    deformation: DeformationGenerator
+    geometry: MultiGeometryGenerator
+    atmosphere: Optional[AtmosphereGenerator] = None
+    wavelength: float = S1_C_BAND_WAVELENGTH
+
+    def generate(self, batch: int, *,
+                 generator: Optional[torch.Generator] = None
+                 ) -> MultiGeometryInterferogramSample:
+        """Generate ``batch`` multi-geometry interferogram samples."""
+        grid = self.deformation.grid
+        g = self.geometry.n_geometries
+        defo = self.deformation.generate(batch, generator=generator)
+        los, geo = self.geometry.generate(batch, generator=generator,
+                                          device=grid.device, dtype=grid.dtype)
+
+        # Shared displacement [B, N] -> [B, 1, N], broadcast against los [B, G, 1].
+        disp = defo.displacement
+        disp_b = Displacement(e=disp.e.unsqueeze(1),
+                              n=disp.n.unsqueeze(1),
+                              u=disp.u.unsqueeze(1))
+        d_los = disp_b.to_los(los)                                 # [B, G, N]
+        phase = to_phase(d_los, self.wavelength).reshape(
+            batch, g, grid.rows, grid.cols)
+
+        aps = None
+        if self.atmosphere is not None:
+            dem = self.atmosphere.draw_dem(batch, generator)       # shared, or None
+            screens = [self.atmosphere.generate(batch, generator=generator, dem=dem)
+                       for _ in range(g)]
+            aps = torch.stack(screens, dim=1)                      # [B, G, rows, cols]
+
+        return MultiGeometryInterferogramSample(
+            deformation_phase=phase, atmosphere=aps,
+            los=los, geometry=geo, names=self.geometry.names,
+            deformation=defo,
         )

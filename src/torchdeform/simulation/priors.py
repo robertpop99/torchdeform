@@ -821,6 +821,32 @@ DEFAULT_S1_GEOMETRY_PRIOR = GeometryPrior(
     look_side=ConstantPrior(float(S1_LOOK_SIDE)),
 )
 
+#: Single-pass Sentinel-1 geometry priors (right-looking): the ascending and
+#: descending headings split out into separate unimodal :class:`GeometryPrior`
+#: instances. Unlike :data:`DEFAULT_S1_GEOMETRY_PRIOR` (one bimodal prior that
+#: samples *either* pass per item), these name each pass, so they can be combined
+#: into a multi-track set that observes the *same* deformation from *both*
+#: geometries -- e.g. ``MultiGeometryGenerator({"asc": DEFAULT_S1_ASCENDING_PRIOR,
+#: "desc": DEFAULT_S1_DESCENDING_PRIOR})``.
+DEFAULT_S1_ASCENDING_PRIOR = GeometryPrior(
+    heading_deg=UniformPrior(*S1_HEADING_ASCENDING_DEG),
+    incidence_deg=UniformPrior(*S1_INCIDENCE_RANGE_DEG),
+    look_side=ConstantPrior(float(S1_LOOK_SIDE)),
+)
+
+DEFAULT_S1_DESCENDING_PRIOR = GeometryPrior(
+    heading_deg=UniformPrior(*S1_HEADING_DESCENDING_DEG),
+    incidence_deg=UniformPrior(*S1_INCIDENCE_RANGE_DEG),
+    look_side=ConstantPrior(float(S1_LOOK_SIDE)),
+)
+
+#: Sentinel-1 ascending + descending as a named set, ready for
+#: :class:`~torchdeform.simulation.MultiGeometryGenerator`.
+DEFAULT_S1_ASC_DESC_PRIORS: dict[str, GeometryPrior] = {
+    "asc": DEFAULT_S1_ASCENDING_PRIOR,
+    "desc": DEFAULT_S1_DESCENDING_PRIOR,
+}
+
 
 # --------------------------------------------------------------------------- #
 # Mixture: weighted choice over source types

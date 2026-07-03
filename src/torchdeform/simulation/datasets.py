@@ -11,8 +11,9 @@ into whatever tensors your training loop needs.
 For DataLoader training, supply a ``transform`` that returns plain tensors (or a
 dict of tensors) so the default collate can batch them; the raw sample objects
 (:class:`~torchdeform.simulation.generators.DeformationSample` /
-:class:`~torchdeform.simulation.generators.InterferogramSample`) carry mixed
-types and are meant for inspection or a custom collate.
+:class:`~torchdeform.simulation.generators.InterferogramSample` /
+:class:`~torchdeform.simulation.generators.MultiGeometryInterferogramSample`)
+carry mixed types and are meant for inspection or a custom collate.
 """
 from typing import Callable, Optional
 
@@ -24,6 +25,8 @@ from .generators import (
     DeformationSample,
     InterferogramGenerator,
     InterferogramSample,
+    MultiGeometryInterferogramGenerator,
+    MultiGeometryInterferogramSample,
 )
 
 
@@ -95,6 +98,52 @@ class InsarDataset(Dataset):
         length: int,
         base_seed: int = 0,
         transform: Optional[Callable[[InterferogramSample], object]] = None,
+    ):
+        self.generator = generator
+        self.length = length
+        self.base_seed = base_seed
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, index: int):
+        g = torch.Generator().manual_seed(self.base_seed + index)
+        sample = self.generator.generate(1, generator=g)
+        return self.transform(sample) if self.transform is not None else sample
+
+
+class MultiGeometryInsarDataset(Dataset):
+    """Reproducible, index-addressable multi-geometry interferogram samples.
+
+    Like :class:`InsarDataset`, but draws from a
+    :class:`~torchdeform.simulation.generators.MultiGeometryInterferogramGenerator`,
+    so each sample observes the *same* deformation from ``G`` acquisition
+    geometries: the (unwrapped) deformation phase, optional atmosphere and LOS all
+    carry a geometry axis (``[1, G, rows, cols]`` / ``[1, G, 1]``). Use
+    ``sample.wrapped()`` for the observable stack of interferograms and
+    ``sample.names`` for the geometry order.
+
+    Parameters
+    ----------
+    generator : MultiGeometryInterferogramGenerator
+        The multi-geometry interferogram generator to draw from.
+    length : int
+        Number of (virtual) samples.
+    base_seed : int
+        Per-index RNG offset; item ``i`` always uses seed ``base_seed + i``.
+    transform : callable, optional
+        Maps a :class:`MultiGeometryInterferogramSample` to the returned object;
+        ``None`` returns the raw sample.
+    """
+
+    def __init__(
+        self,
+        generator: MultiGeometryInterferogramGenerator,
+        length: int,
+        base_seed: int = 0,
+        transform: Optional[
+            Callable[[MultiGeometryInterferogramSample], object]] = None,
     ):
         self.generator = generator
         self.length = length

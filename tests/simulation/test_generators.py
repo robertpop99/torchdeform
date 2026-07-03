@@ -22,10 +22,12 @@ from torchdeform.simulation import (
     ObservationGrid, centered_location, SourceGenerator, DeformationGenerator,
     DeformationSample, GeometryGenerator, AtmosphereGenerator,
     InterferogramGenerator, InterferogramSample,
-    DeformationDataset, InsarDataset,
+    MultiGeometryGenerator, MultiGeometryInterferogramGenerator,
+    MultiGeometryInterferogramSample,
+    DeformationDataset, InsarDataset, MultiGeometryInsarDataset,
     GeometryPrior, PriorMixture, UniformPrior, ConstantPrior, LocationPrior,
     DEFAULT_MOGI_PRIOR, DEFAULT_PENNY_PRIOR, DEFAULT_EARTHQUAKE_PRIOR,
-    DEFAULT_S1_GEOMETRY_PRIOR, synthetic_dem,
+    DEFAULT_S1_GEOMETRY_PRIOR, DEFAULT_S1_ASC_DESC_PRIORS, synthetic_dem,
 )
 
 
@@ -238,6 +240,101 @@ def test_interferogram_reproducible():
 
 
 # --------------------------------------------------------------------------- #
+# MultiGeometryGenerator
+# --------------------------------------------------------------------------- #
+def test_multi_geometry_generator_stacks_axis():
+    mg = MultiGeometryGenerator(DEFAULT_S1_ASC_DESC_PRIORS)
+    assert mg.names == ("asc", "desc") and mg.n_geometries == 2
+    los, geo = mg.generate(16, generator=_gen(), dtype=DTYPE)
+    assert los.e.shape == (16, 2, 1)                    # [B, G, 1]
+    assert torch.allclose(los.norm, torch.ones_like(los.norm), atol=1e-12)
+    assert set(geo) == {"asc", "desc"}
+    assert geo["asc"]["heading_deg"].shape == (16,)
+    # the two passes really are different geometries
+    assert not torch.allclose(los.e[:, 0], los.e[:, 1])
+
+
+def test_multi_geometry_generator_matches_single():
+    # each stacked geometry equals what the equivalent single GeometryGenerator
+    # would produce from the same generator, in order.
+    mg = MultiGeometryGenerator(DEFAULT_S1_ASC_DESC_PRIORS)
+    los, _ = mg.generate(8, generator=_gen(5), dtype=DTYPE)
+
+    g = _gen(5)
+    asc_los, _ = GeometryGenerator(DEFAULT_S1_ASC_DESC_PRIORS["asc"]).generate(
+        8, generator=g, dtype=DTYPE)
+    desc_los, _ = GeometryGenerator(DEFAULT_S1_ASC_DESC_PRIORS["desc"]).generate(
+        8, generator=g, dtype=DTYPE)
+    assert torch.allclose(los.e[:, 0], asc_los.e)
+    assert torch.allclose(los.e[:, 1], desc_los.e)
+
+
+def test_multi_geometry_generator_validation():
+    with pytest.raises(ValueError):
+        MultiGeometryGenerator({})
+
+
+# --------------------------------------------------------------------------- #
+# MultiGeometryInterferogramGenerator
+# --------------------------------------------------------------------------- #
+def _multi_ifg_gen(grid, with_atm=True):
+    defo = _mogi_gen(grid)
+    geom = MultiGeometryGenerator(DEFAULT_S1_ASC_DESC_PRIORS)
+    atm = None
+    if with_atm:
+        atm = AtmosphereGenerator(
+            grid, turbulent_rms=UniformPrior(0.5, 1.5),
+            strat_coeff=UniformPrior(-3e-3, 3e-3),
+            dem=lambda b, g: synthetic_dem(b, grid.rows, grid.cols, relief=600.0, generator=g),
+        )
+    return MultiGeometryInterferogramGenerator(defo, geom, atm)
+
+
+def test_multi_interferogram_shapes_and_wrap():
+    grid = _grid()
+    s = _multi_ifg_gen(grid).generate(8, generator=_gen())
+    assert isinstance(s, MultiGeometryInterferogramSample)
+    assert s.names == ("asc", "desc")
+    assert s.deformation_phase.shape == (8, 2, grid.rows, grid.cols)
+    assert s.atmosphere.shape == (8, 2, grid.rows, grid.cols)
+    assert s.los.e.shape == (8, 2, 1)
+    assert torch.allclose(s.phase, s.deformation_phase + s.atmosphere)
+    w = s.wrapped()
+    assert w.shape == (8, 2, grid.rows, grid.cols)
+    assert bool((w.abs() <= math.pi + 1e-6).all())
+
+
+def test_multi_interferogram_shares_deformation_differs_by_los():
+    # The deformation phase per geometry equals the shared displacement projected
+    # onto that geometry's LOS -- so the two geometries differ only via the LOS.
+    grid = _grid()
+    s = _multi_ifg_gen(grid, with_atm=False).generate(4, generator=_gen())
+    assert s.atmosphere is None
+    disp = s.deformation.displacement                       # shared [B, N]
+    from torchdeform.observation import to_phase
+    for k in range(s.los.e.shape[1]):
+        los_k = s.los.e[:, k], s.los.n[:, k], s.los.u[:, k]  # each [B, 1]
+        d_los = disp.e * los_k[0] + disp.n * los_k[1] + disp.u * los_k[2]
+        expected = to_phase(d_los, s_wavelength()).reshape(4, grid.rows, grid.cols)
+        assert torch.allclose(s.deformation_phase[:, k], expected)
+
+
+def s_wavelength():
+    from torchdeform.observation import S1_C_BAND_WAVELENGTH
+    return S1_C_BAND_WAVELENGTH
+
+
+def test_multi_interferogram_shared_dem_independent_turbulence():
+    grid = _grid()
+    s = _multi_ifg_gen(grid).generate(4, generator=_gen(1))
+    # Two geometries, same ground: atmospheres differ (independent turbulence)...
+    assert not torch.allclose(s.atmosphere[:, 0], s.atmosphere[:, 1])
+    # ...but reproducible given the same seed.
+    s2 = _multi_ifg_gen(grid).generate(4, generator=_gen(1))
+    assert torch.allclose(s.wrapped(), s2.wrapped())
+
+
+# --------------------------------------------------------------------------- #
 # Datasets
 # --------------------------------------------------------------------------- #
 def test_deformation_dataset_len_item_and_reproducible():
@@ -261,6 +358,24 @@ def test_insar_dataset_and_transform():
     ds_t = InsarDataset(gen, length=20, transform=lambda s: s.wrapped().squeeze(0))
     out = ds_t[3]
     assert out.shape == (grid.rows, grid.cols)
+
+
+def test_multi_geometry_insar_dataset_and_transform():
+    grid = _grid()
+    gen = _multi_ifg_gen(grid)
+    ds = MultiGeometryInsarDataset(gen, length=20)
+    s = ds[3]
+    assert isinstance(s, MultiGeometryInterferogramSample)
+    assert s.wrapped().shape == (1, 2, grid.rows, grid.cols)     # [1, G, rows, cols]
+    assert s.names == ("asc", "desc")
+    # deterministic per index, independent of access order
+    assert torch.allclose(ds[3].wrapped(), ds[3].wrapped())
+    assert not torch.allclose(ds[3].wrapped(), ds[4].wrapped())
+
+    # transform hook (e.g. drop the batch dim -> [G, rows, cols] for the loop)
+    ds_t = MultiGeometryInsarDataset(gen, length=20,
+                                     transform=lambda s: s.wrapped().squeeze(0))
+    assert ds_t[3].shape == (2, grid.rows, grid.cols)
 
 
 if __name__ == "__main__":
