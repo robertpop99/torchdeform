@@ -11,10 +11,29 @@ Each scalar prior implements the :class:`Prior` interface -- ``sample(size, ...)
 
 * :class:`UniformPrior` -- uniform on ``[low, high]``.
 * :class:`LogUniformPrior` -- log-uniform on ``[low, high]`` (both > 0); use for
-  scale parameters spanning orders of magnitude.
-* :class:`SignedLogUniformPrior` -- log-uniform magnitude with a random sign;
-  use for signed scale parameters (e.g. inflation/deflation).
+  scale parameters spanning orders of magnitude. Concentrates mass near ``low``.
+* :class:`ReverseLogUniformPrior` -- the mirror image of ``LogUniformPrior``,
+  concentrating mass near ``high`` instead (e.g. depths biased deep).
+* :class:`SignedPrior` -- wrap any positive-magnitude prior and attach a random
+  +/-1 sign; the composable base for signed scale parameters.
+* :class:`SignedLogUniformPrior` -- log-uniform magnitude with a random sign
+  (a ``SignedPrior`` preset); use for signed scale parameters (inflation/deflation).
+* :class:`NormalPrior` -- Gaussian ``N(mean, std)``; a *peaked* alternative to
+  ``UniformPrior`` for "typical value with spread".
+* :class:`TruncatedNormalPrior` -- Gaussian truncated to ``[low, high]``: peaked
+  but bounded, so it never emits an out-of-range value (e.g. negative depth).
+* :class:`LogNormalPrior` -- log-normal ``median * exp(sigma * N(0, 1))``; the
+  peaked analogue of ``LogUniformPrior`` for positive scale parameters.
+* :class:`SignedLogNormalPrior` -- log-normal magnitude with a random sign
+  (a ``SignedPrior`` preset).
+* :class:`PowerLawPrior` -- bounded power law ``pdf proportional to x**-alpha`` on
+  ``[low, high]`` (Gutenberg--Richter / fractal size scaling; ``alpha=1`` recovers
+  log-uniform, larger ``alpha`` piles more mass near ``low``).
+* :class:`VonMisesPrior` -- circular Gaussian for angles; wraps correctly across
+  the 0/360 seam, and ``concentration -> 0`` is uniform on the circle.
 * :class:`ConstantPrior` -- always returns a fixed value (to pin a parameter).
+* :class:`ChoicePrior` -- draw from a fixed set of values with optional weights
+  (e.g. ``look_side`` in ``{+1, -1}``).
 * :class:`MultimodalPrior` -- a finite mixture of scalar priors (per-draw weighted
   choice); for parameters with separated modes, e.g. a Sentinel-1 heading.
 
@@ -194,12 +213,59 @@ class LogUniformPrior(Prior):
 
 
 @dataclass(slots=True)
-class SignedLogUniformPrior(Prior):
-    """Symmetric signed log-uniform prior.
+class SignedPrior(Prior):
+    """Wrap a positive-magnitude prior and apply a random +/-1 sign per draw.
+
+    The composable way to make any positive scale prior *signed*: draw a
+    magnitude from ``magnitude`` and multiply it by +1 or -1 with equal
+    probability. Use for signed scale parameters (volume change -- inflation vs
+    deflation; slip direction). ``SignedPrior(LogUniformPrior(...))``,
+    ``SignedPrior(LogNormalPrior(...))`` and
+    ``SignedPrior(ReverseLogUniformPrior(...))`` all work, so there is no need for
+    a dedicated ``Signed<X>`` class per magnitude shape. The named
+    :class:`SignedLogUniformPrior` / :class:`SignedLogNormalPrior` are thin
+    presets over this (kept for the ``make_prior`` bridge and readability).
+
+    Parameters
+    ----------
+    magnitude : Prior
+        Prior for the (positive) magnitude. Whatever it returns is multiplied by
+        the random sign, so give it a strictly positive distribution.
+    """
+
+    magnitude: Prior
+
+    def __post_init__(self):
+        if not isinstance(self.magnitude, Prior):
+            raise TypeError("magnitude must be a Prior")
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> Tensor:
+        """Draw ``size`` signed values: a random +/-1 times a ``magnitude`` draw.
+
+        Also callable directly. Sign and magnitude are drawn independently, sign
+        first, so a given ``generator`` reproduces the same stream as the
+        dedicated signed presets.
+        """
+        sign_u = _rand(size, generator, device, dtype)
+        sign = 1.0 - 2.0 * (sign_u < 0.5).to(dtype)         # ±1, correct dtype
+        magnitude = self.magnitude.sample(size, generator, device, dtype)
+        return sign * magnitude
+
+
+class SignedLogUniformPrior(SignedPrior):
+    """Symmetric signed log-uniform prior (a :class:`SignedPrior` preset).
 
     Draws a log-uniform magnitude on ``[low, high]`` and multiplies it by a
     random sign (+1/-1 with equal probability). Use for signed scale parameters
-    such as volume change (inflation vs deflation) or slip direction.
+    such as volume change (inflation vs deflation) or slip direction. Equivalent
+    to ``SignedPrior(LogUniformPrior(low, high))``; kept as a named class for the
+    ``make_prior('signed_log')`` bridge and readability.
 
     Parameters
     ----------
@@ -208,51 +274,10 @@ class SignedLogUniformPrior(Prior):
         values fall in ``[-high, -low] u [low, high]``.
     """
 
-    low: float
-    high: float
+    __slots__ = ()
 
-    _logu: LogUniformPrior = field(init=False, repr=False)
-
-    def __post_init__(self):
-        if self.low <= 0:
-            raise ValueError("low must be > 0")
-
-        if self.high <= self.low:
-            raise ValueError("high must be > low")
-
-        self._logu = LogUniformPrior(
-            low=self.low,
-            high=self.high
-        )
-
-    def sample(
-            self,
-            size: Sequence[int],
-            generator: torch.Generator | None = None,
-            device: Optional[DeviceLikeType] = None,
-            dtype: torch.dtype = torch.float64
-    ) -> Tensor:
-        """Draw a tensor of shape ``size`` of signed log-uniform values.
-
-        Also callable directly. Sign and magnitude are drawn independently.
-        """
-        sign_u = _rand(
-            size,
-            generator,
-            device,
-            dtype,
-        )
-
-        sign = 1.0 - 2.0 * (sign_u < 0.5).to(dtype)  # ±1, correct dtype
-
-        magnitude = self._logu.sample(
-            size,
-            generator,
-            device,
-            dtype,
-        )
-
-        return sign * magnitude
+    def __init__(self, low: float, high: float):
+        super().__init__(LogUniformPrior(low, high))
 
 
 @dataclass(slots=True)
@@ -335,12 +360,385 @@ class MultimodalPrior(Prior):
         return flat.gather(0, choice[None, :]).reshape(tuple(size))
 
 
+@dataclass(slots=True)
+class ReverseLogUniformPrior(Prior):
+    """Mirror image of :class:`LogUniformPrior`, concentrating mass near ``high``.
+
+    ``LogUniformPrior`` piles its density up against ``low``; reflecting a
+    log-uniform draw about the interval (``high + low - x``) gives the same
+    log-shaped concentration piled against ``high`` instead. Use it for a
+    positive parameter you want biased toward the *top* of its range -- e.g. a
+    depth that should usually be deep.
+
+    Parameters
+    ----------
+    low, high : float
+        Interval bounds; both must be ``> 0`` and ``high > low`` (the log
+        spacing is defined on ``[low, high]`` before reflection).
+    """
+
+    low: float
+    high: float
+
+    _logu: LogUniformPrior = field(init=False, repr=False)
+
+    def __post_init__(self):
+        if self.low <= 0:
+            raise ValueError("low must be > 0")
+
+        if self.high <= self.low:
+            raise ValueError("high must be > low")
+
+        self._logu = LogUniformPrior(low=self.low, high=self.high)
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> Tensor:
+        """Draw a tensor of shape ``size`` log-concentrated near ``high``.
+
+        Also callable directly. Values fall in ``[low, high]``.
+        """
+        x = self._logu.sample(size, generator, device, dtype)
+        return (self.low + self.high) - x
+
+
+@dataclass(slots=True)
+class NormalPrior(Prior):
+    """Gaussian prior ``N(mean, std)``.
+
+    A peaked alternative to :class:`UniformPrior` when a parameter has a typical
+    value with some spread rather than a flat plausible range. Unbounded -- use
+    :class:`TruncatedNormalPrior` when draws must stay within physical limits.
+
+    Parameters
+    ----------
+    mean : float
+        Distribution mean.
+    std : float
+        Standard deviation; must be ``> 0``.
+    """
+
+    mean: float
+    std: float
+
+    def __post_init__(self):
+        if self.std <= 0:
+            raise ValueError("std must be > 0")
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> Tensor:
+        """Draw a tensor of shape ``size`` from ``N(mean, std)``."""
+        z = torch.randn(size, generator=generator, device=device, dtype=dtype)
+        return self.mean + self.std * z
+
+
+@dataclass(slots=True)
+class TruncatedNormalPrior(Prior):
+    """Gaussian ``N(mean, std)`` truncated to ``[low, high]``.
+
+    Peaked like :class:`NormalPrior` but bounded, so every draw is a physically
+    valid value (e.g. a depth that clusters around a nominal value yet is
+    guaranteed positive). Sampled exactly by inverse-CDF, not rejection.
+
+    Parameters
+    ----------
+    mean, std : float
+        Mean and standard deviation of the *untruncated* Gaussian (``std > 0``).
+    low, high : float
+        Truncation bounds; ``high`` must be ``> low``.
+    """
+
+    mean: float
+    std: float
+    low: float
+    high: float
+
+    def __post_init__(self):
+        if self.std <= 0:
+            raise ValueError("std must be > 0")
+
+        if self.high <= self.low:
+            raise ValueError("high must be > low")
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> Tensor:
+        """Draw a tensor of shape ``size`` from the truncated Gaussian.
+
+        Uses inverse-CDF sampling (``u`` uniform in ``[Phi(a), Phi(b)]`` mapped
+        back through the normal quantile), so all draws lie in ``[low, high]``.
+        """
+        a = (self.low - self.mean) / self.std
+        b = (self.high - self.mean) / self.std
+        lo = torch.special.ndtr(torch.tensor(a, dtype=dtype, device=device))
+        hi = torch.special.ndtr(torch.tensor(b, dtype=dtype, device=device))
+        u = _rand(size, generator, device, dtype)
+        z = torch.special.ndtri(lo + (hi - lo) * u)
+        return (self.mean + self.std * z).clamp(self.low, self.high)
+
+
+@dataclass(slots=True)
+class LogNormalPrior(Prior):
+    """Log-normal prior: ``median * exp(sigma * N(0, 1))``.
+
+    The peaked analogue of :class:`LogUniformPrior` for positive scale
+    parameters (volume change, slip, pressure, ...): unimodal in log-space with
+    heavy tails, rather than flat across decades.
+
+    Parameters
+    ----------
+    median : float
+        Median of the distribution (``exp`` of the underlying normal's mean);
+        must be ``> 0``.
+    sigma : float
+        Standard deviation of ``ln(X)`` (the log-space spread); must be ``> 0``.
+    """
+
+    median: float
+    sigma: float
+
+    def __post_init__(self):
+        if self.median <= 0:
+            raise ValueError("median must be > 0")
+
+        if self.sigma <= 0:
+            raise ValueError("sigma must be > 0")
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> Tensor:
+        """Draw a tensor of shape ``size`` of strictly positive log-normal values."""
+        z = torch.randn(size, generator=generator, device=device, dtype=dtype)
+        return self.median * torch.exp(self.sigma * z)
+
+
+class SignedLogNormalPrior(SignedPrior):
+    """Symmetric signed log-normal prior (a :class:`SignedPrior` preset).
+
+    Draws a log-normal magnitude and multiplies it by a random sign (+1/-1 with
+    equal probability). The peaked counterpart to :class:`SignedLogUniformPrior`
+    for signed scale parameters (inflation vs deflation, slip direction).
+    Equivalent to ``SignedPrior(LogNormalPrior(median, sigma))``.
+
+    Parameters
+    ----------
+    median, sigma : float
+        Median and log-space standard deviation of the magnitude (both ``> 0``);
+        see :class:`LogNormalPrior`.
+    """
+
+    __slots__ = ()
+
+    def __init__(self, median: float, sigma: float):
+        super().__init__(LogNormalPrior(median, sigma))
+
+
+@dataclass(slots=True)
+class PowerLawPrior(Prior):
+    """Bounded power-law prior: ``pdf(x) proportional to x**-alpha`` on ``[low, high]``.
+
+    Motivated by fractal / Gutenberg--Richter size scaling (fault dimensions,
+    seismic moment), where large events are rarer than small ones by a power
+    law. ``alpha=1`` recovers :class:`LogUniformPrior`; larger ``alpha`` piles
+    more mass near ``low`` (steeper size--frequency falloff), ``alpha < 1`` more
+    mass near ``high``. Sampled exactly by inverse-CDF.
+
+    Parameters
+    ----------
+    low, high : float
+        Support bounds; both must be ``> 0`` and ``high > low``.
+    alpha : float
+        Power-law exponent (density ``proportional to x**-alpha``).
+    """
+
+    low: float
+    high: float
+    alpha: float
+
+    def __post_init__(self):
+        if self.low <= 0:
+            raise ValueError("low must be > 0")
+
+        if self.high <= self.low:
+            raise ValueError("high must be > low")
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> Tensor:
+        """Draw a tensor of shape ``size`` from the bounded power law."""
+        u = _rand(size, generator, device, dtype)
+        a, b = self.low, self.high
+        if abs(self.alpha - 1.0) < 1e-12:               # pdf ∝ 1/x  ->  log-uniform
+            return a * (b / a) ** u
+        m = 1.0 - self.alpha
+        return (a ** m + u * (b ** m - a ** m)) ** (1.0 / m)
+
+
+def _von_mises_centered(
+        size: tuple[int, ...],
+        kappa: float,
+        generator: torch.Generator | None,
+        device: Optional[DeviceLikeType],
+        dtype: torch.dtype,
+) -> Tensor:
+    """Von Mises deviates about mean direction 0 (radians), Best & Fisher (1979).
+
+    Vectorised rejection sampler that respects ``generator`` (unlike
+    ``torch.distributions.VonMises``, which draws from the global RNG), so
+    per-index dataset reproducibility is preserved.
+    """
+    n = 1
+    for s in size:
+        n *= s
+    tau = 1.0 + math.sqrt(1.0 + 4.0 * kappa * kappa)
+    rho = (tau - math.sqrt(2.0 * tau)) / (2.0 * kappa)
+    r = (1.0 + rho * rho) / (2.0 * rho)
+
+    out = torch.empty(n, device=device, dtype=dtype)
+    todo = torch.arange(n, device=device)
+    while todo.numel() > 0:                             # resample only the rejects
+        m = int(todo.numel())
+        u1 = _rand((m,), generator, device, dtype)
+        u2 = _rand((m,), generator, device, dtype)
+        u3 = _rand((m,), generator, device, dtype)
+        z = torch.cos(math.pi * u1)
+        f = (1.0 + r * z) / (r + z)
+        c = kappa * (r - f)
+        accept = (c * (2.0 - c) - u2 > 0) | (torch.log(c / u2) + 1.0 - c >= 0)
+        theta = torch.sign(u3 - 0.5) * torch.acos(f.clamp(-1.0, 1.0))
+        acc = accept.nonzero(as_tuple=False).squeeze(1)
+        out[todo[acc]] = theta[acc]
+        todo = todo[~accept]
+    return out.reshape(size)
+
+
+@dataclass(slots=True)
+class VonMisesPrior(Prior):
+    """Von Mises (circular Gaussian) prior for an angle.
+
+    The natural peaked prior for a *periodic* parameter (fault strike, rake,
+    pCDM azimuth): unlike a truncated Gaussian it wraps correctly, so density
+    piled near 0/360 is not split by the seam. ``concentration -> 0`` is uniform
+    on the circle; larger ``concentration`` clusters tightly about ``loc``.
+
+    Parameters
+    ----------
+    loc : float
+        Mean direction (in degrees if ``degrees`` else radians).
+    concentration : float
+        Concentration ``kappa >= 0`` (inverse dispersion; the circular analogue
+        of ``1/std**2``).
+    degrees : bool, default False
+        If True, ``loc`` and the returned samples are in degrees; otherwise
+        radians. Output is wrapped to ``(-180, 180]`` (``(-pi, pi]``).
+    """
+
+    loc: float
+    concentration: float
+    degrees: bool = False
+
+    def __post_init__(self):
+        if self.concentration < 0:
+            raise ValueError("concentration must be >= 0")
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> Tensor:
+        """Draw a tensor of shape ``size`` from the von Mises distribution."""
+        size = tuple(size)
+        loc = math.radians(self.loc) if self.degrees else float(self.loc)
+        kappa = float(self.concentration)
+        if kappa < 1e-8:                                # degenerate -> uniform circle
+            theta = loc + math.pi * (2.0 * _rand(size, generator, device, dtype) - 1.0)
+        else:
+            theta = loc + _von_mises_centered(size, kappa, generator, device, dtype)
+        theta = torch.remainder(theta + math.pi, 2.0 * math.pi) - math.pi   # wrap
+        if self.degrees:
+            theta = theta * (180.0 / math.pi)
+        return theta
+
+
+@dataclass(slots=True)
+class ChoicePrior(Prior):
+    """Draw from a fixed finite set of scalar values with optional weights.
+
+    Unlike :class:`MultimodalPrior` (which mixes sub-*priors*), this samples from
+    an explicit list of numbers -- handy for discrete parameters, e.g.
+    ``look_side`` in ``{+1, -1}`` or a small set of nominal incidence angles.
+
+    Parameters
+    ----------
+    values : Sequence[float]
+        The candidate values; must be non-empty.
+    weights : Sequence[float], optional
+        Relative (unnormalised) selection weight per value; must be strictly
+        positive. Defaults to uniform.
+    """
+
+    values: Sequence[float]
+    weights: Optional[Sequence[float]] = None
+
+    def __post_init__(self):
+        if len(self.values) == 0:
+            raise ValueError("values must be non-empty")
+        if self.weights is not None:
+            if len(self.weights) != len(self.values):
+                raise ValueError("weights must have one entry per value")
+            if any(float(w) <= 0.0 for w in self.weights):
+                raise ValueError("weights must be strictly positive")
+
+    def sample(
+            self,
+            size: Sequence[int],
+            generator: torch.Generator | None = None,
+            device: Optional[DeviceLikeType] = None,
+            dtype: torch.dtype = torch.float64,
+    ) -> Tensor:
+        """Draw ``size``, each element a weighted-random pick from ``values``."""
+        vals = torch.tensor([float(v) for v in self.values], dtype=dtype, device=device)
+        w = ([1.0] * len(self.values) if self.weights is None
+             else [float(x) for x in self.weights])
+        probs = torch.tensor(w, dtype=torch.float64, device=device)
+        probs = probs / probs.sum()
+        n = 1
+        for s in size:
+            n *= s
+        choice = torch.multinomial(probs, n, replacement=True, generator=generator)
+        return vals[choice].reshape(tuple(size))
+
+
 # --------------------------------------------------------------------------- #
 # Bridge: build a scalar prior from a (low, high, mode) spec
 # --------------------------------------------------------------------------- #
 _MODES: dict[str, type[Prior]] = {
     "uniform": UniformPrior,
-    "log": LogUniformPrior,            # log-uniform
+    "log": LogUniformPrior,            # log-uniform (mass near low)
+    "reverse_log": ReverseLogUniformPrior,  # log-uniform mirrored (mass near high)
     "signed_log": SignedLogUniformPrior,   # log-uniform magnitude, random sign
 }
 
@@ -356,8 +754,10 @@ def make_prior(low: float, high: float, mode: str = "uniform") -> Prior:
     ----------
     low, high : float
         Bounds passed to the chosen prior.
-    mode : {'uniform', 'log', 'signed_log'}, default 'uniform'
-        Which prior to construct.
+    mode : {'uniform', 'log', 'reverse_log', 'signed_log'}, default 'uniform'
+        Which prior to construct. Only the ``(low, high)`` families are reachable
+        here; peaked/shape priors (normal, log-normal, power-law, von Mises,
+        choice) take extra parameters and are constructed directly.
 
     Raises
     ------

@@ -22,8 +22,17 @@ from torchdeform.simulation import (
     Prior,
     UniformPrior,
     LogUniformPrior,
+    ReverseLogUniformPrior,
+    SignedPrior,
     SignedLogUniformPrior,
+    NormalPrior,
+    TruncatedNormalPrior,
+    LogNormalPrior,
+    SignedLogNormalPrior,
+    PowerLawPrior,
+    VonMisesPrior,
     ConstantPrior,
+    ChoicePrior,
     MultimodalPrior,
     make_prior,
     PriorBundle,
@@ -103,11 +112,216 @@ def test_log_priors_require_positive_low():
 
 
 # --------------------------------------------------------------------------- #
+# ReverseLogUniformPrior -- mirror of LogUniformPrior (mass near high)
+# --------------------------------------------------------------------------- #
+def test_reverse_log_in_range_and_biased_high():
+    p = ReverseLogUniformPrior(1e2, 1e6)
+    x = p.sample((10000,), _gen(0), dtype=DTYPE)
+    assert isinstance(p, Prior)
+    assert x.min() >= 1e2 * (1 - 1e-9) and x.max() <= 1e6 * (1 + 1e-9)
+    # exact mirror of the log-uniform draw about the interval
+    xr = (1e2 + 1e6) - LogUniformPrior(1e2, 1e6).sample((10000,), _gen(0), dtype=DTYPE)
+    assert torch.allclose(x, xr)
+    # mass piles up near high: median sits above the linear midpoint
+    assert x.median() > 0.5 * (1e2 + 1e6)
+
+
+def test_reverse_log_requires_positive_low_and_ordered_bounds():
+    with pytest.raises(ValueError):
+        ReverseLogUniformPrior(-1.0, 10.0)
+    with pytest.raises(ValueError):
+        ReverseLogUniformPrior(10.0, 1.0)
+
+
+# --------------------------------------------------------------------------- #
+# NormalPrior / TruncatedNormalPrior
+# --------------------------------------------------------------------------- #
+def test_normal_mean_and_std():
+    p = NormalPrior(3.0, 2.0)
+    x = p.sample((50000,), _gen(0), dtype=DTYPE)
+    assert isinstance(p, Prior)
+    assert abs(x.mean().item() - 3.0) < 0.05
+    assert abs(x.std().item() - 2.0) < 0.05
+
+
+def test_normal_requires_positive_std():
+    with pytest.raises(ValueError):
+        NormalPrior(0.0, 0.0)
+
+
+def test_truncated_normal_stays_in_bounds_and_peaks():
+    p = TruncatedNormalPrior(mean=5.0, std=3.0, low=0.0, high=10.0)
+    x = p.sample((20000,), _gen(1), dtype=DTYPE)
+    assert x.min() >= 0.0 and x.max() <= 10.0
+    assert abs(x.mean().item() - 5.0) < 0.1        # symmetric truncation
+    # heavy truncation on one side shifts the mass, never escapes the bounds
+    q = TruncatedNormalPrior(mean=-5.0, std=2.0, low=0.0, high=1.0)
+    y = q.sample((5000,), _gen(2), dtype=DTYPE)
+    assert y.min() >= 0.0 and y.max() <= 1.0
+
+
+def test_truncated_normal_validation():
+    with pytest.raises(ValueError):
+        TruncatedNormalPrior(0.0, 0.0, 0.0, 1.0)   # std <= 0
+    with pytest.raises(ValueError):
+        TruncatedNormalPrior(0.0, 1.0, 1.0, 0.0)   # high <= low
+
+
+# --------------------------------------------------------------------------- #
+# LogNormalPrior / SignedLogNormalPrior
+# --------------------------------------------------------------------------- #
+def test_lognormal_positive_and_median():
+    p = LogNormalPrior(median=1e4, sigma=1.0)
+    x = p.sample((50000,), _gen(0), dtype=DTYPE)
+    assert (x > 0).all()
+    assert 0.9e4 < x.median() < 1.1e4              # median = the `median` arg
+    # ln(x) is normal with std ~ sigma
+    assert abs(x.log().std().item() - 1.0) < 0.05
+
+
+def test_lognormal_validation():
+    with pytest.raises(ValueError):
+        LogNormalPrior(-1.0, 1.0)
+    with pytest.raises(ValueError):
+        LogNormalPrior(1.0, 0.0)
+
+
+def test_signed_lognormal_has_both_signs_and_right_median():
+    p = SignedLogNormalPrior(median=1e4, sigma=0.8)
+    x = p.sample((50000,), _gen(3), dtype=DTYPE)
+    assert (x > 0).any() and (x < 0).any()
+    assert 0.9e4 < x.abs().median() < 1.1e4
+
+
+# --------------------------------------------------------------------------- #
+# SignedPrior wrapper + preset aliases
+# --------------------------------------------------------------------------- #
+def test_signed_prior_wraps_any_magnitude():
+    p = SignedPrior(ReverseLogUniformPrior(1e5, 1e8))
+    x = p.sample((10000,), _gen(0), dtype=DTYPE)
+    assert isinstance(p, Prior)
+    assert (x > 0).any() and (x < 0).any()
+    mag = x.abs()
+    assert mag.min() >= 1e5 * (1 - 1e-9) and mag.max() <= 1e8 * (1 + 1e-9)
+
+
+def test_signed_presets_are_signed_prior_instances():
+    assert issubclass(SignedLogUniformPrior, SignedPrior)
+    assert issubclass(SignedLogNormalPrior, SignedPrior)
+    assert isinstance(SignedLogUniformPrior(1.0, 10.0), Prior)
+
+
+def test_signed_preset_matches_explicit_wrapper_exactly():
+    """The alias reproduces SignedPrior(LogUniformPrior(...)) draw-for-draw."""
+    a = SignedLogUniformPrior(1e3, 1e5).sample((5000,), _gen(4), dtype=DTYPE)
+    b = SignedPrior(LogUniformPrior(1e3, 1e5)).sample((5000,), _gen(4), dtype=DTYPE)
+    assert torch.allclose(a, b)
+    c = SignedLogNormalPrior(1e4, 0.7).sample((5000,), _gen(5), dtype=DTYPE)
+    d = SignedPrior(LogNormalPrior(1e4, 0.7)).sample((5000,), _gen(5), dtype=DTYPE)
+    assert torch.allclose(c, d)
+
+
+def test_signed_prior_rejects_non_prior_magnitude():
+    with pytest.raises(TypeError):
+        SignedPrior(1.0)
+
+
+# --------------------------------------------------------------------------- #
+# PowerLawPrior
+# --------------------------------------------------------------------------- #
+def test_power_law_in_range_and_alpha_one_is_log_uniform():
+    p = PowerLawPrior(1.0, 1e4, alpha=1.6)
+    x = p.sample((20000,), _gen(0), dtype=DTYPE)
+    assert x.min() >= 1.0 * (1 - 1e-9) and x.max() <= 1e4 * (1 + 1e-9)
+    # alpha=1 exactly reproduces a log-uniform draw
+    a = PowerLawPrior(1.0, 1e4, alpha=1.0).sample((5000,), _gen(7), dtype=DTYPE)
+    b = LogUniformPrior(1.0, 1e4).sample((5000,), _gen(7), dtype=DTYPE)
+    assert torch.allclose(a, b)
+
+
+def test_power_law_alpha_controls_concentration():
+    # larger alpha => steeper falloff => more mass near low => smaller median
+    lo = PowerLawPrior(1.0, 1e4, alpha=0.5).sample((20000,), _gen(1), dtype=DTYPE)
+    hi = PowerLawPrior(1.0, 1e4, alpha=2.5).sample((20000,), _gen(1), dtype=DTYPE)
+    assert hi.median() < lo.median()
+
+
+def test_power_law_validation():
+    with pytest.raises(ValueError):
+        PowerLawPrior(-1.0, 10.0, alpha=1.5)
+    with pytest.raises(ValueError):
+        PowerLawPrior(10.0, 1.0, alpha=1.5)
+
+
+# --------------------------------------------------------------------------- #
+# VonMisesPrior
+# --------------------------------------------------------------------------- #
+def test_von_mises_wraps_and_concentrates():
+    import math
+    p = VonMisesPrior(loc=170.0, concentration=8.0, degrees=True)
+    x = p.sample((20000,), _gen(0), dtype=DTYPE)
+    assert x.min() >= -180.0 and x.max() <= 180.0
+    # circular mean near loc despite the 180/-180 wrap (no seam bias)
+    ang = torch.deg2rad(x)
+    cbar = math.degrees(math.atan2(ang.sin().mean().item(), ang.cos().mean().item()))
+    assert abs(((cbar - 170.0 + 180.0) % 360.0) - 180.0) < 3.0
+    # resultant length is high for kappa=8
+    rlen = (ang.cos().mean() ** 2 + ang.sin().mean() ** 2).sqrt().item()
+    assert rlen > 0.8
+
+
+def test_von_mises_zero_concentration_is_uniform_circle():
+    p = VonMisesPrior(loc=0.0, concentration=0.0)
+    x = p.sample((20000,), _gen(1), dtype=DTYPE)
+    assert x.min() >= -3.1416 and x.max() <= 3.1416
+    ang = x
+    rlen = (ang.cos().mean() ** 2 + ang.sin().mean() ** 2).sqrt().item()
+    assert rlen < 0.05                             # no preferred direction
+
+
+def test_von_mises_deterministic_and_validation():
+    p = VonMisesPrior(0.5, 4.0)
+    a = p.sample((32,), _gen(5), dtype=DTYPE)
+    b = p.sample((32,), _gen(5), dtype=DTYPE)
+    assert torch.allclose(a, b)                    # generator-respecting
+    with pytest.raises(ValueError):
+        VonMisesPrior(0.0, -1.0)
+
+
+# --------------------------------------------------------------------------- #
+# ChoicePrior
+# --------------------------------------------------------------------------- #
+def test_choice_prior_only_emits_given_values():
+    p = ChoicePrior([-1.0, 1.0])
+    x = p.sample((5000,), _gen(0), dtype=DTYPE)
+    assert isinstance(p, Prior)
+    assert set(x.unique().tolist()) <= {-1.0, 1.0}
+    assert (x == -1.0).any() and (x == 1.0).any()
+
+
+def test_choice_prior_weighting():
+    p = ChoicePrior([0.0, 1.0], weights=[1.0, 3.0])
+    x = p.sample((20000,), _gen(1), dtype=DTYPE)
+    frac_one = (x == 1.0).float().mean().item()
+    assert 0.70 < frac_one < 0.80                  # ~0.75
+
+
+def test_choice_prior_validation():
+    with pytest.raises(ValueError):
+        ChoicePrior([])
+    with pytest.raises(ValueError):
+        ChoicePrior([1.0, 2.0], weights=[1.0])     # length mismatch
+    with pytest.raises(ValueError):
+        ChoicePrior([1.0], weights=[0.0])          # non-positive
+
+
+# --------------------------------------------------------------------------- #
 # make_prior bridge
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("mode,cls", [
     ("uniform", UniformPrior),
     ("log", LogUniformPrior),
+    ("reverse_log", ReverseLogUniformPrior),
     ("signed_log", SignedLogUniformPrior),
 ])
 def test_make_prior_dispatch(mode, cls):
