@@ -1155,6 +1155,103 @@ class TestDtypeAndDevice:
         assert torch.isfinite(out_f.u).all()
 
 
+class TestDtypeNumericalFloors:
+    """The ``num_eps`` guard scales with ``internal_dtype``.
+
+    A fixed ``1e-12`` is right for float64 but lies below float32's ~1e-7
+    epsilon, so in float32 that floor is effectively inert -- it no longer does
+    what "numerical guard for denominators/sqrt" claims. ``num_eps`` now defaults
+    to ``None`` -> a dtype-appropriate floor. These tests pin that contract and
+    assert forward + gradient stay finite in float32 on the singular manifolds.
+
+    (Note: with the current kxi/ket edge-masking the float64->float32 floor change
+    does not by itself flip any of these configs from non-finite to finite -- the
+    masks already protect them. The tests are a finiteness/contract guard, not a
+    regression reproducer.)
+    """
+
+    def test_default_num_eps_scales_with_dtype(self):
+        from torchdeform.sources.base import default_num_eps
+        assert default_num_eps(torch.float64) == 1e-12
+        assert default_num_eps(torch.float32) > default_num_eps(torch.float64)
+        assert default_num_eps(torch.float16) >= default_num_eps(torch.float32)
+
+    def test_float64_num_eps_unchanged(self):
+        """Regression: the float64 path keeps its validated 1e-12 floor."""
+        assert OkadaSource()._resolve_num_eps() == 1e-12
+        assert OkadaSourceSimple()._resolve_num_eps() == 1e-12
+
+    def test_explicit_num_eps_overrides(self):
+        assert OkadaSource(num_eps=1e-9)._resolve_num_eps() == 1e-9
+        assert OkadaSource(internal_dtype=torch.float32,
+                           num_eps=1e-9)._resolve_num_eps() == 1e-9
+
+    @pytest.mark.parametrize("grad_mode", ["analytic_grad", "smooth_grad"])
+    def test_simplified_float32_finite_on_trace(self, grad_mode):
+        """float32 forward + obs-gradient stay finite on a fault-trace-crossing
+        grid at vertical dip (cd = 0), for both gradient backends."""
+        f32 = torch.float32
+        L, W = 10e3, 5e3
+        g = torch.linspace(-8e3, 8e3, 21, dtype=f32)
+        X, Y = torch.meshgrid(g, g, indexing="xy")
+        x_obs = X.reshape(1, -1).clone().requires_grad_(True)
+        y_obs = Y.reshape(1, -1)
+        model = OkadaSourceSimple(internal_dtype=f32, **{grad_mode: True})
+        out = model(
+            x_obs=x_obs, y_obs=y_obs,
+            source_x=torch.zeros(1, dtype=f32), source_y=torch.zeros(1, dtype=f32),
+            dip=torch.tensor([math.pi / 2.0], dtype=f32),
+            strike=torch.tensor([0.3], dtype=f32),
+            centroid_depth=torch.tensor([0.5 * W], dtype=f32),
+            length=torch.tensor([L], dtype=f32), width=torch.tensor([W], dtype=f32),
+            disl1=torch.tensor([1.0], dtype=f32), disl2=torch.tensor([0.5], dtype=f32),
+            disl3=torch.zeros(1, dtype=f32),
+        )
+        assert torch.isfinite(out.e).all() and torch.isfinite(out.u).all()
+        (gx,) = torch.autograd.grad((out.e**2 + out.n**2 + out.u**2).sum(), x_obs)
+        assert torch.isfinite(gx).all()
+
+    def test_fullz_float32_finite_on_fault_plane(self):
+        """float32 obs-points on the fault plane (analytic backend) stay finite."""
+        f32 = torch.float32
+        g = torch.linspace(-10e3, 10e3, 21, dtype=f32)
+        x_obs = g.reshape(1, -1).clone().requires_grad_(True)
+        n = x_obs.shape[1]
+        out = OkadaSource(internal_dtype=f32, analytic_grad=True)(
+            x_obs=x_obs, y_obs=torch.zeros(1, n, dtype=f32),
+            z_obs=torch.full((1, n), -3e3, dtype=f32),
+            source_x=torch.zeros(1, dtype=f32), source_y=torch.zeros(1, dtype=f32),
+            dip=torch.tensor([math.pi / 2.0], dtype=f32),
+            strike=torch.zeros(1, dtype=f32),
+            centroid_depth=torch.tensor([5e3], dtype=f32),
+            length=torch.tensor([12e3], dtype=f32), width=torch.tensor([6e3], dtype=f32),
+            disl1=torch.tensor([1.0], dtype=f32), disl2=torch.tensor([0.5], dtype=f32),
+            disl3=torch.zeros(1, dtype=f32),
+        )
+        assert torch.isfinite(out.e).all() and torch.isfinite(out.u).all()
+        (gx,) = torch.autograd.grad((out.e**2 + out.n**2 + out.u**2).sum(), x_obs)
+        assert torch.isfinite(gx).all()
+
+    def test_mogi_float32_finite_near_source(self):
+        """Mogi stays finite in float32 for a grid passing over a shallow source
+        (same dtype-aware num_eps convention as the Okada sources)."""
+        from torchdeform import MogiSource
+        f32 = torch.float32
+        # a grid passing directly over an epicentre at (0, 0)
+        g = torch.linspace(-10.0, 10.0, 21, dtype=f32)
+        x_obs = g.reshape(1, -1).clone().requires_grad_(True)
+        n = x_obs.shape[1]
+        out = MogiSource(internal_dtype=f32)(
+            x_obs=x_obs, y_obs=torch.zeros(1, n, dtype=f32),
+            source_x=torch.zeros(1, dtype=f32), source_y=torch.zeros(1, dtype=f32),
+            depth=torch.tensor([1e-3], dtype=f32),   # shallow -> near-singular over epicentre
+            delta_v=torch.tensor([1e5], dtype=f32),
+        )
+        assert torch.isfinite(out.e).all() and torch.isfinite(out.u).all()
+        (gx,) = torch.autograd.grad((out.e**2 + out.n**2 + out.u**2).sum(), x_obs)
+        assert torch.isfinite(gx).all()
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

@@ -67,9 +67,26 @@ from torch import Tensor
 from .base import SourceModel
 from ..core import Displacement
 
-GEOM_EPS = 1e-6   # Okada-style branch / “treat as zero”
+GEOM_EPS = 1e-6   # Okada-style branch / “treat as zero” (physical tolerance, metres)
 NUM_EPS  = 1e-12  # float64 denominator/log/sqrt safety
-RD_EPS   = 1e-8   # UB singularity guard for r + d
+RD_EPS   = 1e-8   # float64 UB singularity guard for r + d
+SMOOTH_EPS = 1e-8  # float64 smooth_grad reciprocal/division scale
+BLEND_EPS  = 1e-4  # smooth_grad cd~0 blend width (physical, dtype-independent)
+
+
+def _okada_grad_floors(dtype: torch.dtype) -> tuple[float, float]:
+    """``(smooth_eps, rd_eps)`` scaled to the compute dtype.
+
+    Both guard near-singular reciprocals (the ``smooth_grad`` divisions and the
+    exact-mode ``r + d -> 0`` shift). The float64 values (``1e-8``) are the
+    validated defaults; ``float32``'s ~1e-7 epsilon would swallow them, so lift
+    the floors for coarser dtypes. See :func:`~torchdeform.sources.base.default_num_eps`.
+    """
+    if dtype == torch.float64:
+        return SMOOTH_EPS, RD_EPS
+    if dtype == torch.float32:
+        return 1e-4, 1e-4
+    return 1e-2, 1e-2  # float16 / bfloat16
 
 
 # ---------------------------------------------------------------------
@@ -1585,11 +1602,7 @@ class _OkadaBase(SourceModel):
         internal_dtype: torch.dtype = torch.float64,
         smooth_grad: bool = False,
         analytic_grad: bool = False,
-        num_eps: float = NUM_EPS,
-        geom_eps: float = GEOM_EPS,
-        rd_eps: float = RD_EPS,
-        smooth_eps: float = 1e-8,
-        blend_eps: float = 1e-4,
+        num_eps: float | None = None,
     ):
         """
         Parameters
@@ -1611,16 +1624,14 @@ class _OkadaBase(SourceModel):
             autograd hits a ``cos(dip) = 0`` NaN. Costs ~2x the backward (the
             forward is unchanged); see the README example. Mutually exclusive with
             ``smooth_grad``.
-        num_eps : float, default NUM_EPS
-            Numerical guard for denominators/logs/sqrt.
-        geom_eps : float, default GEOM_EPS
-            Geometric "treat as zero" threshold for the exact-mode branches.
-        rd_eps : float, default RD_EPS
-            Guard for the ``r + d -> 0`` singularity in the UB kernel.
-        smooth_eps : float, default 1e-8
-            Smoothing scale for the ``smooth_grad`` reciprocals/divisions.
-        blend_eps : float, default 1e-4
-            Smoothing scale for the ``smooth_grad`` ``cd != 0`` / ``cd ~ 0`` blend.
+        num_eps : float or None, default None
+            Numerical guard for denominators/logs/sqrt. ``None`` picks a floor
+            matched to ``internal_dtype`` (``1e-12`` for float64 underflows
+            float32, re-exposing the singularities); pass a float to override.
+            The remaining internal guards (``geom_eps``, ``rd_eps``,
+            ``smooth_eps``, ``blend_eps``) are no longer constructor knobs -- they
+            are derived from ``internal_dtype`` per call (see ``_okada_grad_floors``
+            and the module ``*_EPS`` constants).
         """
         super().__init__()
         if smooth_grad and analytic_grad:
@@ -1632,11 +1643,8 @@ class _OkadaBase(SourceModel):
         self.internal_dtype = internal_dtype
         self.smooth_grad = smooth_grad
         self.analytic_grad = analytic_grad
+        # None -> dtype-appropriate floor resolved per call (see _resolve_num_eps).
         self.num_eps = num_eps
-        self.geom_eps = geom_eps
-        self.rd_eps = rd_eps
-        self.smooth_eps = smooth_eps
-        self.blend_eps = blend_eps
 
     @staticmethod
     def _validate_geometry(centroid_depth, length, width, dip):
@@ -1788,6 +1796,12 @@ class OkadaSource(_OkadaBase):
         )
 
         dtype = self.internal_dtype
+        # Numerical guards, scaled to the compute dtype (the float64 values are
+        # the validated defaults; float32's ~1e-7 epsilon would swallow them).
+        num_eps = self._resolve_num_eps()
+        geom_eps = GEOM_EPS            # physical "treat as zero" tolerance (metres)
+        smooth_eps, rd_eps = _okada_grad_floors(dtype)
+        blend_eps = BLEND_EPS
 
         x_obs = x_obs.to(dtype)
         y_obs = y_obs.to(dtype)
@@ -1839,7 +1853,7 @@ class OkadaSource(_OkadaBase):
             dip_rad=dip.to(dtype),
             internal_dtype=dtype,
             training_safe=self.smooth_grad,
-            geom_eps=self.geom_eps,
+            geom_eps=geom_eps,
         )
 
         # -----------------------------------------
@@ -1873,7 +1887,7 @@ class OkadaSource(_OkadaBase):
         et2 = et_r4[:, 0, 1, :]
         q0  = q_r4[:, 0, 0, :]
 
-        epsg = self.geom_eps
+        epsg = geom_eps
 
         r12 = torch.sqrt(xi1 * xi1 + et2 * et2 + q0 * q0)
         r21 = torch.sqrt(xi2 * xi2 + et1 * et1 + q0 * q0)
@@ -1898,9 +1912,9 @@ class OkadaSource(_OkadaBase):
             kxi=kxi_r,
             ket=ket_r,
             internal_dtype=dtype,
-            eps=self.num_eps,
+            eps=num_eps,
             training_safe=self.smooth_grad,
-            smooth_eps=self.smooth_eps,
+            smooth_eps=smooth_eps,
         )
 
         ua_real = ua_displacement(
@@ -1940,7 +1954,7 @@ class OkadaSource(_OkadaBase):
         et2 = et_i4[:, 0, 1, :]
         q0  = q_i4[:, 0, 0, :]
 
-        eps0 = self.geom_eps
+        eps0 = geom_eps
 
         # mimic Okada's zeroing convention
         qz = torch.where(torch.abs(q0) < eps0, torch.zeros_like(q0), q0)
@@ -1978,9 +1992,9 @@ class OkadaSource(_OkadaBase):
             kxi=kxi_i,
             ket=ket_i,
             internal_dtype=dtype,
-            eps=self.num_eps,
+            eps=num_eps,
             training_safe=self.smooth_grad,
-            smooth_eps=self.smooth_eps,
+            smooth_eps=smooth_eps,
         )
 
         ua_img = ua_displacement(
@@ -1997,11 +2011,11 @@ class OkadaSource(_OkadaBase):
             disl3=disl3,
             c0=c0,
             c2=c2_img,
-            eps=self.num_eps,
+            eps=num_eps,
             training_safe=self.smooth_grad,
-            smooth_eps=self.smooth_eps,
-            blend_eps=self.blend_eps,
-            rd_eps=self.rd_eps,
+            smooth_eps=smooth_eps,
+            blend_eps=blend_eps,
+            rd_eps=rd_eps,
         )
 
         uc_img = uc_displacement_only(
@@ -2336,6 +2350,12 @@ class OkadaSourceSimple(_OkadaBase):
         )
 
         dtype = self.internal_dtype
+        # Numerical guards, scaled to the compute dtype (the float64 values are
+        # the validated defaults; float32's ~1e-7 epsilon would swallow them).
+        num_eps = self._resolve_num_eps()
+        geom_eps = GEOM_EPS            # physical "treat as zero" tolerance (metres)
+        smooth_eps, rd_eps = _okada_grad_floors(dtype)
+        blend_eps = BLEND_EPS
 
         x_obs = x_obs.to(dtype)
         y_obs = y_obs.to(dtype)
@@ -2377,7 +2397,7 @@ class OkadaSourceSimple(_OkadaBase):
             dip_rad=dip,
             internal_dtype=self.internal_dtype,
             training_safe=self.smooth_grad,
-            geom_eps=self.geom_eps,
+            geom_eps=geom_eps,
         )
 
         d = depth
@@ -2410,7 +2430,7 @@ class OkadaSourceSimple(_OkadaBase):
         et2 = et[:, 0, 1, :]  # [B,N]
         q0 = q[:, 0, 0, :]  # [B,N]
 
-        eps0 = self.geom_eps
+        eps0 = geom_eps
 
         # mimic Okada's zeroing convention
         qz = torch.where(torch.abs(q0) < eps0, torch.zeros_like(q0), q0)
@@ -2427,7 +2447,7 @@ class OkadaSourceSimple(_OkadaBase):
                 )
         )  # [B, N]
 
-        eps = self.geom_eps
+        eps = geom_eps
 
         r12 = torch.sqrt(xi1 * xi1 + et2 * et2 + q0 * q0)
         r21 = torch.sqrt(xi2 * xi2 + et1 * et1 + q0 * q0)
@@ -2458,9 +2478,9 @@ class OkadaSourceSimple(_OkadaBase):
             kxi=kxi,
             ket=ket,
             internal_dtype=self.internal_dtype,
-            eps=self.num_eps,
+            eps=num_eps,
             training_safe=self.smooth_grad,
-            smooth_eps=self.smooth_eps,
+            smooth_eps=smooth_eps,
         )
 
         ub = ub_displacement(
@@ -2469,11 +2489,11 @@ class OkadaSourceSimple(_OkadaBase):
             disl3=disl3,
             c0=c0,
             c2=c2,
-            eps=self.num_eps,
+            eps=num_eps,
             training_safe=self.smooth_grad,
-            smooth_eps=self.smooth_eps,
-            blend_eps=self.blend_eps,
-            rd_eps=self.rd_eps,
+            smooth_eps=smooth_eps,
+            blend_eps=blend_eps,
+            rd_eps=rd_eps,
         )
 
         sign = torch.tensor(

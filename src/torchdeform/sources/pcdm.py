@@ -189,7 +189,7 @@ class PCDMSource(SourceModel):
         self,
         poisson_ratio: float = 0.25,
         internal_dtype: torch.dtype = torch.float64,
-        num_eps: float = NUM_EPS,
+        num_eps: float | None = None,
     ):
         """
         Parameters
@@ -198,8 +198,10 @@ class PCDMSource(SourceModel):
             Poisson's ratio of the elastic half-space.
         internal_dtype : torch.dtype, default torch.float64
             Dtype used for the internal computation; inputs are cast to it.
-        num_eps : float, default NUM_EPS
-            Numerical guard for denominators / sqrt.
+        num_eps : float or None, default None
+            Numerical guard for denominators / sqrt. ``None`` picks a floor
+            matched to ``internal_dtype`` (``1e-12`` for float64 underflows
+            float32); pass a float to override.
         """
         super().__init__()
         self.v = poisson_ratio
@@ -252,6 +254,7 @@ class PCDMSource(SourceModel):
         )
 
         dtype = self.internal_dtype
+        num_eps = self._resolve_num_eps()
         x_obs = x_obs.to(dtype)
         y_obs = y_obs.to(dtype)
         source_x = source_x.to(dtype)
@@ -290,7 +293,7 @@ class PCDMSource(SourceModel):
             ny = rot[:, 1, k][:, None]
             nz = rot[:, 2, k][:, None]
             e, n, u = _ptd_disp_surf(dx, dy, depth_b, nx, ny, nz,
-                                     dv[:, None], self.v, self.num_eps)
+                                     dv[:, None], self.v, num_eps)
             ue = ue + e
             un = un + n
             uv = uv + u

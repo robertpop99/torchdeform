@@ -29,13 +29,15 @@ class MogiSource(SourceModel):
 
     def __init__(
         self,
-        poisson_ratio: float =0.25,
+        poisson_ratio: float = 0.25,
         internal_dtype: torch.dtype = torch.float64,
-        num_eps: float = 1e-12,
+        num_eps: float | None = None,
     ):
         super().__init__()
         self.v = poisson_ratio
         self.internal_dtype = internal_dtype
+        # None -> dtype-appropriate floor resolved per call (see _resolve_num_eps);
+        # 1e-12 underflows float32, so the default must track internal_dtype.
         self.num_eps = num_eps
 
     def forward(
@@ -73,6 +75,7 @@ class MogiSource(SourceModel):
         )
 
         dtype = self.internal_dtype
+        num_eps = self._resolve_num_eps()
 
         x_obs = x_obs.to(dtype)
         y_obs = y_obs.to(dtype)
@@ -92,7 +95,7 @@ class MogiSource(SourceModel):
         dy = y_obs - source_y[:, None]   # north offset
 
         r2 = dx * dx + dy * dy + depth_b * depth_b
-        r32 = torch.pow(r2 + self.num_eps, 1.5)
+        r32 = torch.pow(r2 + num_eps, 1.5)
 
         coef = ((1.0 - self.v) / math.pi) * delta_v   # [B]
         coef = coef[:, None]                          # [B,1]

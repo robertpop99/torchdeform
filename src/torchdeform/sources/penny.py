@@ -152,13 +152,15 @@ class PennySource(SourceModel):
         shear_modulus: float = 3e10,
         internal_dtype: torch.dtype = torch.float64,
         nis: int = 2,
-        num_eps: float = 1e-12,
+        num_eps: float | None = None,
     ):
         super().__init__()
         self.v = poisson_ratio
         self.mu = shear_modulus
         self.internal_dtype = internal_dtype
         self.nis = nis
+        # None -> dtype-appropriate floor resolved per call (see _resolve_num_eps);
+        # 1e-12 underflows float32, so the default must track internal_dtype.
         self.num_eps = num_eps
 
     # ------------------------------------------------------------------ #
@@ -181,7 +183,7 @@ class PennySource(SourceModel):
         (T1, T2, T3, T4) : tuple of Tensor
             Each shaped [B, M, M].
         """
-        eps = self.num_eps
+        eps = self._resolve_num_eps()
         # outer grids: t varies down rows, r across cols  -> [M, M]
         tt = t[:, None]
         rr = r[None, :]
@@ -322,7 +324,7 @@ class PennySource(SourceModel):
         (S0_0, S0_1, C0_1, S1_m1, S1_0, C1_0, C1_1, S1_1) : tuple of Tensor
             The eight ``S/C`` kernels of eqs B5-B12, each broadcast to [B, N, M].
         """
-        eps = self.num_eps
+        eps = self._resolve_num_eps()
         # eq (B13): X1 = h^2 + r^2 - t^2 ,  X2 = sqrt(X1^2 + 4 h^2 t^2)
         h2 = h * h
         X1 = h2 + r * r - t * t
@@ -410,7 +412,7 @@ class PennySource(SourceModel):
             downward-positive convention and ``ur`` radially outward positive.
             (Multiply by ``Pf`` and negate ``uz`` for upward-positive metres.)
         """
-        eps = self.num_eps
+        eps = self._resolve_num_eps()
 
         # reshape for [B, N, M] broadcasting
         r_ = r[:, :, None]                       # [B, N, 1]
@@ -509,7 +511,7 @@ class PennySource(SourceModel):
 
         dx = x_obs - source_x[:, None]                   # [B, N] east offset
         dy = y_obs - source_y[:, None]                   # [B, N] north offset
-        rho = torch.sqrt(dx * dx + dy * dy + self.num_eps)  # metric radial distance
+        rho = torch.sqrt(dx * dx + dy * dy + self._resolve_num_eps())  # metric radial distance
         r = rho / R[:, None]                             # [B, N] dimensionless radius
 
         # --- quadrature grid ------------------------------------------------ #

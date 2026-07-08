@@ -10,9 +10,28 @@ solution. See the individual subclasses for their specific parameter signatures.
 """
 from abc import abstractmethod, ABC
 
+import torch
 from torch import Tensor, nn
 
 from ..core import Displacement
+
+
+def default_num_eps(dtype: torch.dtype) -> float:
+    """Numerical guard scale (denominator/sqrt/log floor) appropriate for ``dtype``.
+
+    The source models add a small ``num_eps`` to radii/denominators to keep the
+    forward *and its gradient* finite at the deformation singularities (on the
+    source, at fault edges, ...). A fixed ``1e-12`` is right for ``float64`` but
+    lies *below* ``float32``'s machine epsilon (~1e-7), so in ``float32`` it
+    silently vanishes and the guard stops biting -- reintroducing ``inf``/``NaN``
+    (e.g. ``1/r**4`` overflow past ``3.4e38``) near the singular manifolds. Scale
+    the floor with the dtype's precision so the guard keeps working.
+    """
+    if dtype == torch.float64:
+        return 1e-12
+    if dtype == torch.float32:
+        return 1e-6
+    return 1e-3  # float16 / bfloat16 and anything coarser
 
 
 class SourceModel(nn.Module, ABC):
@@ -75,6 +94,19 @@ class SourceModel(nn.Module, ABC):
                     f"{batch} (or 1) to match x_obs"
                 )
         return batch
+
+    def _resolve_num_eps(self) -> float:
+        """Concrete ``num_eps``: the user's value, or a dtype-appropriate default.
+
+        Subclasses accept ``num_eps=None`` (the default) meaning "pick a floor
+        matched to ``internal_dtype``" via :func:`default_num_eps`; an explicit
+        value overrides. Resolved on each call from ``self.internal_dtype`` so it
+        stays correct even if the compute dtype is changed after construction.
+        """
+        eps = getattr(self, "num_eps", None)
+        if eps is not None:
+            return eps
+        return default_num_eps(getattr(self, "internal_dtype", torch.float64))
 
     @abstractmethod
     def forward(self, *args, **kwargs) -> Displacement:
