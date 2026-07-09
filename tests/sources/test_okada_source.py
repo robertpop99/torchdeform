@@ -53,7 +53,9 @@ Run with::
     pytest test_okada_source.py -v
 """
 
+import json
 import math
+from pathlib import Path
 
 import pytest
 import torch
@@ -383,6 +385,434 @@ class TestOkada85Reference:
             f"  want {[f'{v:+.3e}' for v in want.tolist()]}"
         )
 
+_DC3D_GOLDEN = Path(__file__).resolve().parent / "data" / "dc3d_golden.json"
+
+
+def _dc3d_map_jacobian(d):
+    """DC3D fault-frame derivatives -> map-frame Jacobian J[..., i, j] = d ENU_i /
+    d coord_j, coords (E, N, z). The stored 9-vector is column-major, so a
+    row-major reshape gives J_fault^T; transpose, then rotate both legs by the
+    strike matrix C (its own inverse): J_map = C @ J_fault @ C."""
+    b, n = len(d["strike"]), d["n_points"]
+    j_fault = t(d["derivatives_fault_frame"]).reshape(b, n, 3, 3).transpose(-1, -2)
+    s, c = torch.sin(t(d["strike"])), torch.cos(t(d["strike"]))
+    cmat = torch.zeros(b, n, 3, 3, dtype=DTYPE)
+    cmat[..., 0, 0] = s[:, None]; cmat[..., 0, 1] = c[:, None]
+    cmat[..., 1, 0] = c[:, None]; cmat[..., 1, 1] = -s[:, None]
+    cmat[..., 2, 2] = 1.0
+    return cmat @ j_fault @ cmat
+
+
+def _dc3d_model_run(d, grad_params):
+    """Run OkadaSource(analytic_grad=True) on the fixture, with the named inputs
+    made leaves that require grad. Returns (Displacement, {name: leaf})."""
+    leaves = {}
+
+    def leaf(name):
+        v = t(d[name])
+        if name in grad_params:
+            v = v.clone().requires_grad_(True)
+            leaves[name] = v
+        return v
+
+    model = OkadaSource(poisson_ratio=d["poisson_ratio"], analytic_grad=True)
+    out = model(
+        x_obs=leaf("x_obs"), y_obs=leaf("y_obs"), z_obs=leaf("z_obs"),
+        source_x=leaf("source_x"), source_y=leaf("source_y"),
+        dip=leaf("dip"), strike=t(d["strike"]),
+        centroid_depth=leaf("centroid_depth"),
+        length=leaf("length"), width=leaf("width"),
+        disl1=leaf("disl1"), disl2=leaf("disl2"), disl3=leaf("disl3"),
+    )
+    return out, leaves
+
+
+# Points per fault at which the source-parameter gradients are checked. A
+# systematic gradient error shows at any point, so a subset over all 24 faults is
+# ample; it keeps the (custom-Function, non-vmap-able) one-hot backwards cheap.
+_N_GRAD_POINTS = 8
+
+
+def _dc3d_surface_simplified_run(d, grad_params):
+    """OkadaSourceSimple(analytic_grad=True) on the fixture's z = 0 points, each
+    flattened to its own batch element. With one point per element, a per-image
+    parameter feeds exactly one output point, so ``grad(out_i.sum(), param)`` is
+    the elementwise per-point gradient -- no one-hot loop needed. Returns
+    (Displacement, {name: leaf [K]}, surface mask [B, N])."""
+    z = t(d["z_obs"])
+    mask = z == 0.0
+    b, n = z.shape
+    leaves = {}
+
+    def leaf(name):
+        v = t(d[name])[:, None].expand(b, n)[mask]      # [K]
+        if name in grad_params:
+            v = v.clone().requires_grad_(True)
+            leaves[name] = v
+        return v
+
+    model = OkadaSourceSimple(poisson_ratio=d["poisson_ratio"], analytic_grad=True)
+    out = model(
+        x_obs=t(d["x_obs"])[mask][:, None], y_obs=t(d["y_obs"])[mask][:, None],
+        source_x=leaf("source_x"), source_y=leaf("source_y"),
+        dip=leaf("dip"), strike=t(d["strike"])[:, None].expand(b, n)[mask],
+        centroid_depth=leaf("centroid_depth"),
+        length=leaf("length"), width=leaf("width"),
+        disl1=leaf("disl1"), disl2=leaf("disl2"), disl3=leaf("disl3"),
+    )
+    return out, leaves, mask
+
+
+def _elementwise_source_grad(out, param):
+    """d(ENU_i) / d param as [K, 3] when each param element feeds one output
+    point (the flattened surface layout)."""
+    g = torch.zeros(param.shape[0], 3, dtype=DTYPE)
+    for i, comp in enumerate((out.e, out.n, out.u)):
+        g[:, i] = torch.autograd.grad(comp.sum(), param, retain_graph=True)[0]
+    return g
+
+
+def _per_point_source_grad(out, param, b, n, k=_N_GRAD_POINTS):
+    """d(ENU_i)[b, j] / d param[b] as [b, k, 3] for the first ``k`` points. Each
+    per-image parameter feeds all N of its points, so one one-hot backward per
+    (component, point index) isolates that point's gradient. The custom analytic
+    Function is not vmap-able, so this stays an explicit loop."""
+    k = min(k, n)
+    g = torch.zeros(b, k, 3, dtype=DTYPE)
+    for i, comp in enumerate((out.e, out.n, out.u)):
+        for j in range(k):
+            sel = torch.zeros(b, n, dtype=DTYPE)
+            sel[:, j] = 1.0
+            g[:, j, i] = torch.autograd.grad(comp, param, grad_outputs=sel,
+                                             retain_graph=True)[0]
+    return g
+
+
+class TestOkadaDC3DVolume:
+    """OkadaSource against Okada's own DC3D over a random volume of buried faults.
+
+    External ground truth at depth, complementing the surface-only Okada-85
+    Table 2 cases. The fixture ``data/dc3d_golden.json`` freezes the output of
+    Okada's ``DC3D`` (DC3D.f90) for 24 random buried faults -- each with a
+    *non-zero* strike, so the full map->fault assembly is exercised, not just
+    the kernel -- observed at 32 points each, ~3/4 of them *below* the surface
+    (z < 0). Regenerate with ``reference/gen_dc3d.py`` (needs gfortran + a local
+    DC3D.f90); the committed JSON is all this test needs. See reference/README.md.
+    """
+
+    def _load(self):
+        assert _DC3D_GOLDEN.is_file(), (
+            f"{_DC3D_GOLDEN} missing; regenerate with reference/gen_dc3d.py"
+        )
+        return json.loads(_DC3D_GOLDEN.read_text())
+
+    def test_dc3d_volume_displacement(self):
+        d = self._load()
+        # Material must match the fixture (nu = 0.25 -> alpha = 2/3).
+        assert d["poisson_ratio"] == 0.25
+
+        model = OkadaSource(poisson_ratio=d["poisson_ratio"])
+        out = model(
+            x_obs=t(d["x_obs"]), y_obs=t(d["y_obs"]), z_obs=t(d["z_obs"]),
+            source_x=t(d["source_x"]), source_y=t(d["source_y"]),
+            dip=t(d["dip"]), strike=t(d["strike"]),
+            centroid_depth=t(d["centroid_depth"]),
+            length=t(d["length"]), width=t(d["width"]),
+            disl1=t(d["disl1"]), disl2=t(d["disl2"]), disl3=t(d["disl3"]),
+        )
+        got = torch.stack([out.e, out.n, out.u], dim=-1)   # [B, N, 3] ENU
+        want = t(d["u_enu"])
+
+        # Both sides are float64: the only gap is summation order / the kernel
+        # refactor, ~1e-11 m on displacements up to ~0.4 m. atol covers the
+        # handful of points where |u| ~ 1e-7 m (relative noise, not error).
+        assert torch.allclose(got, want, rtol=1e-9, atol=1e-11), (
+            "OkadaSource disagrees with DC3D at depth: max abs diff "
+            f"{(got - want).abs().max().item():.3e} m"
+        )
+
+    def test_dc3d_surface_simplified(self):
+        """OkadaSourceSimple (surface-only fast path) against DC3D ground truth
+        at the fixture's z = 0 points.
+
+        The Simplified model is otherwise checked against Okada-85 Table 2 (three
+        surface points, strike = 0) and by equality with OkadaSource at z = 0.
+        This adds independent DC3D ground truth at the surface with a *non-zero*
+        strike. Each surface point is flattened to its own batch element so the
+        per-fault parameters line up with the ragged count of z = 0 points.
+        """
+        d = self._load()
+        z = t(d["z_obs"])
+        mask = z == 0.0                       # exact: generator sets 0.0
+        assert int(mask.sum()) > 50, "fixture has too few surface points"
+
+        b, n = z.shape
+
+        def per_point(name):                  # [B] source param -> [K] surface pts
+            return t(d[name])[:, None].expand(b, n)[mask]
+
+        model = OkadaSourceSimple(poisson_ratio=d["poisson_ratio"])
+        out = model(
+            x_obs=t(d["x_obs"])[mask][:, None], y_obs=t(d["y_obs"])[mask][:, None],
+            source_x=per_point("source_x"), source_y=per_point("source_y"),
+            dip=per_point("dip"), strike=per_point("strike"),
+            centroid_depth=per_point("centroid_depth"),
+            length=per_point("length"), width=per_point("width"),
+            disl1=per_point("disl1"), disl2=per_point("disl2"), disl3=per_point("disl3"),
+        )
+        got = torch.stack([out.e, out.n, out.u], dim=-1).reshape(-1, 3)  # [K, 3]
+        want = t(d["u_enu"])[mask]                                       # [K, 3]
+
+        assert torch.allclose(got, want, rtol=1e-9, atol=1e-11), (
+            "OkadaSourceSimple disagrees with DC3D at the surface: max abs diff "
+            f"{(got - want).abs().max().item():.3e} m"
+        )
+
+    def test_dc3d_surface_simplified_analytic_grad_strain(self):
+        """OkadaSourceSimple(analytic_grad=True)'s closed-form backward vs DC3D's
+        exact derivatives, at the fixture's z = 0 points.
+
+        The Simplified model takes no z_obs, so autograd reaches only the six
+        *horizontal* components d(ENU)/d(E, N) -- the map-frame Jacobian's first
+        two columns. Those depend solely on DC3D's fault-frame x/y derivatives
+        (the strike rotation C is block-diagonal in the horizontal plane), so
+        ``(C @ J_fault @ C)[:, :, :2]`` is the reference. The z-derivative column
+        is only checkable through the full OkadaSource (see the volume test).
+        """
+        d = self._load()
+        z = t(d["z_obs"])
+        mask = z == 0.0
+        b, n = z.shape
+        k = int(mask.sum())
+        assert k > 50, "fixture has too few surface points"
+
+        def per_point(name):
+            return t(d[name])[:, None].expand(b, n)[mask]
+
+        x = t(d["x_obs"])[mask][:, None].clone().requires_grad_(True)   # [K, 1]
+        y = t(d["y_obs"])[mask][:, None].clone().requires_grad_(True)
+        strike = per_point("strike")
+
+        model = OkadaSourceSimple(poisson_ratio=d["poisson_ratio"], analytic_grad=True)
+        out = model(
+            x_obs=x, y_obs=y,
+            source_x=per_point("source_x"), source_y=per_point("source_y"),
+            dip=per_point("dip"), strike=strike,
+            centroid_depth=per_point("centroid_depth"),
+            length=per_point("length"), width=per_point("width"),
+            disl1=per_point("disl1"), disl2=per_point("disl2"), disl3=per_point("disl3"),
+        )
+
+        # Horizontal map-frame Jacobian d(ENU_i)/d(E, N) -> [K, 1, 3, 2].
+        j_map_h = torch.zeros(k, 1, 3, 2, dtype=DTYPE)
+        for i, comp in enumerate((out.e, out.n, out.u)):
+            for j, g in enumerate(torch.autograd.grad(comp.sum(), (x, y), retain_graph=True)):
+                j_map_h[..., i, j] = g
+
+        j_fault = t(d["derivatives_fault_frame"])[mask].reshape(k, 3, 3).transpose(-1, -2)
+        s, c = torch.sin(strike), torch.cos(strike)
+        cmat = torch.zeros(k, 3, 3, dtype=DTYPE)
+        cmat[:, 0, 0] = s; cmat[:, 0, 1] = c
+        cmat[:, 1, 0] = c; cmat[:, 1, 1] = -s
+        cmat[:, 2, 2] = 1.0
+        j_map_ref = (cmat @ j_fault @ cmat)[:, :, :2].unsqueeze(1)   # [K, 1, 3, 2]
+
+        assert torch.allclose(j_map_h, j_map_ref, rtol=1e-9, atol=1e-12), (
+            "OkadaSourceSimple analytic_grad strain disagrees with DC3D at the "
+            f"surface: max abs diff {(j_map_h - j_map_ref).abs().max().item():.3e} /m"
+        )
+
+    def test_dc3d_volume_analytic_grad_strain(self):
+        """OkadaSource(analytic_grad=True)'s closed-form backward vs DC3D's exact
+        spatial derivatives, over the same at-depth volume.
+
+        DC3D returns the nine fault-frame derivatives ``d u_i / d x_j`` (stored
+        column-major in ``derivatives_fault_frame``). The analytic backend's
+        gradient w.r.t. the *map-frame* observation coordinates is the map-frame
+        Jacobian ``J_map = d(ENU) / d(E, N, z)``; the two are related by the same
+        strike rotation ``C`` used for displacement (``C`` is its own inverse):
+
+            J_map = C @ J_fault @ C.
+
+        Because each output point depends only on its own observation coordinate,
+        one ``grad(out_i.sum(), coord_j)`` per (i, j) recovers the whole batched
+        Jacobian in nine backward passes. This is the only external check of the
+        analytic strain in the *interior* (z < 0) and for all nine components --
+        Okada-85 Table 2 covers three surface points and horizontal derivatives.
+        """
+        d = self._load()
+
+        x = t(d["x_obs"]).requires_grad_(True)
+        y = t(d["y_obs"]).requires_grad_(True)
+        z = t(d["z_obs"]).requires_grad_(True)
+        strike = t(d["strike"])
+
+        model = OkadaSource(poisson_ratio=d["poisson_ratio"], analytic_grad=True)
+        out = model(
+            x_obs=x, y_obs=y, z_obs=z,
+            source_x=t(d["source_x"]), source_y=t(d["source_y"]),
+            dip=t(d["dip"]), strike=strike,
+            centroid_depth=t(d["centroid_depth"]),
+            length=t(d["length"]), width=t(d["width"]),
+            disl1=t(d["disl1"]), disl2=t(d["disl2"]), disl3=t(d["disl3"]),
+        )
+
+        # J_map[..., i, j] = d(ENU_i) / d(coord_j), coords (E=x_obs, N=y_obs, z).
+        comps, coords = (out.e, out.n, out.u), (x, y, z)
+        j_map = torch.zeros(*x.shape, 3, 3, dtype=DTYPE)
+        for i, comp in enumerate(comps):
+            grads = torch.autograd.grad(comp.sum(), coords, retain_graph=True)
+            for j, g in enumerate(grads):
+                j_map[..., i, j] = g
+
+        j_map_ref = _dc3d_map_jacobian(d)
+
+        # The analytic backward returns the closed-form Okada strain, so this is
+        # a port-vs-Fortran check of the same formulas: agreement is ~1e-15 on
+        # entries up to ~1e-4 /m. atol covers the near-zero components.
+        assert torch.allclose(j_map, j_map_ref, rtol=1e-9, atol=1e-12), (
+            "analytic_grad strain disagrees with DC3D at depth: max abs diff "
+            f"{(j_map - j_map_ref).abs().max().item():.3e} /m"
+        )
+
+    # -- Source-parameter gradients ------------------------------------------
+    # The three tests below check OkadaSource(analytic_grad=True)'s gradients
+    # w.r.t. the *source* parameters (not the observation coords above) against
+    # DC3D. Two are exact identities; the rest are DC3D finite differences.
+
+    def test_dc3d_slip_gradient(self):
+        """Exact: displacement is linear in the three dislocations, so
+        d u / d disl_k is the unit-slip response G_k, which the fixture stores
+        (from DC3D with disl = e_k). Matches to forward precision (~1e-11)."""
+        d = self._load()
+        b, n = d["n_faults"], d["n_points"]
+        out, leaves = _dc3d_model_run(d, {"disl1", "disl2", "disl3"})
+        for name in ("disl1", "disl2", "disl3"):
+            got = _per_point_source_grad(out, leaves[name], b, n)
+            want = t(d["param_gradients"][name])[:, :got.shape[1]]
+            assert torch.allclose(got, want, rtol=1e-9, atol=1e-11), (
+                f"d u / d {name} disagrees with DC3D: max abs diff "
+                f"{(got - want).abs().max().item():.3e}"
+            )
+
+    def test_dc3d_source_position_gradient(self):
+        """Exact: a half-space is horizontally homogeneous, so the field depends
+        only on (x_obs - source_x, y_obs - source_y). Hence
+        d u / d source_x = -d u / d x_obs (and likewise for y) -- the negated
+        horizontal spatial strain. Matches the closed-form backward to ~1e-15."""
+        d = self._load()
+        b, n = d["n_faults"], d["n_points"]
+        out, leaves = _dc3d_model_run(d, {"source_x", "source_y"})
+        j_map_ref = _dc3d_map_jacobian(d)
+        for name, col_idx in (("source_x", 0), ("source_y", 1)):
+            got = _per_point_source_grad(out, leaves[name], b, n)
+            want = -j_map_ref[..., :got.shape[1], :, col_idx]   # -d(ENU)/d(coord)
+            assert torch.allclose(got, want, rtol=1e-9, atol=1e-12), (
+                f"d u / d {name} != -horizontal strain: max abs diff "
+                f"{(got - want).abs().max().item():.3e}"
+            )
+
+    def test_dc3d_geometry_gradient_finite_diff(self):
+        """length / width / centroid_depth gradients vs DC3D central differences
+        (stored in the fixture). These flow through autograd of the exact forward,
+        a different path from the closed-form strain. The gradient magnitudes are
+        small (~1e-5 /m), so the finite-difference truncation is negligible and
+        agreement is ~1e-11."""
+        d = self._load()
+        b, n = d["n_faults"], d["n_points"]
+        names = ("length", "width", "centroid_depth")
+        out, leaves = _dc3d_model_run(d, set(names))
+        for name in names:
+            got = _per_point_source_grad(out, leaves[name], b, n)
+            want = t(d["param_gradients"][name])[:, :got.shape[1]]
+            assert torch.allclose(got, want, rtol=1e-6, atol=1e-9), (
+                f"d u / d {name} disagrees with DC3D finite diff: max abs diff "
+                f"{(got - want).abs().max().item():.3e}"
+            )
+
+    def test_dc3d_dip_gradient_finite_diff(self):
+        """dip gradient vs a DC3D central difference. The weakest of the set:
+        analytic_grad computes dip by its *own* wide central difference, so this
+        is finite-diff vs finite-diff -- it confirms sign and scale (agreement
+        ~1e-6 on a gradient of magnitude ~0.5), not machine precision. The exact
+        dip sensitivity is covered by the gradcheck tests below."""
+        d = self._load()
+        b, n = d["n_faults"], d["n_points"]
+        out, leaves = _dc3d_model_run(d, {"dip"})
+        got = _per_point_source_grad(out, leaves["dip"], b, n)
+        want = t(d["param_gradients"]["dip"])[:, :got.shape[1]]
+        assert torch.allclose(got, want, rtol=1e-3, atol=1e-5), (
+            "d u / d dip disagrees with DC3D finite diff: max abs diff "
+            f"{(got - want).abs().max().item():.3e}"
+        )
+
+    # -- Same source-parameter gradients for the surface-only Simplified model --
+    # OkadaSourceSimple takes no z_obs, but its *source*-parameter gradients are
+    # all well-defined at the surface; only the observation z-derivative is out
+    # of reach. Checked at the fixture's z = 0 points against the same DC3D
+    # references.
+
+    def test_dc3d_surface_simplified_exact_gradients(self):
+        """OkadaSourceSimple exact source-parameter gradients at z = 0: slips
+        (unit-slip responses) and source position (negated horizontal strain)."""
+        d = self._load()
+        out, leaves, mask = _dc3d_surface_simplified_run(
+            d, {"disl1", "disl2", "disl3", "source_x", "source_y"})
+
+        for name in ("disl1", "disl2", "disl3"):
+            got = _elementwise_source_grad(out, leaves[name])
+            want = t(d["param_gradients"][name])[mask]
+            assert torch.allclose(got, want, rtol=1e-9, atol=1e-11), (
+                f"Simplified d u / d {name} disagrees with DC3D: max abs diff "
+                f"{(got - want).abs().max().item():.3e}"
+            )
+
+        j_map_ref = _dc3d_map_jacobian(d)[mask]        # [K, 3, 3]
+        for name, col_idx in (("source_x", 0), ("source_y", 1)):
+            got = _elementwise_source_grad(out, leaves[name])
+            want = -j_map_ref[..., :, col_idx]
+            assert torch.allclose(got, want, rtol=1e-9, atol=1e-12), (
+                f"Simplified d u / d {name} != -horizontal strain: max abs diff "
+                f"{(got - want).abs().max().item():.3e}"
+            )
+
+    def test_dc3d_surface_simplified_finite_diff_gradients(self):
+        """OkadaSourceSimple finite-difference source-parameter gradients at
+        z = 0: dip / length / width / centroid_depth vs the DC3D references.
+        Same tolerances as the volume model (dip is the loose one)."""
+        d = self._load()
+        tol = {
+            "length": (1e-6, 1e-9), "width": (1e-6, 1e-9),
+            "centroid_depth": (1e-6, 1e-9), "dip": (1e-3, 1e-5),
+        }
+        out, leaves, mask = _dc3d_surface_simplified_run(d, set(tol))
+        for name, (rtol, atol) in tol.items():
+            got = _elementwise_source_grad(out, leaves[name])
+            want = t(d["param_gradients"][name])[mask]
+            assert torch.allclose(got, want, rtol=rtol, atol=atol), (
+                f"Simplified d u / d {name} disagrees with DC3D: max abs diff "
+                f"{(got - want).abs().max().item():.3e}"
+            )
+
+    def test_dc3d_volume_has_at_depth_coverage(self):
+        """Guard the fixture itself: it must actually probe the volume (z < 0),
+        not just the surface, or the checks above would silently weaken."""
+        d = self._load()
+        z = t(d["z_obs"])
+        assert (z < 0).float().mean() > 0.5      # majority below surface
+        assert float(z.min()) < -1e3             # genuinely deep points
+        # And the strikes are non-trivial, so the rotation path is exercised.
+        strike = t(d["strike"]).abs()
+        assert float(strike.min()) > 0.1
+        # The derivative fixture must be present and correctly shaped.
+        deriv = t(d["derivatives_fault_frame"])
+        assert deriv.shape == (z.shape[0], z.shape[1], 9)
+        # Source-parameter gradient references, each [B, N, 3].
+        for name in ("disl1", "disl2", "disl3",
+                     "dip", "length", "width", "centroid_depth"):
+            assert t(d["param_gradients"][name]).shape == (z.shape[0], z.shape[1], 3)
+
+
 class TestAnalyticBackend:
     """OkadaSourceSimple(analytic_grad=True): exact forward + closed-form Okada-strain backward.
 
@@ -498,6 +928,110 @@ class TestAnalyticBackend:
         fd = (loss(ref, **kp) - loss(ref, **km)) / (2 * h)
         assert torch.isfinite(g).all()
         assert torch.allclose(g.sum(), fd, rtol=1e-3, atol=1e-9)
+
+    @pytest.mark.parametrize("dip_deg,rtol", [(60.0, 1e-5), (89.5, 1e-5),
+                                              (90.0, 2e-3)])
+    def test_dip_gradient_matches_richardson_reference(self, dip_deg, rtol):
+        """dip gradient converges to the *true* derivative -- not merely to the
+        module's own wide-step FD -- right through the vertical manifold.
+
+        ``test_dip_gradient_accurate_through_vertical`` compares the internal
+        1e-3 FD against a 1e-3 FD of the reference forward, which only pins the
+        gradient to the truncation scale of that step. Here the reference is an
+        O(h^4) Richardson extrapolation ``(4*D(h/2) - D(h)) / 3`` of the exact
+        forward, i.e. genuine ground truth. Off-vertical (60, 89.5 deg) the
+        forward is well-conditioned so the reference is trustworthy to ~1e-7 and
+        the tolerance is tight; at exactly 90 deg the forward itself loses
+        precision (|cos(dip)| collapses), so both the module and the reference
+        are limited to ~1e-3 and the tolerance is relaxed accordingly."""
+        ana = OkadaSourceSimple(analytic_grad=True)
+        ref = OkadaSourceSimple(smooth_grad=False)
+        base = dict(
+            x_obs=t([[3e3, -7e3, 12e3]]), y_obs=t([[5e3, 9e3, -4e3]]),
+            source_x=t([0.0]), source_y=t([0.0]),
+            strike=t([0.7]), centroid_depth=t([6e3]), length=t([8e3]),
+            width=t([4e3]), disl1=t([1.0]), disl2=t([-0.5]), disl3=t([0.2]),
+        )
+        dip0 = t([math.radians(dip_deg)])
+
+        def loss(model, dip):
+            o = model(dip=dip, **base)
+            return (o.e**2 + o.n**2 + o.u**2).sum()
+
+        dipg = dip0.clone().requires_grad_(True)
+        loss(ana, dipg).backward()
+        g = dipg.grad.sum()
+
+        h = 1e-3
+        cd = lambda step: (loss(ref, dip0 + step) - loss(ref, dip0 - step)) / (2 * step)
+        richardson = (4.0 * cd(h / 2) - cd(h)) / 3.0
+        assert torch.allclose(g, richardson, rtol=rtol, atol=1e-9)
+
+    @staticmethod
+    def _f32_base(dtype):
+        tt = lambda x: torch.as_tensor(x, dtype=dtype)
+        return dict(
+            x_obs=tt([[3e3, -7e3, 12e3]]), y_obs=tt([[5e3, 9e3, -4e3]]),
+            source_x=tt([0.0]), source_y=tt([0.0]),
+            strike=tt([0.7]), centroid_depth=tt([6e3]), length=tt([8e3]),
+            width=tt([4e3]), disl1=tt([1.0]), disl2=tt([-0.5]), disl3=tt([0.2]),
+        )
+
+    @pytest.mark.parametrize("mode", [{}, {"smooth_grad": True}],
+                             ids=["exact", "smooth_grad"])
+    @pytest.mark.parametrize("dip_deg", [60.0, 89.5, 89.99, 90.0, 90.001])
+    def test_forward_float32_accurate_near_vertical(self, dip_deg, mode):
+        """The float32 *forward* is accurate through the near-vertical band.
+
+        The general-dip ("_a") Okada terms carry ``1/cos(dip)^2`` factors whose
+        numerators vanish like ``cos(dip)^2``; evaluated naively in float32 the
+        subtraction cancels to noise and the output is wrong by *orders of
+        magnitude* for ``0 < |cos(dip)| < ~1e-2`` (rel. err up to ~7 at
+        89.99 deg). The model promotes that band to float64 internally and casts
+        back, so the float32 output tracks float64 -- and the returned dtype is
+        still float32 (the promotion is invisible).
+
+        ``smooth_grad`` shares the same numerator cancellation (its blends/safe
+        divisions guard the *denominator*, not the ``big - big`` numerator, and
+        it only swaps toward the dip=90 form for ``|cos| < ~1e-4``), so it is
+        covered too. Each mode is compared float32-vs-float64 in the *same* mode,
+        so smooth_grad's intended near-singularity perturbation cancels out and
+        only the float32 conditioning error is under test."""
+        m32 = OkadaSourceSimple(internal_dtype=torch.float32, **mode)
+        m64 = OkadaSourceSimple(internal_dtype=torch.float64, **mode)
+        dip = math.radians(dip_deg)
+        o32 = m32(dip=t([dip]).float(), **self._f32_base(torch.float32))
+        o64 = m64(dip=t([dip]), **self._f32_base(torch.float64))
+        assert o32.e.dtype == torch.float32          # promotion cast back
+        v32 = torch.cat([o32.e, o32.n, o32.u]).double()
+        v64 = torch.cat([o64.e, o64.n, o64.u])
+        assert (v32 - v64).abs().max() <= 1e-3 * v64.abs().max()
+
+    @pytest.mark.parametrize("dip_deg", [60.0, 89.5, 89.99, 90.0, 90.001])
+    def test_dip_gradient_float32_accurate_through_vertical(self, dip_deg):
+        """float32 dip gradient tracks the float64 gradient right through the
+        vertical manifold -- not merely finite there.
+
+        Both the ill-conditioned forward *and* the wide-step FD subtraction of
+        two nearly-equal losses cancel catastrophically in float32 near vertical
+        (relative error ~1e3-1e4 before the fix). The analytic backend promotes
+        the near-vertical forward and runs the whole dip FD in float64, casting
+        only the resulting gradient back, so float32 matches float64."""
+        ana32 = OkadaSourceSimple(analytic_grad=True, internal_dtype=torch.float32)
+        ana64 = OkadaSourceSimple(analytic_grad=True, internal_dtype=torch.float64)
+
+        def dip_grad(model, dtype):
+            dip = torch.as_tensor([math.radians(dip_deg)],
+                                  dtype=dtype).requires_grad_(True)
+            o = model(dip=dip, **self._f32_base(dtype))
+            (o.e**2 + o.n**2 + o.u**2).sum().backward()
+            return dip.grad
+
+        g32 = dip_grad(ana32, torch.float32)
+        g64 = dip_grad(ana64, torch.float64)
+        assert g32.dtype == torch.float32
+        assert torch.isfinite(g32).all()
+        assert torch.allclose(g32.double(), g64, rtol=1e-3, atol=1e-9)
 
     @pytest.mark.parametrize("device", DEVICES)
     def test_gradcheck_all_params(self, device):

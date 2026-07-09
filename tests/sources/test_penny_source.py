@@ -500,6 +500,64 @@ class TestFialkoReference:
         torch.testing.assert_close(out.u[0], torch.tensor(case["uz"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
 
 
+# --------------------------------------------------------------------------- #
+# External reference: penny crack over a random volume
+# --------------------------------------------------------------------------- #
+_PENNY_VOLUME_GOLDEN = (
+    Path(__file__).resolve().parent / "data" / "penny_volume_golden.json"
+)
+
+
+def _tt(x):
+    return torch.as_tensor(x, dtype=DTYPE)
+
+
+class TestPennyVolume:
+    """PennySource against the original Fialko (2001) code over a random volume.
+
+    Complements ``TestFialkoReference``'s three fixed depth ratios: the fixture
+    ``data/penny_volume_golden.json`` freezes the forward displacement for 16
+    random cracks -- random radius, depth ratio ``h = depth/radius`` and (signed)
+    pressure -- observed at 24 points each on the +East radius (``y = 0``), so the
+    horizontal field is purely radial (``ue == Ur``). Uses the same corrected
+    ``Uz`` as the fixed-point fixture. Forward only: PennySource has no
+    hand-written backward, so its gradients are covered by the gradcheck tests,
+    not here. Regenerate with ``reference/gen_penny_volume.py`` (needs MATLAB +
+    the downloaded penny/ code); the committed JSON is all this test needs. See
+    reference/README.md.
+    """
+
+    def test_penny_volume_displacement(self):
+        assert _PENNY_VOLUME_GOLDEN.is_file(), (
+            f"{_PENNY_VOLUME_GOLDEN} missing; regenerate with "
+            "reference/gen_penny_volume.py"
+        )
+        d = json.loads(_PENNY_VOLUME_GOLDEN.read_text())
+        assert d["poisson_ratio"] == 0.25 and d["shear_modulus"] == 3.0e10
+
+        x = _tt(d["x_obs"])                       # on +East radius
+        y = torch.zeros_like(x)
+        b = x.shape[0]
+        zeros = torch.zeros(b, dtype=DTYPE)
+        out = PennySource(
+            poisson_ratio=d["poisson_ratio"], shear_modulus=d["shear_modulus"],
+            nis=d["nis"],
+        )(
+            x, y, zeros, zeros,
+            depth=_tt(d["depth"]), radius=_tt(d["radius"]),
+            pressure=_tt(d["pressure"]),
+        )
+        # Radial (== +East) and vertical against the Fialko ground truth.
+        assert torch.allclose(out.e, _tt(d["ur"]), rtol=1e-6, atol=1e-12), (
+            "PennySource Ur disagrees: max abs diff "
+            f"{(out.e - _tt(d['ur'])).abs().max().item():.3e} m"
+        )
+        assert torch.allclose(out.u, _tt(d["uz"]), rtol=1e-6, atol=1e-12), (
+            "PennySource Uz disagrees: max abs diff "
+            f"{(out.u - _tt(d['uz'])).abs().max().item():.3e} m"
+        )
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))

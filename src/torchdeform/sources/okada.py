@@ -58,13 +58,14 @@ Reference: Okada, Y. (1992), "Internal deformation due to shear and tensile
 faults in a half-space", Bulletin of the Seismological Society of America,
 82(2), 1018-1040.
 """
+import copy
 import torch
 from dataclasses import dataclass
 import math
 import warnings
 from torch import Tensor
 
-from .base import SourceModel
+from .base import SourceModel, default_num_eps
 from ..core import Displacement
 
 GEOM_EPS = 1e-6   # Okada-style branch / “treat as zero” (physical tolerance, metres)
@@ -72,6 +73,19 @@ NUM_EPS  = 1e-12  # float64 denominator/log/sqrt safety
 RD_EPS   = 1e-8   # float64 UB singularity guard for r + d
 SMOOTH_EPS = 1e-8  # float64 smooth_grad reciprocal/division scale
 BLEND_EPS  = 1e-4  # smooth_grad cd~0 blend width (physical, dtype-independent)
+# Near-vertical band (|cos(dip)|) in which float32 cannot resolve Okada's exact
+# formula. Note the subtlety: Okada's closed-form cos(dip)=0 expression (our "_b"
+# branch) is exact only *at* vertical -- off vertical (89.5 deg, say) it is wrong
+# by percent (2.5% at 89.5, 5% at 89), and the physically correct value there is
+# the general-dip "_a" formula. But "_a" carries 1/cos(dip)**2 factors whose
+# numerators vanish like cos(dip)**2; in float32 that (big - big)/cos**2 cancels
+# to noise, so the *forward* is off by orders of magnitude for 0 < |cos| < ~1e-2.
+# There is no separate closed form to reach for here (Okada's dip=90 form is a
+# single point, already used exactly), only a precision requirement the general
+# formula imposes. Inside this band we therefore evaluate that same exact formula
+# in float64 and cast the result back (see _OkadaBase._compute_dtype); float64 is
+# accurate down to |cos| ~ 1e-6, which is why it is the default compute dtype.
+F32_VERTICAL_BAND = 0.1
 
 
 def _okada_grad_floors(dtype: torch.dtype) -> tuple[float, float]:
@@ -1646,6 +1660,39 @@ class _OkadaBase(SourceModel):
         # None -> dtype-appropriate floor resolved per call (see _resolve_num_eps).
         self.num_eps = num_eps
 
+    def _compute_dtype(self, dip: Tensor) -> torch.dtype:
+        """Internal compute dtype for this evaluation.
+
+        Normally ``self.internal_dtype``. A reduced-precision request is bumped
+        to ``float64`` when the batch contains a near-vertical dip
+        (``|cos(dip)| < F32_VERTICAL_BAND``): there the correct value is Okada's
+        general-dip formula, whose ``1/cos(dip)**2`` terms float32 cannot resolve
+        (see F32_VERTICAL_BAND). This is not a numerical guard or an alternative
+        formula -- it is the *same* exact formula, evaluated in the precision it
+        requires, with the result cast back to ``internal_dtype`` so the choice is
+        invisible. Well-conditioned scenes keep the fast reduced-precision path.
+        """
+        requested = self.internal_dtype
+        if requested == torch.float64:
+            return requested
+        cd = torch.cos(dip.detach().to(torch.float64)).abs()
+        if bool((cd < F32_VERTICAL_BAND).any()):
+            return torch.float64
+        return requested
+
+    def _f64_twin(self) -> "_OkadaBase":
+        """A cheap float64 copy of this model (shares nothing mutable of note).
+
+        Lets the analytic backward evaluate the wide-step dip finite difference
+        in float64. Two things need the precision near vertical: Okada's exact
+        general-dip forward (as in :meth:`_compute_dtype`) and the FD subtraction
+        of two nearly-equal losses. Both run in double; only the resulting
+        gradient is cast back to the input dtype.
+        """
+        twin = copy.copy(self)
+        twin.internal_dtype = torch.float64
+        return twin
+
     @staticmethod
     def _validate_geometry(centroid_depth, length, width, dip):
         """Reject unphysical fault dimensions before they silently misbehave.
@@ -1795,10 +1842,15 @@ class OkadaSource(_OkadaBase):
              "disl1": disl1, "disl2": disl2, "disl3": disl3},
         )
 
-        dtype = self.internal_dtype
+        requested_dtype = self.internal_dtype
+        # Near-vertical scenes need Okada's exact general-dip formula evaluated in
+        # float64 (float32 cannot resolve its 1/cos(dip)**2 terms); _compute_dtype
+        # bumps the compute dtype there and we cast back to requested_dtype on
+        # return. num_eps/floors follow the *compute* dtype.
+        dtype = self._compute_dtype(dip)
         # Numerical guards, scaled to the compute dtype (the float64 values are
         # the validated defaults; float32's ~1e-7 epsilon would swallow them).
-        num_eps = self._resolve_num_eps()
+        num_eps = self.num_eps if self.num_eps is not None else default_num_eps(dtype)
         geom_eps = GEOM_EPS            # physical "treat as zero" tolerance (metres)
         smooth_eps, rd_eps = _okada_grad_floors(dtype)
         blend_eps = BLEND_EPS
@@ -2108,7 +2160,7 @@ class OkadaSource(_OkadaBase):
 
         disp = Displacement(e=ue, n=un, u=uu)
         if not return_strain:
-            return disp
+            return disp if dtype == requested_dtype else disp.to(requested_dtype)
 
         # ------------------------------------------------------------------
         # Analytic Jacobian d(ue, un, uu) / d(x_obs, y_obs, z_obs) via the full
@@ -2184,6 +2236,10 @@ class OkadaSource(_OkadaBase):
             "y_obs": jy,
             "z_obs": jz,
         }
+        if dtype != requested_dtype:
+            disp = disp.to(requested_dtype)
+            strain = {k: tuple(t.to(requested_dtype) for t in v)
+                      for k, v in strain.items()}
         return disp, strain
 
 
@@ -2246,14 +2302,24 @@ class _OkadaAnalyticFn(torch.autograd.Function):
             torch.autograd.grad(loss, geo)
 
         # dip: wide central difference of the exact forward (see _OkadaBase docs).
+        # In a reduced precision the FD runs in float64: near vertical Okada's
+        # general-dip forward needs the precision (as in _compute_dtype), and so
+        # does the FD subtraction of two nearly-equal losses. Only the resulting
+        # gradient is cast back to dip's dtype.
+        fd_ev, cast = (ctx.model._f64_twin()._evaluate, lambda u: u.to(torch.float64)) \
+            if ctx.model.internal_dtype != torch.float64 else (ev, lambda u: u)
+        gef, gnf, guf = cast(ge), cast(gn), cast(gu)
+
         def _dip_loss(dip_value):
-            o = ev(x_obs, y_obs, z_obs, source_x, source_y, dip_value, strike,
-                   centroid_depth, length, width, disl1, disl2, disl3)
-            return (o.e * ge + o.n * gn + o.u * gu).sum(dim=1)
+            o = fd_ev(cast(x_obs), cast(y_obs), cast(z_obs), cast(source_x),
+                      cast(source_y), dip_value, cast(strike), cast(centroid_depth),
+                      cast(length), cast(width), cast(disl1), cast(disl2), cast(disl3))
+            return (o.e * gef + o.n * gnf + o.u * guf).sum(dim=1)
 
         h = 1e-3
+        dip_c = cast(dip)
         with torch.no_grad():
-            g_dip = (_dip_loss(dip + h) - _dip_loss(dip - h)) / (2.0 * h)
+            g_dip = ((_dip_loss(dip_c + h) - _dip_loss(dip_c - h)) / (2.0 * h)).to(dip.dtype)
 
         # order: model, x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
         #        centroid_depth, length, width, disl1, disl2, disl3
@@ -2349,10 +2415,15 @@ class OkadaSourceSimple(_OkadaBase):
              "disl1": disl1, "disl2": disl2, "disl3": disl3},
         )
 
-        dtype = self.internal_dtype
+        requested_dtype = self.internal_dtype
+        # Near-vertical scenes need Okada's exact general-dip formula evaluated in
+        # float64 (float32 cannot resolve its 1/cos(dip)**2 terms); _compute_dtype
+        # bumps the compute dtype there and we cast back to requested_dtype on
+        # return. num_eps/floors follow the *compute* dtype.
+        dtype = self._compute_dtype(dip)
         # Numerical guards, scaled to the compute dtype (the float64 values are
         # the validated defaults; float32's ~1e-7 epsilon would swallow them).
-        num_eps = self._resolve_num_eps()
+        num_eps = self.num_eps if self.num_eps is not None else default_num_eps(dtype)
         geom_eps = GEOM_EPS            # physical "treat as zero" tolerance (metres)
         smooth_eps, rd_eps = _okada_grad_floors(dtype)
         blend_eps = BLEND_EPS
@@ -2395,7 +2466,7 @@ class OkadaSourceSimple(_OkadaBase):
                 dtype=x.dtype,
             ),
             dip_rad=dip,
-            internal_dtype=self.internal_dtype,
+            internal_dtype=dtype,
             training_safe=self.smooth_grad,
             geom_eps=geom_eps,
         )
@@ -2477,7 +2548,7 @@ class OkadaSourceSimple(_OkadaBase):
             cd=c0.cd[:, None, None, None],
             kxi=kxi,
             ket=ket,
-            internal_dtype=self.internal_dtype,
+            internal_dtype=dtype,
             eps=num_eps,
             training_safe=self.smooth_grad,
             smooth_eps=smooth_eps,
@@ -2527,7 +2598,7 @@ class OkadaSourceSimple(_OkadaBase):
 
         disp = Displacement(e=ue, n=un, u=uu)
         if not return_strain:
-            return disp
+            return disp if dtype == requested_dtype else disp.to(requested_dtype)
 
         # ------------------------------------------------------------------
         # Analytic Jacobian of (ue, un, uu) w.r.t. the inputs that enter the
@@ -2611,6 +2682,10 @@ class OkadaSourceSimple(_OkadaBase):
             "depth": _zero_sing(depth_j),
             "strike": _zero_sing(strike_j),
         }
+        if dtype != requested_dtype:
+            disp = disp.to(requested_dtype)
+            strain = {k: tuple(t.to(requested_dtype) for t in v)
+                      for k, v in strain.items()}
         return disp, strain
 
 
@@ -2689,15 +2764,25 @@ class _OkadaSimpleAnalyticFn(torch.autograd.Function):
         # samples in the well-conditioned region, giving a derivative accurate to
         # ~5 significant figures everywhere -- including exactly dip = 90 deg --
         # while remaining tight enough to match autograd off-vertical (the field
-        # is smooth in dip, so truncation error is negligible).
+        # is smooth in dip, so truncation error is negligible).  In a reduced
+        # precision the whole FD runs in float64: near vertical Okada's general-dip
+        # forward needs the precision (as in _compute_dtype), and so does the FD
+        # subtraction of two nearly-equal losses.  Only the resulting gradient is
+        # cast back to dip's dtype.
+        fd_ev, cast = (ctx.model._f64_twin()._evaluate, lambda u: u.to(torch.float64)) \
+            if ctx.model.internal_dtype != torch.float64 else (ev, lambda u: u)
+        gef, gnf, guf = cast(ge), cast(gn), cast(gu)
+
         def _dip_loss(dip_value):
-            o = ev(x_obs, y_obs, source_x, source_y, dip_value, strike,
-                   centroid_depth, length, width, disl1, disl2, disl3)
-            return (o.e * ge + o.n * gn + o.u * gu).sum(dim=1)   # [B]
+            o = fd_ev(cast(x_obs), cast(y_obs), cast(source_x), cast(source_y),
+                      dip_value, cast(strike), cast(centroid_depth), cast(length),
+                      cast(width), cast(disl1), cast(disl2), cast(disl3))
+            return (o.e * gef + o.n * gnf + o.u * guf).sum(dim=1)   # [B]
 
         h = 1e-3
+        dip_c = cast(dip)
         with torch.no_grad():
-            g_dip = (_dip_loss(dip + h) - _dip_loss(dip - h)) / (2.0 * h)
+            g_dip = ((_dip_loss(dip_c + h) - _dip_loss(dip_c - h)) / (2.0 * h)).to(dip.dtype)
 
         # order: model, x_obs, y_obs, source_x, source_y, dip, strike,
         #        centroid_depth, length, width, disl1, disl2, disl3

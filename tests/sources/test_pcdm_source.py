@@ -323,3 +323,56 @@ class TestNikkhooReference:
         torch.testing.assert_close(out.e[0], torch.tensor(row["ue"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
         torch.testing.assert_close(out.n[0], torch.tensor(row["un"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
         torch.testing.assert_close(out.u[0], torch.tensor(row["uv"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
+
+
+# --------------------------------------------------------------------------- #
+# External reference: pCDM over a random parameter volume
+# --------------------------------------------------------------------------- #
+_PCDM_VOLUME_GOLDEN = (
+    Path(__file__).resolve().parent / "data" / "pcdm_volume_golden.json"
+)
+
+
+def _t(x):
+    return torch.as_tensor(x, dtype=DTYPE)
+
+
+class TestPCDMVolume:
+    """PCDMSource against the original Nikkhoo (2017) MATLAB ``pCDM.m`` over a
+    random *parameter* volume.
+
+    Complements ``TestNikkhooReference``'s three hand-picked orientations: the
+    fixture ``data/pcdm_volume_golden.json`` freezes ``pCDM.m``'s forward ENU for
+    16 random buried pCDMs -- random depth, full 3-axis orientation, and
+    anisotropic (same-sign) potencies -- observed at 24 surface points each.
+    Forward only: PCDMSource has no hand-written backward, so its gradients are
+    covered by ``test_gradcheck`` (autograd vs. finite differences), not here.
+    Regenerate with ``reference/gen_pcdm_volume.py`` (needs MATLAB + vendored
+    nikkhoo/); the committed JSON is all this test needs. See reference/README.md.
+    """
+
+    def test_pcdm_volume_displacement(self):
+        assert _PCDM_VOLUME_GOLDEN.is_file(), (
+            f"{_PCDM_VOLUME_GOLDEN} missing; regenerate with "
+            "reference/gen_pcdm_volume.py"
+        )
+        d = json.loads(_PCDM_VOLUME_GOLDEN.read_text())
+        assert d["poisson_ratio"] == 0.25   # must match PCDMSource default nu
+
+        out = PCDMSource()(
+            _t(d["x_obs"]), _t(d["y_obs"]),
+            source_x=_t(d["source_x"]), source_y=_t(d["source_y"]),
+            depth=_t(d["depth"]),
+            omega_x=_t(d["omega_x"]), omega_y=_t(d["omega_y"]),
+            omega_z=_t(d["omega_z"]),
+            dv_x=_t(d["dv_x"]), dv_y=_t(d["dv_y"]), dv_z=_t(d["dv_z"]),
+        )
+        got = torch.stack([out.e, out.n, out.u], dim=-1)   # [B, N, 3] ENU
+        want = _t(d["u_enu"])
+
+        # Both sides float64; the port reproduces pCDM.m to ~1e-13 relative. atol
+        # covers far-field points where |u| shrinks to noise.
+        assert torch.allclose(got, want, rtol=1e-6, atol=1e-12), (
+            "PCDMSource disagrees with pCDM.m: max abs diff "
+            f"{(got - want).abs().max().item():.3e} m"
+        )

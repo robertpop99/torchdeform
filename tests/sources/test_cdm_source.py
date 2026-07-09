@@ -358,3 +358,54 @@ class TestNikkhooReference:
         torch.testing.assert_close(out.e[0], torch.tensor(row["ue"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
         torch.testing.assert_close(out.n[0], torch.tensor(row["un"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
         torch.testing.assert_close(out.u[0], torch.tensor(row["uv"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
+
+
+# --------------------------------------------------------------------------- #
+# External reference: CDM over a random parameter volume
+# --------------------------------------------------------------------------- #
+_CDM_VOLUME_GOLDEN = (
+    Path(__file__).resolve().parent / "data" / "cdm_volume_golden.json"
+)
+
+
+def _tt(x):
+    return torch.as_tensor(x, dtype=DTYPE)
+
+
+class TestCDMVolume:
+    """CDMSource against the original Nikkhoo (2017) MATLAB ``CDM.m`` over a
+    random *parameter* volume.
+
+    Complements ``TestNikkhooReference``'s two hand-picked orientations: the
+    fixture ``data/cdm_volume_golden.json`` freezes ``CDM.m``'s forward ENU for
+    16 random buried CDMs -- random depth, full 3-axis orientation, semi-axes and
+    (signed) opening -- observed at 24 surface points each. Forward only:
+    CDMSource has no hand-written backward, so its gradients are covered by
+    ``test_gradcheck`` (autograd vs. finite differences), not here. Regenerate
+    with ``reference/gen_cdm_volume.py`` (needs MATLAB + vendored nikkhoo/); the
+    committed JSON is all this test needs. See reference/README.md.
+    """
+
+    def test_cdm_volume_displacement(self):
+        assert _CDM_VOLUME_GOLDEN.is_file(), (
+            f"{_CDM_VOLUME_GOLDEN} missing; regenerate with "
+            "reference/gen_cdm_volume.py"
+        )
+        d = json.loads(_CDM_VOLUME_GOLDEN.read_text())
+        assert d["poisson_ratio"] == 0.25   # must match CDMSource default nu
+
+        out = CDMSource()(
+            _tt(d["x_obs"]), _tt(d["y_obs"]),
+            source_x=_tt(d["source_x"]), source_y=_tt(d["source_y"]),
+            depth=_tt(d["depth"]),
+            omega_x=_tt(d["omega_x"]), omega_y=_tt(d["omega_y"]),
+            omega_z=_tt(d["omega_z"]),
+            a_x=_tt(d["a_x"]), a_y=_tt(d["a_y"]), a_z=_tt(d["a_z"]),
+            opening=_tt(d["opening"]),
+        )
+        got = torch.stack([out.e, out.n, out.u], dim=-1)   # [B, N, 3] ENU
+        want = _tt(d["u_enu"])
+        assert torch.allclose(got, want, rtol=1e-6, atol=1e-12), (
+            "CDMSource disagrees with CDM.m: max abs diff "
+            f"{(got - want).abs().max().item():.3e} m"
+        )

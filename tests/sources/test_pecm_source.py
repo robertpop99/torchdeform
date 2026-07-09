@@ -377,3 +377,57 @@ class TestNikkhooReference:
         torch.testing.assert_close(out.e[0], torch.tensor(row["ue"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
         torch.testing.assert_close(out.n[0], torch.tensor(row["un"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
         torch.testing.assert_close(out.u[0], torch.tensor(row["uv"], dtype=DTYPE), rtol=1e-6, atol=1e-12)
+
+
+# --------------------------------------------------------------------------- #
+# External reference: pECM over a random parameter volume
+# --------------------------------------------------------------------------- #
+_PECM_VOLUME_GOLDEN = (
+    Path(__file__).resolve().parent / "data" / "pecm_volume_golden.json"
+)
+
+
+def _tt(x):
+    return torch.as_tensor(x, dtype=DTYPE)
+
+
+class TestPECMVolume:
+    """PECMSource against the original Nikkhoo (2017) MATLAB ``pECM.m`` over a
+    random *parameter* volume.
+
+    Complements ``TestNikkhooReference``'s two hand-picked orientations: the
+    fixture ``data/pecm_volume_golden.json`` freezes ``pECM.m``'s forward ENU for
+    16 random buried point cavities -- random depth, full 3-axis orientation,
+    semi-axes and (signed) pressure -- observed at 24 surface points each.
+    Forward only: PECMSource has no hand-written backward, so its gradients are
+    covered by ``test_gradcheck`` (autograd vs. finite differences), not here.
+    Regenerate with ``reference/gen_pecm_volume.py`` (needs MATLAB + vendored
+    nikkhoo/); the committed JSON is all this test needs. See reference/README.md.
+    """
+
+    def test_pecm_volume_displacement(self):
+        assert _PECM_VOLUME_GOLDEN.is_file(), (
+            f"{_PECM_VOLUME_GOLDEN} missing; regenerate with "
+            "reference/gen_pecm_volume.py"
+        )
+        d = json.loads(_PECM_VOLUME_GOLDEN.read_text())
+        assert d["poisson_ratio"] == 0.25    # material must match the fixture
+        assert d["shear_modulus"] == 3.0e10
+
+        out = PECMSource(
+            poisson_ratio=d["poisson_ratio"], shear_modulus=d["shear_modulus"],
+        )(
+            _tt(d["x_obs"]), _tt(d["y_obs"]),
+            source_x=_tt(d["source_x"]), source_y=_tt(d["source_y"]),
+            depth=_tt(d["depth"]),
+            omega_x=_tt(d["omega_x"]), omega_y=_tt(d["omega_y"]),
+            omega_z=_tt(d["omega_z"]),
+            a_x=_tt(d["a_x"]), a_y=_tt(d["a_y"]), a_z=_tt(d["a_z"]),
+            pressure=_tt(d["pressure"]),
+        )
+        got = torch.stack([out.e, out.n, out.u], dim=-1)   # [B, N, 3] ENU
+        want = _tt(d["u_enu"])
+        assert torch.allclose(got, want, rtol=1e-6, atol=1e-12), (
+            "PECMSource disagrees with pECM.m: max abs diff "
+            f"{(got - want).abs().max().item():.3e} m"
+        )

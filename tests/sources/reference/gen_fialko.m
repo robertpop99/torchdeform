@@ -6,24 +6,27 @@
 %   applications to volcano geodesy, GJI 146(1), 181-190.
 %
 % Fialko's penny-crack code is NOT redistributed in this repo (it carries no
-% explicit redistribution license). Download it yourself into a local `penny/`
-% subdirectory next to this script before running -- e.g. from the GeodMod
-% mirror:
-%   https://github.com/falkamelung/GeodMod/tree/master/deformation_sources/penny
-% The needed files are: Q.m Qr.m RtWt.m fpkernel.m fred.m fredholm.m intgr.m
-% (`penny/` is git-ignored). Then:
+% explicit redistribution license). Download the ORIGINAL into a local `penny/`
+% subdirectory next to this script before running -- e.g.:
+%   wget http://igppweb.ucsd.edu/~fialko/Assets/Software/penny.tar.gz
+% Use the original, NOT the GeodMod mirror
+% (https://github.com/falkamelung/GeodMod/tree/master/deformation_sources/penny):
+% the two use different array-shape conventions (see below). (`penny/` is
+% git-ignored.) Then:
 %
 % Run from this directory:  matlab -batch "run('gen_fialko.m')"
 % Writes ../data/fialko_golden.json
 %
-% IMPORTANT -- bug in Fialko's intgr.m (as mirrored by GeodMod):
-%   The active (vectorized "speedup") Uz line in penny/intgr.m is WRONG: it
-%   factors `fi` over the psi terms,
-%       Uz = sum(Wt2.*fi2.*(Qf1 + h*Qf2 + psi2.*Qf1./tt - Qf3))
-%   The correct expression (the commented original loop in the same file) is
-%       Uz = sum(Wt.*( fi.*(Q1+h*Q2) + psi.*(Q1./t - Q3) ))
+% IMPORTANT -- scalar-vs-vectorized Q, and the GeodMod intgr.m bug:
+%   The original penny code's Q(h,t,r,n) takes a *scalar* radius r (with t the
+%   node vector), and its intgr.m already carries the correct per-radius Uz line
+%       Uz = sum(Wt.*( fi.*(Q1+h*Q2) + psi.*(Q1./t - Q3) ))       % CORRECT
+%   The GeodMod mirror instead vectorizes Q over the radii and its "speedup" Uz
+%   line is WRONG (it factors `fi` over the psi terms):
+%       Uz = sum(Wt2.*fi2.*(Qf1 + h*Qf2 + psi2.*Qf1./tt - Qf3))   % WRONG
 %   Radial (Ur) is unaffected. torchdeform's penny.py implements the correct
-%   formula, so we recompute Uz correctly below rather than trusting intgr's Uz.
+%   formula, so we recompute Uz with the per-radius loop below (matching the
+%   original scalar Q) rather than trusting intgr's Uz.
 %
 % Conventions match torchdeform PennySource: the dimensionless solution depends
 % only on h = depth/radius; nu and mu enter purely through the scale factor
@@ -58,16 +61,18 @@ for k = 1:numel(hs)
     [fi,psi,t,Wt] = fredholm(h, nis, eps);
     [~,Ur] = intgr(r, fi, psi, h, Wt, t);    % Ur is correct in intgr.m
 
-    % Uz: use the ORIGINAL Fialko loop formula (see header note).
-    rr  = repmat(reshape(r,numel(r),1), size(t));
-    tt  = repmat(t,  numel(r),1);
-    Wt2 = repmat(Wt, numel(r),1);
-    fi2 = repmat(fi, numel(r),1);
-    psi2= repmat(psi,numel(r),1);
-    Qf  = Q(h,tt,rr,1:8);
-    Uz  = sum(Wt2.*( fi2.*(Qf(:,:,1) + h*Qf(:,:,2)) ...
-                   + psi2.*(Qf(:,:,1)./tt - Qf(:,:,3)) ), 2);
-    Uz  = reshape(Uz, size(r));
+    % Uz: use the ORIGINAL Fialko loop formula (see header note). The original
+    % penny code's Q(h,t,r,n) takes a *scalar* radius r with the node vector t,
+    % so evaluate per radius (this is intgr.m's own correct Uz line, recomputed
+    % here so the result is independent of which intgr.m variant is installed).
+    Uz = zeros(size(r));
+    for j = 1:numel(r)
+        rj = r(j);
+        Q1 = Q(h, t, rj, 1);
+        Q2 = Q(h, t, rj, 2);
+        Q3 = Q(h, t, rj, 3);
+        Uz(j) = sum(Wt.*( fi.*(Q1 + h*Q2) + psi.*(Q1./t - Q3) ));
+    end
 
     cases{end+1} = struct('h',h,'depth',h*a, ...
                           'uz_dimless',Uz(:)','ur_dimless',Ur(:)', ...
