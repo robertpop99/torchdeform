@@ -1,4 +1,11 @@
 from .dem import synthetic_dem
+from .real_dem import (
+    DEMPatchSampler,
+    load_dem_raster,
+    read_geotiff_bytes,
+    copernicus_glo30_url,
+    download_copernicus_glo30,
+)
 from .priors import (
     Prior,
     UniformPrior,
@@ -71,6 +78,11 @@ from .datasets import (
 
 __all__ = [
     "synthetic_dem",
+    "DEMPatchSampler",
+    "load_dem_raster",
+    "read_geotiff_bytes",
+    "copernicus_glo30_url",
+    "download_copernicus_glo30",
     "Prior",
     "UniformPrior",
     "LogUniformPrior",

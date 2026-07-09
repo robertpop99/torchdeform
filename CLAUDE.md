@@ -72,7 +72,15 @@ optimisation/inversion loop.
   `covariance_vs_distance`, `fit_exponential_covariance`.
 
 - **`simulation/`** — randomised scene generation for datasets:
-  - `dem.py` → `synthetic_dem` (fractal DEMs)
+  - `dem.py` → `synthetic_dem` (procedural terrain; `method="ridged"` realistic
+    multifractal is the default, `method="fbm"` the fast fractal surface;
+    `fold`/`positive` for non-negative referencing).
+  - `real_dem.py` → `DEMPatchSampler` (random `[B,rows,cols]` patches from real
+    elevation rasters; a drop-in `(batch, generator)->dem` source for
+    `AtmosphereGenerator(dem=...)`; build via `.from_files`, or `.from_copernicus`
+    which fetches random GLO-30 land tiles into memory). Helpers: `load_dem_raster`,
+    `read_geotiff_bytes`, `copernicus_glo30_url`, `download_copernicus_glo30` (to
+    disk). GeoTIFF reading needs optional `rasterio`; `.npy`/`.npz` need only numpy.
   - `priors.py` → `Prior` family (`UniformPrior`, `LogUniformPrior`,
     `SignedLogUniformPrior`, `ConstantPrior`, `MultimodalPrior`, `make_prior`),
     per-source prior bundles (`MogiPrior`, `OkadaPrior`, `PennyPrior`,

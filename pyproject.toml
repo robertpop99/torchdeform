@@ -22,6 +22,14 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
+[project.optional-dependencies]
+# Real-DEM loading (torchdeform.simulation.real_dem): GeoTIFF I/O needs rasterio,
+# which brings numpy; numpy alone also covers the .npy/.npz raster paths.
+dem = [
+    "numpy",
+    "rasterio",
+]
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

@@ -79,20 +79,23 @@ class TestShapeAndAmplitude:
 # Roughness
 # --------------------------------------------------------------------------- #
 class TestRoughness:
+    # roughness knobs (hurst/beta/PSD slope) are specific to the fBm surface
     @pytest.mark.parametrize("hurst", [0.2, 0.5, 0.8])
     def test_psd_slope_tracks_hurst(self, hurst):
         torch.manual_seed(0)
-        dem = synthetic_dem(64, 128, 128, relief=300.0, hurst=hurst, generator=_gen())
+        dem = synthetic_dem(64, 128, 128, relief=300.0, hurst=hurst,
+                            method="fbm", generator=_gen())
         assert abs(_psd_slope(dem) - (-(2 * hurst + 2))) < 0.2
 
     def test_smoother_with_higher_hurst(self):
         def ac(h):
-            return _lag1(synthetic_dem(48, 128, 128, hurst=h, generator=_gen(1)))
+            return _lag1(synthetic_dem(48, 128, 128, hurst=h,
+                                       method="fbm", generator=_gen(1)))
         assert ac(0.2) < ac(0.5) < ac(0.8)
 
     def test_beta_overrides_hurst(self):
-        a = synthetic_dem(2, 64, 64, beta=2.5, hurst=0.1, generator=_gen(3))
-        b = synthetic_dem(2, 64, 64, beta=2.5, hurst=0.9, generator=_gen(3))
+        a = synthetic_dem(2, 64, 64, beta=2.5, hurst=0.1, method="fbm", generator=_gen(3))
+        b = synthetic_dem(2, 64, 64, beta=2.5, hurst=0.9, method="fbm", generator=_gen(3))
         torch.testing.assert_close(a, b)
 
 
@@ -119,6 +122,21 @@ class TestRampAndPositive:
                             base_elevation=0.0, generator=_gen())
         assert dem.min().item() >= 0.0
 
+    def test_fold_min_is_base_and_nonnegative(self):
+        dem = synthetic_dem(3, 64, 64, relief=400.0, fold=True,
+                            base_elevation=200.0, generator=_gen())
+        torch.testing.assert_close(dem.amin(dim=(-2, -1)),
+                                   torch.full((3,), 200.0, dtype=DTYPE),
+                                   rtol=0, atol=1e-6)
+        assert dem.min().item() >= 200.0 - 1e-9
+
+    def test_fold_differs_from_shift(self):
+        # abs-fold is a different shape than a plain min-shift for the same field
+        kw = dict(relief=400.0, base_elevation=0.0)
+        shifted = synthetic_dem(2, 64, 64, positive=True, generator=_gen(9), **kw)
+        folded = synthetic_dem(2, 64, 64, fold=True, generator=_gen(9), **kw)
+        assert not torch.allclose(shifted, folded)
+
 
 # --------------------------------------------------------------------------- #
 # Determinism / dtype / device
@@ -143,6 +161,63 @@ class TestDeterminismDtypeDevice:
         dem = synthetic_dem(4, 64, 64, relief=300.0, ramp=200.0,
                             positive=True, base_elevation=100.0, device="cuda")
         assert dem.device.type == "cuda" and torch.isfinite(dem).all()
+
+
+# --------------------------------------------------------------------------- #
+# Realistic ("ridged") terrain
+# --------------------------------------------------------------------------- #
+class TestRidgedMethod:
+    def test_shape_and_finite(self):
+        dem = synthetic_dem(3, 96, 128, method="ridged", warp=0.2,
+                            erosion_iters=30, generator=_gen())
+        assert dem.shape == (3, 96, 128) and torch.isfinite(dem).all()
+
+    def test_shares_output_semantics(self):
+        # relief is still the exact per-image std, base_elevation the mean
+        dem = synthetic_dem(4, 96, 96, relief=250.0, base_elevation=800.0,
+                            method="ridged", warp=0.2, erosion_iters=20,
+                            generator=_gen())
+        torch.testing.assert_close(dem.std(dim=(-2, -1)),
+                                   torch.full((4,), 250.0, dtype=DTYPE),
+                                   rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(dem.mean(dim=(-2, -1)),
+                                   torch.full((4,), 800.0, dtype=DTYPE),
+                                   rtol=0, atol=1e-6)
+
+    def test_deterministic(self):
+        kw = dict(method="ridged", warp=0.2, erosion_iters=25)
+        torch.testing.assert_close(synthetic_dem(2, 96, 96, generator=_gen(4), **kw),
+                                   synthetic_dem(2, 96, 96, generator=_gen(4), **kw))
+
+    def test_asymmetric_unlike_fbm(self):
+        # sharp peaks + broad valleys make ridged terrain skewed, whereas an fBm
+        # surface is (near-)symmetric Gaussian -> ~zero skew. Skewness is the
+        # structural fingerprint fBm lacks.
+        def skew(dem):
+            f = dem - dem.mean(dim=(-2, -1), keepdim=True)
+            s = f.std(dim=(-2, -1), keepdim=True)
+            return ((f / s) ** 3).mean(dim=(-2, -1)).abs().mean().item()
+        r = skew(synthetic_dem(16, 128, 128, method="ridged", warp=0.2,
+                               generator=_gen(2)))
+        f = skew(synthetic_dem(16, 128, 128, method="fbm", generator=_gen(2)))
+        assert r > 0.3 and r > f
+
+    def test_erosion_smooths(self):
+        # thermal erosion rounds ridges -> smoother (higher lag-1 autocorr)
+        rough = _lag1(synthetic_dem(8, 128, 128, method="ridged", warp=0.2,
+                                    erosion_iters=0, generator=_gen(5)))
+        eroded = _lag1(synthetic_dem(8, 128, 128, method="ridged", warp=0.2,
+                                     erosion_iters=80, generator=_gen(5)))
+        assert eroded > rough
+
+    def test_bad_method_raises(self):
+        with pytest.raises(ValueError):
+            synthetic_dem(1, 32, 32, method="nope", generator=_gen())
+
+    def test_ridged_is_the_default(self):
+        torch.testing.assert_close(synthetic_dem(2, 64, 64, generator=_gen(11)),
+                                   synthetic_dem(2, 64, 64, method="ridged",
+                                                 generator=_gen(11)))
 
 
 # --------------------------------------------------------------------------- #
