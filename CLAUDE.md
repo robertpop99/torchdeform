@@ -79,8 +79,12 @@ optimisation/inversion loop.
     elevation rasters; a drop-in `(batch, generator)->dem` source for
     `AtmosphereGenerator(dem=...)`; build via `.from_files`, or `.from_copernicus`
     which fetches random GLO-30 land tiles into memory). Helpers: `load_dem_raster`,
-    `read_geotiff_bytes`, `copernicus_glo30_url`, `download_copernicus_glo30` (to
-    disk). GeoTIFF reading needs optional `rasterio`; `.npy`/`.npz` need only numpy.
+    `read_geotiff_bytes`, `copernicus_glo30_url`, `download_copernicus_glo30` (one
+    tile to disk), `download_copernicus_glo30_tiles` (many to disk — explicit
+    `[(lat,lon),…]` list or `n` random land tiles; ocean 404s skipped in both —
+    silently for random draws, with a `warnings` message for explicit tiles).
+    All download/URL helpers take a `url_for` override for other tile sources.
+    GeoTIFF reading needs optional `rasterio`; `.npy`/`.npz` need only numpy.
   - `priors.py` → `Prior` family (`UniformPrior`, `LogUniformPrior`,
     `SignedLogUniformPrior`, `ConstantPrior`, `MultimodalPrior`, `make_prior`),
     per-source prior bundles (`MogiPrior`, `OkadaPrior`, `PennyPrior`,

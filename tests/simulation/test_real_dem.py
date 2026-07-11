@@ -13,6 +13,9 @@ Run with::
 
     pytest test_real_dem.py -v
 """
+import warnings
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -295,6 +298,74 @@ class TestCopernicus:
         with pytest.raises(RuntimeError):
             DEMPatchSampler.from_copernicus(n=1, seed=1, patch_rows=32, patch_cols=32,
                                             max_tile_tries=5)
+
+    def test_from_copernicus_explicit_ocean_warns_and_skips(self, monkeypatch):
+        pytest.importorskip("rasterio")
+        data = _geotiff_bytes(_ramp_raster(300, 300).numpy())
+
+        def fake_fetch(url):                              # "ocean" in the west
+            if "_W" in url:
+                raise FileNotFoundError(url)
+            return data
+        monkeypatch.setattr(real_dem, "_fetch_bytes", fake_fetch)
+        with pytest.warns(UserWarning, match="skipping tile lat=50, lon=-20"):
+            s = DEMPatchSampler.from_copernicus(tiles=[(50, 14), (50, -20)],
+                                                patch_rows=48, patch_cols=48)
+        assert len(s.rasters) == 1                        # only the land tile kept
+
+
+# --------------------------------------------------------------------------- #
+# Copernicus GLO-30 to disk -- the download orchestration is network-free once
+# the per-tile fetch (``download_copernicus_glo30`` / ``urlretrieve``) is faked.
+# --------------------------------------------------------------------------- #
+class TestDownloadToDisk:
+    def _fake_per_tile(self, ocean):
+        """A stand-in ``download_copernicus_glo30`` that skips ``ocean(lat, lon)``."""
+        def fake(lat, lon, *, cache_dir, overwrite, url_for):
+            if ocean(lat, lon):
+                raise FileNotFoundError("ocean")
+            return Path(f"tile_{lat}_{lon}.tif")
+        return fake
+
+    def test_explicit_list_skips_and_warns(self, monkeypatch):
+        monkeypatch.setattr(real_dem, "download_copernicus_glo30",
+                            self._fake_per_tile(lambda la, lo: lo < 0))
+        with pytest.warns(UserWarning, match="skipping tile lat=10, lon=-20"):
+            paths = real_dem.download_copernicus_glo30_tiles(
+                [(50, 14), (10, -20), (51, 15)])
+        assert [p.name for p in paths] == ["tile_50_14.tif", "tile_51_15.tif"]
+
+    def test_random_reproducible_and_silent(self, monkeypatch):
+        monkeypatch.setattr(real_dem, "download_copernicus_glo30",
+                            self._fake_per_tile(lambda la, lo: la < 0))  # south = ocean
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")                # random skips must NOT warn
+            a = real_dem.download_copernicus_glo30_tiles(
+                n=3, seed=7, bounds=(-40.0, 40.0, -40.0, 40.0))
+            b = real_dem.download_copernicus_glo30_tiles(
+                n=3, seed=7, bounds=(-40.0, 40.0, -40.0, 40.0))
+        assert len(a) == 3 and [p.name for p in a] == [p.name for p in b]
+
+    def test_exhausted_raises(self, monkeypatch):
+        monkeypatch.setattr(real_dem, "download_copernicus_glo30",
+                            self._fake_per_tile(lambda la, lo: True))   # all ocean
+        with pytest.raises(RuntimeError):
+            real_dem.download_copernicus_glo30_tiles(n=1, seed=1, max_tile_tries=5)
+
+    def test_url_for_override_and_dest_name(self, monkeypatch, tmp_path):
+        import urllib.request
+        seen = {}
+
+        def fake_urlretrieve(url, dest):
+            seen["url"] = url
+            Path(dest).write_bytes(b"data")
+        monkeypatch.setattr(urllib.request, "urlretrieve", fake_urlretrieve)
+
+        p = real_dem.download_copernicus_glo30(
+            12, 34, cache_dir=tmp_path,
+            url_for=lambda la, lo: f"https://example.com/tile_{int(la)}_{int(lo)}.tif")
+        assert seen["url"] == "https://example.com/tile_12_34.tif"
+        assert p.name == "tile_12_34.tif" and p.exists()
 
 
 if __name__ == "__main__":

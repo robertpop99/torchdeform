@@ -1,8 +1,33 @@
 # External cross-validation tests
 
-Manual-only tests that check torchdeform against **independent third-party
-libraries**. They are *not* part of CI — they need extra dependencies and are
-meant to be run by hand for confidence, not on every push.
+Manual-only tests that reach outside the codebase — to **independent third-party
+libraries** or to **live network services**. They are *not* part of CI: they
+need extra dependencies and/or network access and are meant to be run by hand
+for confidence, not on every push. Each module is gated behind its own
+`RUN_*=1` env var, so a plain `pytest` / CI run skips them all.
+
+## `test_copernicus_download.py`
+
+Live download smoke test for the Copernicus GLO-30 helpers in
+`torchdeform.simulation.real_dem`. Actually fetches tiles from the public AWS
+bucket `copernicus-dem-30m` and decodes them, so it needs **network access** and
+the optional `rasterio` dependency. This is the one thing the CI mocks
+(`tests/simulation/test_real_dem.py`, which monkeypatch the fetch) cannot check:
+that the real tile-URL scheme, the bucket, and rasterio's COG decoding still line
+up.
+
+Run it:
+
+```bash
+RUN_COPERNICUS_TESTS=1 pytest tests/external/test_copernicus_download.py -v -s
+```
+
+Without `RUN_COPERNICUS_TESTS=1` the module skips. Covers: a known land tile
+downloading to disk, a mid-ocean point raising `FileNotFoundError`, the bulk
+`download_copernicus_glo30_tiles` skipping ocean tiles in an explicit list and in
+random-draw mode, and the in-memory `DEMPatchSampler.from_copernicus` path. Each
+GLO-30 tile is tens of MB; the suite keeps the tile count small and downloads
+into a throwaway temp cache.
 
 ## `test_vmod_comparison.py`
 

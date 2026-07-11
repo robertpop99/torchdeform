@@ -5,6 +5,7 @@ from .real_dem import (
     read_geotiff_bytes,
     copernicus_glo30_url,
     download_copernicus_glo30,
+    download_copernicus_glo30_tiles,
 )
 from .priors import (
     Prior,
@@ -83,6 +84,7 @@ __all__ = [
     "read_geotiff_bytes",
     "copernicus_glo30_url",
     "download_copernicus_glo30",
+    "download_copernicus_glo30_tiles",
     "Prior",
     "UniformPrior",
     "LogUniformPrior",

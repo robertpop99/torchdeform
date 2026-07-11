@@ -24,7 +24,9 @@ Getting DEMs
 Any elevation raster works. Convenient free sources of global ~30 m tiles:
 
 * **Copernicus GLO-30** -- public, no auth. :func:`download_copernicus_glo30`
-  fetches one 1x1-degree tile by lat/lon from the open AWS bucket.
+  fetches one 1x1-degree tile by lat/lon from the open AWS bucket;
+  :func:`download_copernicus_glo30_tiles` grabs many at once (an explicit
+  ``[(lat, lon), ...]`` list, or ``n`` random land tiles).
 * **SRTM / NASADEM / ASTER GDMEM** -- via OpenTopography or NASA Earthdata.
 
 Reading GeoTIFFs needs the optional ``rasterio`` dependency; ``.npy`` / ``.npz``
@@ -293,6 +295,7 @@ class DEMPatchSampler:
         bounds: tuple = (-56.0, 60.0, -180.0, 180.0),
         read_downsample: int = 1,
         max_tile_tries: int = 200,
+        url_for=None,
         **kwargs,
     ) -> "DEMPatchSampler":
         """Build a sampler from Copernicus GLO-30 tiles fetched **into memory** (no disk).
@@ -301,39 +304,27 @@ class DEMPatchSampler:
         ``None`` to draw ``n`` random *land* tiles: random ``(lat, lon)`` within
         ``bounds = (lat_min, lat_max, lon_min, lon_max)`` are tried, skipping the
         oceans (404s), until ``n`` tiles are collected or ``max_tile_tries`` is
-        exhausted. Tile choice is reproducible via ``seed`` (the per-patch
-        sampling still uses the ``torch.Generator`` passed at call time).
+        exhausted. Explicit ocean tiles are likewise skipped (with a
+        :mod:`warnings` message, since each was named on purpose). Tile choice is
+        reproducible via ``seed`` (the per-patch sampling still uses the
+        ``torch.Generator`` passed at call time).
+
+        ``url_for(lat, lon) -> url`` (default :func:`copernicus_glo30_url`) builds
+        the tile URL; override it to fetch from a differently-named source.
 
         Each tile is ~3600x3600 px (~52 MB float32 near the equator);
         ``read_downsample`` reads a decimated overview to cut that ~k^2. Requires
         network access and the optional ``rasterio`` dependency. Untested in CI.
         """
-        import random
+        url_for = url_for or copernicus_glo30_url
+
+        def _fetch(la, lo):
+            return read_geotiff_bytes(_fetch_bytes(url_for(la, lo)), read_downsample)
 
         if tiles is not None:
-            rasters = [read_geotiff_bytes(_fetch_bytes(copernicus_glo30_url(la, lo)),
-                                          read_downsample) for la, lo in tiles]
-            return cls(rasters, patch_rows=patch_rows, patch_cols=patch_cols, **kwargs)
-
-        rng = random.Random(seed)
-        lat_min, lat_max, lon_min, lon_max = bounds
-        rasters, seen, tries = [], set(), 0
-        while len(rasters) < n and tries < max_tile_tries:
-            tries += 1
-            key = (int(math.floor(rng.uniform(lat_min, lat_max))),
-                   int(math.floor(rng.uniform(lon_min, lon_max))))
-            if key in seen:
-                continue
-            seen.add(key)
-            try:
-                data = _fetch_bytes(copernicus_glo30_url(*key))
-            except FileNotFoundError:
-                continue                                         # ocean / no tile
-            rasters.append(read_geotiff_bytes(data, read_downsample))
-        if len(rasters) < n:
-            raise RuntimeError(
-                f"found only {len(rasters)}/{n} land tiles in {tries} tries; "
-                f"widen `bounds`, raise `max_tile_tries`, or pass explicit `tiles`")
+            rasters = _fetch_tiles(tiles, _fetch)
+        else:
+            rasters = _collect_land_tiles(n, bounds, seed, max_tile_tries, _fetch)
         return cls(rasters, patch_rows=patch_rows, patch_cols=patch_cols, **kwargs)
 
 
@@ -343,6 +334,56 @@ def copernicus_glo30_url(lat: float, lon: float) -> str:
     ns, ew = ("N" if la >= 0 else "S"), ("E" if lo >= 0 else "W")
     name = f"Copernicus_DSM_COG_10_{ns}{abs(la):02d}_00_{ew}{abs(lo):03d}_00_DEM"
     return f"https://copernicus-dem-30m.s3.amazonaws.com/{name}/{name}.tif"
+
+
+def _fetch_tiles(tiles, fetch):
+    """``[fetch(lat, lon) for (lat, lon) in tiles]``, skipping ocean tiles (404s).
+
+    Unlike the random-draw path, an explicit list implies the caller wants every
+    tile, so each skipped one is announced via :mod:`warnings`.
+    """
+    import warnings
+
+    out = []
+    for la, lo in tiles:
+        try:
+            out.append(fetch(la, lo))
+        except FileNotFoundError:
+            warnings.warn(f"skipping tile lat={la}, lon={lo}: no Copernicus GLO-30 "
+                          f"tile there (ocean or out of coverage)", stacklevel=2)
+    return out
+
+
+def _collect_land_tiles(n, bounds, seed, max_tile_tries, fetch):
+    """Draw up to ``n`` random *land* tiles, calling ``fetch(lat, lon)`` per tile.
+
+    Random integer ``(lat, lon)`` keys are drawn (reproducibly via ``seed``)
+    within ``bounds = (lat_min, lat_max, lon_min, lon_max)``, deduplicated, and
+    passed to ``fetch``; keys where ``fetch`` raises :class:`FileNotFoundError`
+    are treated as ocean and skipped. Raises :class:`RuntimeError` if fewer than
+    ``n`` land tiles are found within ``max_tile_tries`` draws.
+    """
+    import random
+
+    rng = random.Random(seed)
+    lat_min, lat_max, lon_min, lon_max = bounds
+    results, seen, tries = [], set(), 0
+    while len(results) < n and tries < max_tile_tries:
+        tries += 1
+        key = (int(math.floor(rng.uniform(lat_min, lat_max))),
+               int(math.floor(rng.uniform(lon_min, lon_max))))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            results.append(fetch(*key))
+        except FileNotFoundError:
+            continue                                             # ocean / no tile
+    if len(results) < n:
+        raise RuntimeError(
+            f"found only {len(results)}/{n} land tiles in {tries} tries; "
+            f"widen `bounds`, raise `max_tile_tries`, or pass explicit `tiles`")
+    return results
 
 
 def _fetch_bytes(url: str) -> bytes:
@@ -378,19 +419,23 @@ def read_geotiff_bytes(data: bytes, downsample: int = 1) -> Tensor:
 
 def download_copernicus_glo30(lat: float, lon: float, *,
                               cache_dir: PathLike = "~/.cache/torchdeform/dem",
-                              overwrite: bool = False) -> Path:
+                              overwrite: bool = False,
+                              url_for=None) -> Path:
     """Download one Copernicus GLO-30 1x1-degree DEM tile to disk and return its path.
 
     Fetches from the public (no-auth) AWS bucket ``copernicus-dem-30m`` the tile
     covering ``floor(lat), floor(lon)``. Ocean-only tiles do not exist and raise
-    :class:`FileNotFoundError`. Requires network access; read the result with
+    :class:`FileNotFoundError`. ``url_for(lat, lon) -> url`` (default
+    :func:`copernicus_glo30_url`) builds the URL; override it to fetch from a
+    differently-named source. Requires network access; read the result with
     :meth:`DEMPatchSampler.from_files`. For an in-memory alternative (no disk),
-    see :meth:`DEMPatchSampler.from_copernicus`. Untested in CI.
+    see :meth:`DEMPatchSampler.from_copernicus`; for many tiles at once, see
+    :func:`download_copernicus_glo30_tiles`. Untested in CI.
     """
     import urllib.error
     import urllib.request
 
-    url = copernicus_glo30_url(lat, lon)
+    url = (url_for or copernicus_glo30_url)(lat, lon)
     cache = Path(os.path.expanduser(str(cache_dir)))
     cache.mkdir(parents=True, exist_ok=True)
     dest = cache / url.rsplit("/", 1)[-1]
@@ -407,3 +452,38 @@ def download_copernicus_glo30(lat: float, lon: float, *,
                 f"lon={int(math.floor(lon))} (ocean or out of coverage): {url}") from exc
         raise
     return dest
+
+
+def download_copernicus_glo30_tiles(
+    tiles: Optional[Sequence[tuple]] = None,
+    *,
+    n: int = 1,
+    bounds: tuple = (-56.0, 60.0, -180.0, 180.0),
+    seed: Optional[int] = None,
+    max_tile_tries: int = 200,
+    cache_dir: PathLike = "~/.cache/torchdeform/dem",
+    overwrite: bool = False,
+    url_for=None,
+) -> List[Path]:
+    """Download several Copernicus GLO-30 tiles to disk; return their paths.
+
+    The bulk / to-disk counterpart of :func:`download_copernicus_glo30` (which it
+    calls per tile). Either pass explicit ``tiles`` as ``[(lat, lon), ...]``, or
+    leave it ``None`` to grab ``n`` random *land* tiles within
+    ``bounds = (lat_min, lat_max, lon_min, lon_max)`` (reproducible via ``seed``,
+    up to ``max_tile_tries`` draws). Ocean tiles (404s) are skipped in **both**
+    modes, so an explicit list returns only the paths that existed -- each skipped
+    explicit tile is announced via :mod:`warnings`. ``cache_dir``, ``overwrite``
+    and ``url_for`` are passed through per tile.
+
+    For an in-memory alternative that skips disk entirely, see
+    :meth:`DEMPatchSampler.from_copernicus`. Requires network access. Untested
+    in CI.
+    """
+    def _fetch(la, lo):
+        return download_copernicus_glo30(la, lo, cache_dir=cache_dir,
+                                         overwrite=overwrite, url_for=url_for)
+
+    if tiles is not None:
+        return _fetch_tiles(tiles, _fetch)
+    return _collect_land_tiles(n, bounds, seed, max_tile_tries, _fetch)
