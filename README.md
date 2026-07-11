@@ -17,6 +17,12 @@ walks through the whole library step by step with plots — sources,
 LOS/phase/wrapping, atmosphere, the full pipeline, datasets, and covariance
 fitting.
 
+📗 **Hands-on guide:** [`examples/guide.ipynb`](examples/guide.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/robertpop99/torchdeform/blob/main/examples/guide.ipynb)
+a slower tutorial that explains in greater detail each
+step — building a deformation signal, writing your own parameter priors, and
+inverting an interferogram by gradient descent.
+
 ## Features
 
 - **Source models** (`torchdeform.sources`): Mogi point source, the full Okada
@@ -39,8 +45,9 @@ fitting.
   screens (Kolmogorov / exponential) and topography-correlated stratified delay,
   plus covariance diagnostics (`covariance_vs_distance`,
   `fit_exponential_covariance`) for measuring and calibrating screen statistics.
-- **Simulation helpers** (`torchdeform.simulation`): synthetic fractal DEMs and
-  parameter priors for randomised scene generation.
+- **Simulation helpers** (`torchdeform.simulation`): synthetic fractal DEMs *and
+  real Copernicus GLO-30 topography* (`DEMPatchSampler`), plus parameter priors
+  for randomised scene generation.
 - **Geometry & core** (`torchdeform.geometry`, `torchdeform.core`): WGS84
   coordinate transforms and tensor-backed data structures (`Displacement`,
   `LOSVector`, `ECEF`, `Geodetic`).
@@ -59,6 +66,13 @@ CPU-only users should install PyTorch CPU before torchdeform:
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
+If you want to use real DEMs downloaded from Copernicus GLO-30, you need to also install rasterio:
+
+```bash
+pip install "torchdeform[dem] @ git+https://github.com/robertpop99/torchdeform.git"
+```
+
+
 ## Quick start
 
 End-to-end: a finite-fault rupture → LOS → wrapped interferometric phase with
@@ -69,7 +83,7 @@ import torch
 from torchdeform import OkadaSourceSimple, los_vector
 from torchdeform.observation.insar import to_phase, wrap_phase
 from torchdeform.atmosphere import turbulent_aps, stratified_aps, orbital_ramp
-from torchdeform.simulation import synthetic_dem, UniformPrior
+from torchdeform.simulation import DEMPatchSampler, synthetic_dem, UniformPrior
 
 B, rows, cols = 4, 500, 500
 psizex, psizey = 100, 100 # metres per pixel
@@ -97,13 +111,17 @@ disp = src(
 )
 
 # 2. Project to Sentinel-1 line of sight and convert to phase
+#    (los_vector also takes look_side: +1 right-looking [default], -1 left-looking)
 los = los_vector(heading_deg=torch.full((B,), -13.0),
                  incidence_deg=torch.full((B,), 39.0))
 phase = to_phase(disp.to_los(los)).reshape(B, rows, cols)
 
 # 3. Add a realistic background: orbital ramp + topo-correlated + turbulent APS
 #    (in a calm scene the long-wavelength ramp dominates; turbulence is texture)
-dem = synthetic_dem(B, rows, cols, relief=600.0)
+# Real topography from Copernicus GLO-30 (public, no auth; needs network +
+# `torchdeform[dem]`). For a zero-setup offline DEM instead, swap this line for
+# `dem = synthetic_dem(B, rows, cols, relief=600.0)`. See "Real topography" below.
+dem = DEMPatchSampler.from_copernicus(4, patch_rows=rows, patch_cols=cols)(B)
 aps = orbital_ramp(B, rows, cols, rms=4.0)                              # long-wavelength trend
 aps = aps + stratified_aps(dem, coeff=torch.full((B,), 3e-3))          # tracks topography
 aps = aps + turbulent_aps(B, rows, cols, rms=0.8)                       # powerlaw: scale-free
@@ -192,7 +210,7 @@ from torchdeform.observation.insar import phase_to_unit_circle
 from torchdeform.simulation import (
     ObservationGrid, SourceGenerator, DeformationGenerator, GeometryGenerator,
     AtmosphereGenerator, InterferogramGenerator, InsarDataset,
-    UniformPrior, synthetic_dem,
+    UniformPrior, DEMPatchSampler, synthetic_dem,
     DEFAULT_MOGI_PRIOR, DEFAULT_EARTHQUAKE_PRIOR, DEFAULT_S1_GEOMETRY_PRIOR,
 )
 
@@ -213,12 +231,18 @@ deformation = DeformationGenerator(
 
 geometry = GeometryGenerator(DEFAULT_S1_GEOMETRY_PRIOR)        # Sentinel-1 asc/desc
 
+# Real topography as the DEM source: a DEMPatchSampler is a drop-in for the `dem=`
+# callable. A stack of Copernicus tiles (fetched once) yields unlimited patches via
+# random crops/flips. For a zero-setup offline DEM, use instead:
+#   dem=lambda b, g: synthetic_dem(b, grid.rows, grid.cols, relief=600.0, generator=g)
+dem_source = DEMPatchSampler.from_copernicus(8, patch_rows=grid.rows, patch_cols=grid.cols)
+
 atmosphere = AtmosphereGenerator(
     grid,
     orbital_rms=UniformPrior(2.0, 5.0),
     turbulent_rms=UniformPrior(0.5, 1.5),
     strat_coeff=UniformPrior(-3e-3, 3e-3),
-    dem=lambda b, g: synthetic_dem(b, grid.rows, grid.cols, relief=600.0, generator=g),
+    dem=dem_source,
 )
 
 pipeline = InterferogramGenerator(deformation, geometry, atmosphere)
@@ -243,6 +267,42 @@ sample for inspection. The same applies to `DeformationDataset` over a
 Mapping samples to normalised regression targets (sin/cos angles, log-scaled
 depths, network head layout, ...) is intentionally left to your code — the
 library produces physical quantities, not training tensors.
+
+## Real topography
+
+The stratified (topography-correlated) atmosphere is only as realistic as its
+DEM. `synthetic_dem` fabricates plausible fractal terrain with zero setup, but you
+can drop in **real elevation** anywhere a DEM is taken. `DEMPatchSampler` samples
+random `[B, rows, cols]` patches from real rasters and is callable with the exact
+`(batch, generator) -> dem` signature the generators expect — so it goes straight
+into `AtmosphereGenerator(dem=...)`, or you can call it directly like
+`synthetic_dem`:
+
+```python
+from torchdeform.simulation import (
+    DEMPatchSampler, download_copernicus_glo30_tiles, AtmosphereGenerator, UniformPrior,
+)
+
+# A. Fetch random global land tiles straight into memory (needs network + rasterio):
+dem = DEMPatchSampler.from_copernicus(8, patch_rows=grid.rows, patch_cols=grid.cols)
+
+# B. Or download the tiles to disk once, then sample from them offline afterwards:
+paths = download_copernicus_glo30_tiles(n=8)              # ~30 m global, public, no auth
+dem = DEMPatchSampler.from_files(paths, patch_rows=grid.rows, patch_cols=grid.cols)
+
+# C. Or use your own GeoTIFF / .npy / .npz rasters:
+dem = DEMPatchSampler.from_files("my_dems/", patch_rows=grid.rows, patch_cols=grid.cols)
+
+atmosphere = AtmosphereGenerator(grid, strat_coeff=UniformPrior(-3e-3, 3e-3), dem=dem)
+dem(4)                                                    # -> [4, rows, cols] real terrain (m)
+```
+
+Copernicus GLO-30 is public and needs no login. Reading GeoTIFFs needs the
+optional `rasterio` extra (`pip install 'torchdeform[dem]'`), while `.npy`/`.npz`
+rasters load with numpy alone. A finite stack of tiles yields effectively
+unlimited variety through random tile choice, crop location, flips and rotations,
+and stays seed-reproducible (all randomness flows through the passed
+`torch.Generator`, exactly like `synthetic_dem`).
 
 ## Priors
 
@@ -273,9 +333,15 @@ my_prior = MogiPrior(
 my_prior.sample((8,))                            # -> {"depth": [8], "delta_v": [8]}
 ```
 
-The same applies to `OkadaPrior`, `PCDMPrior`, `CDMPrior`, etc. — pass any
-`UniformPrior` / `LogUniformPrior` / `ConstantPrior` (or your own `Prior`
-subclass) per field. The CDM magmatic-style presets in particular use
+The same applies to `OkadaPrior`, `PCDMPrior`, `CDMPrior`, etc. Each field takes
+any `Prior`, and there's a broad family to choose from: uniform on linear, log or
+sign-symmetric-log scales (`UniformPrior`, `LogUniformPrior`,
+`ReverseLogUniformPrior`, `SignedLogUniformPrior`), Gaussians and their truncated /
+log / signed-log variants (`NormalPrior`, `TruncatedNormalPrior`, `LogNormalPrior`,
+`SignedLogNormalPrior`), a `PowerLawPrior`, a `VonMisesPrior` for angles, discrete
+and mixture priors (`ConstantPrior`, `ChoicePrior`, `MultimodalPrior`), or your own
+`Prior` subclass — plus `make_prior` to build one from a short spec. The CDM
+magmatic-style presets in particular use
 torchdeform's own sampling ranges, not the inversion bounds of any study; see
 [`docs/cdm_style_provenance.md`](docs/cdm_style_provenance.md) for what each
 style means and where it comes from.
