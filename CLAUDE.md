@@ -60,6 +60,12 @@ optimisation/inversion loop.
     as a *test* (finite `DC3D` → `DC3D0` as `L,W→0`), not as a user-facing source.
   - `penny.py` → `PennySource` (penny-shaped crack)
   - `pcdm.py` → `PCDMSource` (point compound dislocation model)
+  - `cdm.py` → `CDMSource` (finite compound dislocation model: three
+    orthogonal rectangular tensile dislocations; the finite counterpart of
+    `PCDMSource`, matching it in the far field)
+  - `pecm.py` → `PECMSource` (point ellipsoidal cavity model: a uniformly
+    pressurised point ellipsoid mapped to point-CDM potencies via the Eshelby
+    (1957) shape tensor)
 
 - **`observation/`** — geometry + observation operators:
   - `los.py` → `los_vector`, `los_vector_per_pixel`, `los_vector_from_center`,
