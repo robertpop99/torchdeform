@@ -40,11 +40,22 @@ There is also an *analytic-backward* mode, ``analytic_grad=True`` (on both
 observation-coordinate gradient. Unlike the smoothed path this is exact to the
 Okada-85 table even on the singular manifolds (vertical dip, on-trace points),
 and unlike plain autograd of the exact forward it has no ``cd = 0`` NaN trap.
-``dip`` (whose explicit ``1/cos(dip)`` terms have no closed-form strain) comes
-from a wide central difference of the exact forward. ``smooth_grad`` and
-``analytic_grad`` are mutually exclusive gradient modes; with neither set the
-forward is exact and gradients are plain autograd (which can be non-finite right
-on the singular manifolds).
+``dip`` (whose explicit ``1/cos(dip)`` terms have no closed-form strain) is taken
+from autograd of the exact forward -- exact to ~machine precision -- except in a
+thin near-vertical band (``|cos(dip)| < DIP_FD_BAND``, dip within ~0.17 deg of
+vertical) where those terms make autograd ill-conditioned; there it falls back to
+a Richardson-extrapolated finite difference whose wide steps clear the vertical
+singularity (``DIP_FD_RICH_STEP``), good to ~1e-6 right through dip = 90 deg.
+``smooth_grad`` and ``analytic_grad`` are mutually exclusive gradient modes; with
+neither set the forward is exact and gradients are plain autograd (which can be
+non-finite right on the singular manifolds).
+
+Second derivatives (Hessians) are available by ordinary autograd double-backward
+(``create_graph=True``) in the default and ``smooth_grad`` modes, whose forwards
+are plain-autograd graphs. ``analytic_grad`` is a custom ``autograd.Function`` and
+is **first-order only**: its hand-written backward is not itself differentiable,
+so a Hessian through it raises rather than silently returning a wrong value. Use
+the default mode if you need second-order information.
 
 Attribution
 -----------
@@ -65,14 +76,22 @@ import math
 import warnings
 from torch import Tensor
 
-from .base import SourceModel, default_num_eps
+from .base import SourceModel, default_num_eps, NUM_EPS_F64, DEFAULT_POISSON_RATIO
 from ..core import Displacement
 
 GEOM_EPS = 1e-6   # Okada-style branch / “treat as zero” (physical tolerance, metres)
-NUM_EPS  = 1e-12  # float64 denominator/log/sqrt safety
 RD_EPS   = 1e-8   # float64 UB singularity guard for r + d
 SMOOTH_EPS = 1e-8  # float64 smooth_grad reciprocal/division scale
+# RD_EPS and SMOOTH_EPS are both 1e-8-class reciprocal-stability floors; float32
+# (~1e-7 eps) and float16 (~1e-3 eps) would swallow them, so _okada_grad_floors
+# lifts both together onto this shared coarse ladder (cf. base.default_num_eps).
+GRAD_FLOOR_F32 = 1e-4
+GRAD_FLOOR_F16 = 1e-2
 BLEND_EPS  = 1e-4  # smooth_grad cd~0 blend width (physical, dtype-independent)
+# The num guard (denominator/log/sqrt floor) is owned by base.default_num_eps,
+# which dtype-scales it; the kernels below default to base.NUM_EPS_F64 only as a
+# fallback for standalone calls -- on the model path _evaluate always passes the
+# dtype-resolved value explicitly.
 # Near-vertical band (|cos(dip)|) in which float32 cannot resolve Okada's exact
 # formula. Note the subtlety: Okada's closed-form cos(dip)=0 expression (our "_b"
 # branch) is exact only *at* vertical -- off vertical (89.5 deg, say) it is wrong
@@ -85,7 +104,50 @@ BLEND_EPS  = 1e-4  # smooth_grad cd~0 blend width (physical, dtype-independent)
 # formula imposes. Inside this band we therefore evaluate that same exact formula
 # in float64 and cast the result back (see _OkadaBase._compute_dtype); float64 is
 # accurate down to |cos| ~ 1e-6, which is why it is the default compute dtype.
+#
+# Choice of 0.1 -- safe against gross failure, but slightly optimistic against the
+# 1e-3 float32 contract (see test_forward_float32_accurate_near_vertical). Measured
+# pure-float32 error (promotion disabled) grows smoothly as |cos(dip)| shrinks:
+# ~1e-5 at |cos|=0.5, ~1.5e-4 by |cos|=0.26 (dip 75 deg), then steeply near the
+# edge. It never leaks an orders-of-magnitude failure -- those start around
+# |cos|<0.05, well inside the band. But right at the band edge |cos|~0.1 (dip
+# ~84 deg) it reaches ~5e-4 to ~1.3e-3 depending on scene, i.e. a normal geometry
+# already *exceeds* 1e-3 there (the promoted band is what keeps the contract; the
+# un-promoted edge is the one regime that misses it -- see
+# test_forward_float32_band_edge_margin). Widening to 0.2 (dip ~78.5 deg) would
+# pull the edge back to ~2e-4 and restore 1e-3, at the cost of promoting steep
+# (>78 deg) faults to float64; near-vertical dykes already promote regardless and
+# common 45-70 deg faults stay float32 either way, so the extra cost is modest.
+# Default is 0.1 (favours float32 speed); a float32 user near ~80-84 deg dip should
+# expect ~1e-3, not float32 baseline. This is the *default* of the per-model
+# ``f32_vertical_band`` constructor knob -- callers who want tighter near-vertical
+# float32 accuracy can raise it (e.g. to 0.2) at the cost of promoting more scenes.
 F32_VERTICAL_BAND = 0.1
+
+# analytic_grad dip derivative: |cos(dip)| below which we fall back from autograd
+# of the exact forward to a finite-difference estimate. Away from vertical,
+# autograd gives the dip gradient to ~machine precision (4-6 orders tighter than
+# any FD); but the kernel's 1/cos(dip)**2 terms make it ill-conditioned in this
+# thin band (and it is exactly zero at dip = 90 deg, where dccon0 snaps cos(dip)).
+# Empirically (float64) autograd's relative error stays <~1e-5 down to
+# |cos(dip)| ~ 1e-2 (dip ~89.4 deg), climbs through ~1e-4 near |cos| ~ 2e-3 (dip
+# ~89.9 deg), and the crossover where the FD becomes the better estimate is
+# |cos(dip)| ~ 1.5e-3 (dip ~0.09 deg off vertical). 3e-3 (dip within ~0.17 deg of
+# vertical) is a conservative margin above that crossover.
+DIP_FD_BAND = 3e-3
+
+# Base step for the dip FD fallback, which uses Richardson extrapolation
+# (4*D(H/2) - D(H))/3, D(s) the central difference at step s. A *single* central
+# difference is unusable across the band: for any fixed step some in-band dip puts
+# one sample essentially on the removable singularity at 90 deg, spiking the
+# relative error to ~1e-2 (worse than the autograd it replaces). Richardson fixes
+# this two ways: (i) its smallest sample step, H/2, is set ABOVE the band
+# half-width (~asin(DIP_FD_BAND) ~ DIP_FD_BAND rad) so all four samples clear
+# vertical and stay well-conditioned for every dip in the band; (ii) it cancels
+# the O(H^2) truncation term, so the wide steps do not cost accuracy -- the result
+# is ~1e-6 relative right through vertical, independent of scene geometry.
+# H/2 = 2 * DIP_FD_BAND keeps (i) tied to the band if either is retuned.
+DIP_FD_RICH_STEP = 4.0 * DIP_FD_BAND  # H = 1.2e-2 rad; samples at +/-6e-3, +/-1.2e-2
 
 
 def _okada_grad_floors(dtype: torch.dtype) -> tuple[float, float]:
@@ -99,8 +161,8 @@ def _okada_grad_floors(dtype: torch.dtype) -> tuple[float, float]:
     if dtype == torch.float64:
         return SMOOTH_EPS, RD_EPS
     if dtype == torch.float32:
-        return 1e-4, 1e-4
-    return 1e-2, 1e-2  # float16 / bfloat16
+        return GRAD_FLOOR_F32, GRAD_FLOOR_F32
+    return GRAD_FLOOR_F16, GRAD_FLOOR_F16  # float16 / bfloat16
 
 
 # ---------------------------------------------------------------------
@@ -262,7 +324,7 @@ def dccon1(
     cd: torch.Tensor,
     *,
     internal_dtype: torch.dtype = torch.float64,
-    eps: float = 1e-12,
+    eps: float = NUM_EPS_F64,
 ) -> DCCon1:
     """
     Differentiable vectorized DCCON1.
@@ -450,9 +512,10 @@ def dccon2(
     ket: torch.Tensor,
     *,
     internal_dtype: torch.dtype = torch.float64,
-    eps: float = 1e-12,
+    eps: float = NUM_EPS_F64,
     training_safe: bool = False,
-    smooth_eps: float = 1e-8,
+    smooth_eps: float = SMOOTH_EPS,
+    geom_eps: float = GEOM_EPS,
 ):
     """
     Exact mode:
@@ -469,9 +532,9 @@ def dccon2(
     cd = cd.to(internal_dtype)
 
     if not training_safe:
-        xi = torch.where(torch.abs(xi) < GEOM_EPS, torch.zeros_like(xi), xi)
-        et = torch.where(torch.abs(et) < GEOM_EPS, torch.zeros_like(et), et)
-        q  = torch.where(torch.abs(q)  < GEOM_EPS, torch.zeros_like(q),  q)
+        xi = torch.where(torch.abs(xi) < geom_eps, torch.zeros_like(xi), xi)
+        et = torch.where(torch.abs(et) < geom_eps, torch.zeros_like(et), et)
+        q  = torch.where(torch.abs(q)  < geom_eps, torch.zeros_like(q),  q)
 
     # --------------------------------------------------
     # powers / radius
@@ -891,11 +954,11 @@ def ub_displacement(
     c0: DCCon0,
     c2: DCCon2,
     *,
-    eps: float = 1e-12,
+    eps: float = NUM_EPS_F64,
     training_safe: bool = False,
-    smooth_eps: float = 1e-8,
-    blend_eps: float = 1e-4,
-    rd_eps: float = 1e-8,
+    smooth_eps: float = SMOOTH_EPS,
+    blend_eps: float = BLEND_EPS,
+    rd_eps: float = RD_EPS,
 ):
     """
     Exact mode:
@@ -937,11 +1000,11 @@ def ub_displacement(
 
     if not training_safe:
         # ---------------- exact behavior ----------------
-        near_rd = torch.abs(rd) < RD_EPS
+        near_rd = torch.abs(rd) < rd_eps
         rd_safe = torch.where(
             rd >= 0.0,
-            rd + RD_EPS,
-            rd - RD_EPS,
+            rd + rd_eps,
+            rd - rd_eps,
         )
 
         d11 = 1.0 / (r * rd_safe + eps)
@@ -1612,11 +1675,12 @@ class _OkadaBase(SourceModel):
 
     def __init__(
         self,
-        poisson_ratio: float = 0.25,
+        poisson_ratio: float = DEFAULT_POISSON_RATIO,
         internal_dtype: torch.dtype = torch.float64,
         smooth_grad: bool = False,
         analytic_grad: bool = False,
         num_eps: float | None = None,
+        f32_vertical_band: float = F32_VERTICAL_BAND,
     ):
         """
         Parameters
@@ -1637,7 +1701,10 @@ class _OkadaBase(SourceModel):
             on-fault/on-trace points) where ``smooth_grad`` drifts and plain
             autograd hits a ``cos(dip) = 0`` NaN. Costs ~2x the backward (the
             forward is unchanged); see the README example. Mutually exclusive with
-            ``smooth_grad``.
+            ``smooth_grad``. First-order only: this is a custom
+            ``autograd.Function``, so Hessians via double-backward are not
+            available in this mode -- use the default mode (a plain-autograd graph)
+            when you need second-order information.
         num_eps : float or None, default None
             Numerical guard for denominators/logs/sqrt. ``None`` picks a floor
             matched to ``internal_dtype`` (``1e-12`` for float64 underflows
@@ -1646,6 +1713,16 @@ class _OkadaBase(SourceModel):
             ``smooth_eps``, ``blend_eps``) are no longer constructor knobs -- they
             are derived from ``internal_dtype`` per call (see ``_okada_grad_floors``
             and the module ``*_EPS`` constants).
+        f32_vertical_band : float, default ``F32_VERTICAL_BAND`` (0.1)
+            Only relevant for a reduced-precision ``internal_dtype`` (float32/16).
+            ``|cos(dip)|`` below which a batch is promoted to float64 for the near-
+            vertical band the reduced precision cannot resolve (see
+            ``_compute_dtype``). Trades float32 speed against near-vertical
+            accuracy: the 0.1 default keeps float32 for dips up to ~84 deg but lets
+            the error there reach ~1e-3; raise toward ~0.2 to hold the error under
+            ~1e-3 through the edge (promoting steep, >78 deg, faults to float64), or
+            lower it to keep more scenes in float32 if you can tolerate the error.
+            See the ``F32_VERTICAL_BAND`` note for the measured tradeoff.
         """
         super().__init__()
         if smooth_grad and analytic_grad:
@@ -1659,24 +1736,26 @@ class _OkadaBase(SourceModel):
         self.analytic_grad = analytic_grad
         # None -> dtype-appropriate floor resolved per call (see _resolve_num_eps).
         self.num_eps = num_eps
+        self.f32_vertical_band = f32_vertical_band
 
     def _compute_dtype(self, dip: Tensor) -> torch.dtype:
         """Internal compute dtype for this evaluation.
 
         Normally ``self.internal_dtype``. A reduced-precision request is bumped
         to ``float64`` when the batch contains a near-vertical dip
-        (``|cos(dip)| < F32_VERTICAL_BAND``): there the correct value is Okada's
-        general-dip formula, whose ``1/cos(dip)**2`` terms float32 cannot resolve
-        (see F32_VERTICAL_BAND). This is not a numerical guard or an alternative
-        formula -- it is the *same* exact formula, evaluated in the precision it
-        requires, with the result cast back to ``internal_dtype`` so the choice is
-        invisible. Well-conditioned scenes keep the fast reduced-precision path.
+        (``|cos(dip)| < self.f32_vertical_band``): there the correct value is
+        Okada's general-dip formula, whose ``1/cos(dip)**2`` terms float32 cannot
+        resolve (see ``F32_VERTICAL_BAND``). This is not a numerical guard or an
+        alternative formula -- it is the *same* exact formula, evaluated in the
+        precision it requires, with the result cast back to ``internal_dtype`` so
+        the choice is invisible. Well-conditioned scenes keep the fast
+        reduced-precision path.
         """
         requested = self.internal_dtype
         if requested == torch.float64:
             return requested
         cd = torch.cos(dip.detach().to(torch.float64)).abs()
-        if bool((cd < F32_VERTICAL_BAND).any()):
+        if bool((cd < self.f32_vertical_band).any()):
             return torch.float64
         return requested
 
@@ -1721,9 +1800,10 @@ class _OkadaBase(SourceModel):
         if bool((centroid_depth <= 0).any()):
             raise ValueError("centroid_depth must be strictly positive")
         # top (shallowest) edge depth; guard the == 0 surface-rupturing case with
-        # a tiny tolerance so floating-point noise there does not warn spuriously.
+        # GEOM_EPS (the physical "treat as zero" tolerance, metres) so floating-point
+        # noise at the surface does not warn spuriously.
         top_edge = centroid_depth - 0.5 * width * torch.sin(dip).abs()
-        if bool((top_edge < -1e-6).any()):
+        if bool((top_edge < -GEOM_EPS).any()):
             warnings.warn(
                 "Okada fault top edge is above the free surface "
                 "(centroid_depth < (width/2)*|sin(dip)|); part of the fault lies "
@@ -1967,6 +2047,7 @@ class OkadaSource(_OkadaBase):
             eps=num_eps,
             training_safe=self.smooth_grad,
             smooth_eps=smooth_eps,
+            geom_eps=geom_eps,
         )
 
         ua_real = ua_displacement(
@@ -2047,6 +2128,7 @@ class OkadaSource(_OkadaBase):
             eps=num_eps,
             training_safe=self.smooth_grad,
             smooth_eps=smooth_eps,
+            geom_eps=geom_eps,
         )
 
         ua_img = ua_displacement(
@@ -2248,8 +2330,10 @@ class _OkadaAnalyticFn(torch.autograd.Function):
 
     The forward runs the exact ``model._evaluate`` and the DC3D strain in one
     pass.  The backward returns the closed-form observation-coordinate strain (and
-    translation-invariant source gradients), autograd of the exact forward for
-    geometry/slips, and a wide central difference for ``dip``."""
+    translation-invariant source gradients), and autograd of the exact forward for
+    dip/geometry/slips -- with a Richardson-extrapolated finite difference
+    overwriting ``dip`` only in the thin near-vertical band where its autograd is
+    ill-conditioned (see ``DIP_FD_BAND``/``DIP_FD_RICH_STEP``)."""
 
     @staticmethod
     def forward(ctx, model, x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
@@ -2290,36 +2374,51 @@ class _OkadaAnalyticFn(torch.autograd.Function):
         if ctx.z_ndim == 1:                # scalar z per image -> reduce over N
             gz = gz.sum(dim=1)
 
-        # geometry + slips: autograd of the EXACT forward.
+        # dip + geometry + slips: autograd of the EXACT forward. dip rides the
+        # same re-evaluation for free; away from the vertical manifold its autograd
+        # is exact to ~machine precision (the wide-FD fallback below overwrites only
+        # the thin near-vertical band where 1/cos(dip)**2 makes it ill-conditioned).
+        dip_l = dip.detach().clone().requires_grad_(True)
         geo = [v.detach().clone().requires_grad_(True)
                for v in (strike, centroid_depth, length, width,
                          disl1, disl2, disl3)]
         with torch.enable_grad():
-            out = ev(x_obs, y_obs, z_obs, source_x, source_y, dip,
+            out = ev(x_obs, y_obs, z_obs, source_x, source_y, dip_l,
                      geo[0], geo[1], geo[2], geo[3], geo[4], geo[5], geo[6])
             loss = (out.e * ge + out.n * gn + out.u * gu).sum()
-        g_strike, g_depth, g_length, g_width, g_d1, g_d2, g_d3 = \
-            torch.autograd.grad(loss, geo)
+        g_dip_ag, g_strike, g_depth, g_length, g_width, g_d1, g_d2, g_d3 = \
+            torch.autograd.grad(loss, [dip_l, *geo])
 
-        # dip: wide central difference of the exact forward (see _OkadaBase docs).
-        # In a reduced precision the FD runs in float64: near vertical Okada's
-        # general-dip forward needs the precision (as in _compute_dtype), and so
-        # does the FD subtraction of two nearly-equal losses. Only the resulting
-        # gradient is cast back to dip's dtype.
-        fd_ev, cast = (ctx.model._f64_twin()._evaluate, lambda u: u.to(torch.float64)) \
-            if ctx.model.internal_dtype != torch.float64 else (ev, lambda u: u)
-        gef, gnf, guf = cast(ge), cast(gn), cast(gu)
+        # dip: autograd (above) everywhere except a thin near-vertical band
+        # (|cos(dip)| < DIP_FD_BAND), where it is ill-conditioned (and exactly zero
+        # at dip = 90 deg, where dccon0 snaps cos(dip)). For the -- rare -- batch
+        # elements in that band, fall back to Richardson extrapolation of the exact
+        # forward (see DIP_FD_RICH_STEP): its wide sample steps clear the vertical
+        # singularity for every in-band dip, and it cancels the O(H^2) truncation,
+        # giving ~1e-6 through vertical. The FD runs in float64: near vertical
+        # Okada's general-dip forward needs the precision (as in _compute_dtype)
+        # and so does the subtraction of nearly-equal losses; only the result is
+        # cast back to dip's dtype. Skipped entirely (no extra forward evals) when
+        # no element is near vertical -- the common case.
+        g_dip = g_dip_ag
+        near_vert = torch.cos(dip.detach().to(torch.float64)).abs() < DIP_FD_BAND
+        if bool(near_vert.any()):
+            fd_ev, cast = (ctx.model._f64_twin()._evaluate, lambda u: u.to(torch.float64)) \
+                if ctx.model.internal_dtype != torch.float64 else (ev, lambda u: u)
+            gef, gnf, guf = cast(ge), cast(gn), cast(gu)
 
-        def _dip_loss(dip_value):
-            o = fd_ev(cast(x_obs), cast(y_obs), cast(z_obs), cast(source_x),
-                      cast(source_y), dip_value, cast(strike), cast(centroid_depth),
-                      cast(length), cast(width), cast(disl1), cast(disl2), cast(disl3))
-            return (o.e * gef + o.n * gnf + o.u * guf).sum(dim=1)
+            def _dip_loss(dip_value):
+                o = fd_ev(cast(x_obs), cast(y_obs), cast(z_obs), cast(source_x),
+                          cast(source_y), dip_value, cast(strike), cast(centroid_depth),
+                          cast(length), cast(width), cast(disl1), cast(disl2), cast(disl3))
+                return (o.e * gef + o.n * gnf + o.u * guf).sum(dim=1)
 
-        h = 1e-3
-        dip_c = cast(dip)
-        with torch.no_grad():
-            g_dip = ((_dip_loss(dip_c + h) - _dip_loss(dip_c - h)) / (2.0 * h)).to(dip.dtype)
+            dip_c = cast(dip)
+            H = DIP_FD_RICH_STEP
+            _D = lambda s: (_dip_loss(dip_c + s) - _dip_loss(dip_c - s)) / (2.0 * s)
+            with torch.no_grad():
+                g_fd = ((4.0 * _D(H / 2) - _D(H)) / 3.0).to(dip.dtype)
+            g_dip = torch.where(near_vert.to(g_fd.device), g_fd, g_dip_ag)
 
         # order: model, x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
         #        centroid_depth, length, width, disl1, disl2, disl3
@@ -2552,6 +2651,7 @@ class OkadaSourceSimple(_OkadaBase):
             eps=num_eps,
             training_safe=self.smooth_grad,
             smooth_eps=smooth_eps,
+            geom_eps=geom_eps,
         )
 
         ub = ub_displacement(
@@ -2699,9 +2799,10 @@ class _OkadaSimpleAnalyticFn(torch.autograd.Function):
     """Analytic-backward implementation of :class:`OkadaSourceSimple`.
 
     Closed-form Okada surface strain for ``x_obs``/``y_obs``/``source``/``length``/
-    ``width``/``centroid_depth``/``strike``; slips via autograd of the exact
-    forward; ``dip`` via a wide central difference (its ``1/cos(dip)**2`` terms
-    make autograd ill-conditioned near vertical)."""
+    ``width``/``centroid_depth``/``strike``; slips and ``dip`` via autograd of the
+    exact forward, with a Richardson-extrapolated finite difference overwriting
+    ``dip`` only in the thin near-vertical band where its ``1/cos(dip)**2`` terms
+    make autograd ill-conditioned (see ``DIP_FD_BAND``/``DIP_FD_RICH_STEP``)."""
 
     # which inputs get analytic gradients, in the strain-dict keys
     _ANALYTIC = ("x_obs", "y_obs", "length", "width", "depth", "strike")
@@ -2745,44 +2846,52 @@ class _OkadaSimpleAnalyticFn(torch.autograd.Function):
         g_length = _contract(strain, "length", ge, gn, gu).sum(dim=1)
         g_width = _contract(strain, "width", ge, gn, gu).sum(dim=1)
 
-        # slips: autograd of the EXACT forward (linear, so exact and stable).
+        # dip + slips: autograd of the EXACT forward. Slips are linear (exact and
+        # stable); dip rides the same re-evaluation for free and is exact to
+        # ~machine precision away from the vertical manifold -- 4-6 orders tighter
+        # than the wide FD -- so autograd is used there and the FD fallback below
+        # overwrites only the thin near-vertical band.
+        dip_l = dip.detach().clone().requires_grad_(True)
         slips = [disl1.detach().clone().requires_grad_(True),
                  disl2.detach().clone().requires_grad_(True),
                  disl3.detach().clone().requires_grad_(True)]
         with torch.enable_grad():
-            out = ev(x_obs, y_obs, source_x, source_y, dip, strike,
+            out = ev(x_obs, y_obs, source_x, source_y, dip_l, strike,
                      centroid_depth, length, width, slips[0], slips[1], slips[2])
             loss = (out.e * ge + out.n * gn + out.u * gu).sum()
-        g_d1, g_d2, g_d3 = torch.autograd.grad(loss, slips)
+        g_dip_ag, g_d1, g_d2, g_d3 = torch.autograd.grad(loss, [dip_l, *slips])
 
-        # dip: central finite differences of the EXACT forward.  dip has no
-        # closed-form surface strain, and autograd of the kernel's 1/cos(dip)^2
-        # terms is ill-conditioned near the vertical manifold (and zeroed exactly
-        # on it, where dccon0 snaps cos(dip) to a constant).  The forward values
-        # themselves lose precision for |cos(dip)| <~ 1e-3, so a *wide* central
-        # step (1e-3 rad) is used: it brackets the vertical manifold with both
-        # samples in the well-conditioned region, giving a derivative accurate to
-        # ~5 significant figures everywhere -- including exactly dip = 90 deg --
-        # while remaining tight enough to match autograd off-vertical (the field
-        # is smooth in dip, so truncation error is negligible).  In a reduced
-        # precision the whole FD runs in float64: near vertical Okada's general-dip
-        # forward needs the precision (as in _compute_dtype), and so does the FD
-        # subtraction of two nearly-equal losses.  Only the resulting gradient is
-        # cast back to dip's dtype.
-        fd_ev, cast = (ctx.model._f64_twin()._evaluate, lambda u: u.to(torch.float64)) \
-            if ctx.model.internal_dtype != torch.float64 else (ev, lambda u: u)
-        gef, gnf, guf = cast(ge), cast(gn), cast(gu)
+        # dip: autograd (above) everywhere except a thin near-vertical band
+        # (|cos(dip)| < DIP_FD_BAND), where the kernel's 1/cos(dip)^2 terms make it
+        # ill-conditioned (and it is zeroed exactly at dip = 90 deg, where dccon0
+        # snaps cos(dip)). For the -- rare -- batch elements in that band, fall back
+        # to Richardson extrapolation of the exact forward (see DIP_FD_RICH_STEP):
+        # its wide sample steps clear the vertical singularity for every in-band dip
+        # and it cancels the O(H^2) truncation, giving ~1e-6 through dip = 90 deg.
+        # In a reduced precision the whole FD runs in float64: near vertical Okada's
+        # general-dip forward needs the precision (as in _compute_dtype), and so
+        # does the subtraction of nearly-equal losses; only the result is cast back
+        # to dip's dtype. Skipped entirely (no extra forward evals) when no element
+        # is near vertical -- the common case.
+        g_dip = g_dip_ag
+        near_vert = torch.cos(dip.detach().to(torch.float64)).abs() < DIP_FD_BAND
+        if bool(near_vert.any()):
+            fd_ev, cast = (ctx.model._f64_twin()._evaluate, lambda u: u.to(torch.float64)) \
+                if ctx.model.internal_dtype != torch.float64 else (ev, lambda u: u)
+            gef, gnf, guf = cast(ge), cast(gn), cast(gu)
 
-        def _dip_loss(dip_value):
-            o = fd_ev(cast(x_obs), cast(y_obs), cast(source_x), cast(source_y),
-                      dip_value, cast(strike), cast(centroid_depth), cast(length),
-                      cast(width), cast(disl1), cast(disl2), cast(disl3))
-            return (o.e * gef + o.n * gnf + o.u * guf).sum(dim=1)   # [B]
+            def _dip_loss(dip_value):
+                o = fd_ev(cast(x_obs), cast(y_obs), cast(source_x), cast(source_y),
+                          dip_value, cast(strike), cast(centroid_depth), cast(length),
+                          cast(width), cast(disl1), cast(disl2), cast(disl3))
+                return (o.e * gef + o.n * gnf + o.u * guf).sum(dim=1)   # [B]
 
-        h = 1e-3
-        dip_c = cast(dip)
-        with torch.no_grad():
-            g_dip = ((_dip_loss(dip_c + h) - _dip_loss(dip_c - h)) / (2.0 * h)).to(dip.dtype)
+            dip_c = cast(dip)
+            H = DIP_FD_RICH_STEP
+            _D = lambda s: (_dip_loss(dip_c + s) - _dip_loss(dip_c - s)) / (2.0 * s)
+            with torch.no_grad():
+                g_fd = ((4.0 * _D(H / 2) - _D(H)) / 3.0).to(dip.dtype)
+            g_dip = torch.where(near_vert.to(g_fd.device), g_fd, g_dip_ag)
 
         # order: model, x_obs, y_obs, source_x, source_y, dip, strike,
         #        centroid_depth, length, width, disl1, disl2, disl3

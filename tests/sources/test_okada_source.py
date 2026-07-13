@@ -61,6 +61,7 @@ import pytest
 import torch
 
 from torchdeform import OkadaSource, OkadaSourceSimple
+from torchdeform.sources.okada import F32_VERTICAL_BAND
 
 # dtype is passed explicitly everywhere (the t() helper, random_params, and
 # each model's internal_dtype), so no global torch.set_default_dtype is needed:
@@ -929,7 +930,7 @@ class TestAnalyticBackend:
         assert torch.isfinite(g).all()
         assert torch.allclose(g.sum(), fd, rtol=1e-3, atol=1e-9)
 
-    @pytest.mark.parametrize("dip_deg,rtol", [(60.0, 1e-5), (89.5, 1e-5),
+    @pytest.mark.parametrize("dip_deg,rtol", [(60.0, 1e-9), (89.5, 1e-6),
                                               (90.0, 2e-3)])
     def test_dip_gradient_matches_richardson_reference(self, dip_deg, rtol):
         """dip gradient converges to the *true* derivative -- not merely to the
@@ -939,11 +940,14 @@ class TestAnalyticBackend:
         1e-3 FD against a 1e-3 FD of the reference forward, which only pins the
         gradient to the truncation scale of that step. Here the reference is an
         O(h^4) Richardson extrapolation ``(4*D(h/2) - D(h)) / 3`` of the exact
-        forward, i.e. genuine ground truth. Off-vertical (60, 89.5 deg) the
-        forward is well-conditioned so the reference is trustworthy to ~1e-7 and
-        the tolerance is tight; at exactly 90 deg the forward itself loses
-        precision (|cos(dip)| collapses), so both the module and the reference
-        are limited to ~1e-3 and the tolerance is relaxed accordingly."""
+        forward, i.e. genuine ground truth. Off-vertical (60, 89.5 deg) the dip
+        gradient comes from autograd of the exact forward, which agrees with the
+        reference to ~machine precision -- limited only by the reference itself
+        (~1e-12 at 60 deg, ~1e-7 at 89.5 deg where the forward starts to
+        stiffen), hence the tight tolerances. At exactly 90 deg autograd is
+        ill-conditioned so the module falls back to the wide FD, and the forward
+        itself loses precision (|cos(dip)| collapses), so both the module and the
+        reference are limited to ~1e-3 and the tolerance is relaxed accordingly."""
         ana = OkadaSourceSimple(analytic_grad=True)
         ref = OkadaSourceSimple(smooth_grad=False)
         base = dict(
@@ -966,6 +970,85 @@ class TestAnalyticBackend:
         cd = lambda step: (loss(ref, dip0 + step) - loss(ref, dip0 - step)) / (2 * step)
         richardson = (4.0 * cd(h / 2) - cd(h)) / 3.0
         assert torch.allclose(g, richardson, rtol=rtol, atol=1e-9)
+
+    @pytest.mark.parametrize("dip_deg", [89.9, 89.95, 89.97, 90.05, 90.1])
+    def test_dip_gradient_inside_fd_band_no_resonance(self, dip_deg):
+        """Inside the near-vertical FD band, at dips *offset* from exactly 90 deg.
+
+        These are the points a single fixed-step central difference silently
+        fails: for any step h, some in-band dip puts one sample on the removable
+        singularity at 90 deg and the FD relative error spikes to ~1e-2 (worse
+        than the autograd it replaces). The module's Richardson fallback uses wide
+        steps that clear vertical for every in-band dip, so it stays ~1e-6.
+
+        Ground truth is a *wide-base* Richardson (base step 1.5e-2 rad) whose
+        samples all sit outside the ill-conditioned band -- validated to ~1e-7 by
+        its agreement across base steps 1e-2..3e-2 rad. (The 1e-3-base Richardson
+        used in the sibling test is itself unreliable at these offsets, which is
+        exactly the failure being guarded against.)"""
+        ana = OkadaSourceSimple(analytic_grad=True)
+        ref = OkadaSourceSimple(smooth_grad=False)
+        base = dict(
+            x_obs=t([[3e3, -7e3, 12e3]]), y_obs=t([[5e3, 9e3, -4e3]]),
+            source_x=t([0.0]), source_y=t([0.0]), strike=t([0.7]),
+            centroid_depth=t([6e3]), length=t([8e3]), width=t([4e3]),
+            disl1=t([1.0]), disl2=t([-0.5]), disl3=t([0.2]),
+        )
+
+        def loss(model, dip):
+            o = model(dip=dip, **base)
+            return (o.e**2 + o.n**2 + o.u**2).sum()
+
+        dip0 = t([math.radians(dip_deg)])
+        dipg = dip0.clone().requires_grad_(True)
+        loss(ana, dipg).backward()
+        g = dipg.grad.sum()
+
+        H = 1.5e-2
+        cd = lambda s: (loss(ref, dip0 + s) - loss(ref, dip0 - s)) / (2 * s)
+        wide_ref = (4.0 * cd(H / 2) - cd(H)) / 3.0
+        assert torch.isfinite(g).all()
+        assert torch.allclose(g, wide_ref, rtol=1e-4, atol=1e-9)
+
+    def test_dip_gradient_mixed_batch_autograd_and_fd(self):
+        """Per-element hand-off: in one batch, an off-vertical element takes the
+        autograd path (tight) and a vertical element the wide-FD fallback, and
+        both are correct. Guards the ``torch.where(near_vert, ...)`` selection --
+        a NaN/ill-conditioned autograd value at the vertical element must not
+        leak into the off-vertical one, and vice versa."""
+        ana = OkadaSourceSimple(analytic_grad=True)
+        ref = OkadaSourceSimple(smooth_grad=False)
+        dips = t([math.radians(45.0), math.radians(90.0)])
+        base = dict(
+            x_obs=t([[3e3, -7e3, 12e3], [3e3, -7e3, 12e3]]),
+            y_obs=t([[5e3, 9e3, -4e3], [5e3, 9e3, -4e3]]),
+            source_x=t([0.0, 0.0]), source_y=t([0.0, 0.0]),
+            strike=t([0.7, 0.7]), centroid_depth=t([6e3, 6e3]),
+            length=t([8e3, 8e3]), width=t([4e3, 4e3]),
+            disl1=t([1.0, 1.0]), disl2=t([-0.5, -0.5]), disl3=t([0.2, 0.2]),
+        )
+
+        def loss(model, dip):
+            o = model(dip=dip, **base)
+            return (o.e**2 + o.n**2 + o.u**2).sum()
+
+        dipg = dips.clone().requires_grad_(True)
+        loss(ana, dipg).backward()
+        g = dipg.grad
+        assert torch.isfinite(g).all()
+
+        # Per-element wide-FD reference of the exact forward (matches the module's
+        # own scheme at the vertical element; the tight autograd path at 45 deg is
+        # far inside its trust region so a wide FD still pins it to ~1e-4).
+        h = 1e-3
+        kp = dips + h
+        km = dips - h
+        op = ref(dip=kp, **base)
+        om = ref(dip=km, **base)
+        lp = (op.e**2 + op.n**2 + op.u**2).sum(dim=1)
+        lm = (om.e**2 + om.n**2 + om.u**2).sum(dim=1)
+        fd = (lp - lm) / (2 * h)
+        assert torch.allclose(g, fd, rtol=1e-3, atol=1e-9)
 
     @staticmethod
     def _f32_base(dtype):
@@ -1006,6 +1089,60 @@ class TestAnalyticBackend:
         v32 = torch.cat([o32.e, o32.n, o32.u]).double()
         v64 = torch.cat([o64.e, o64.n, o64.u])
         assert (v32 - v64).abs().max() <= 1e-3 * v64.abs().max()
+
+    @pytest.mark.parametrize("mode", [{}, {"smooth_grad": True}],
+                             ids=["exact", "smooth_grad"])
+    @pytest.mark.parametrize("dip_deg", [78.0, 82.0, 84.0])
+    def test_forward_float32_band_edge_margin(self, dip_deg, mode):
+        """Characterise pure-float32 accuracy just *outside* the promotion band.
+
+        These dips have ``|cos(dip)| = 0.21/0.14/0.105 > F32_VERTICAL_BAND = 0.1``,
+        so the model does NOT promote and runs in pure float32 -- this is the edge
+        the 0.1 threshold leaves to float32. It exposes that 0.1 is *optimistic*:
+        error grows steeply toward the band and, right at the edge (84 deg), the
+        exact mode reaches ~1.3e-3 -- over the 1e-3 contract that the promoted band
+        satisfies (see the ``F32_VERTICAL_BAND`` note; the un-promoted edge is the
+        one regime that misses it). Widening the band to 0.2 would promote these
+        dips and restore 1e-3; it is left at 0.1 for speed for now. This test pins
+        the edge to a 2e-3 bound so the small overshoot cannot silently grow (via a
+        narrowed band or numeric drift) without a failure here.
+
+        The 78/82 deg cases stay well under 1e-3 (~2-4e-4); 84 deg is the outlier.
+        """
+        m32 = OkadaSourceSimple(internal_dtype=torch.float32, **mode)
+        m64 = OkadaSourceSimple(internal_dtype=torch.float64, **mode)
+        dip = math.radians(dip_deg)
+        assert abs(math.cos(dip)) > F32_VERTICAL_BAND     # genuinely un-promoted
+        o32 = m32(dip=t([dip]).float(), **self._f32_base(torch.float32))
+        o64 = m64(dip=t([dip]), **self._f32_base(torch.float64))
+        v32 = torch.cat([o32.e, o32.n, o32.u]).double()
+        v64 = torch.cat([o64.e, o64.n, o64.u])
+        assert (v32 - v64).abs().max() <= 2e-3 * v64.abs().max()
+
+    def test_f32_vertical_band_constructor_override(self):
+        """The ``f32_vertical_band`` knob widens the float64-promotion band.
+
+        At dip 83 deg (``|cos| = 0.122``) the default band (0.1) leaves the batch
+        in float32 -- near the edge, so ~1e-3 error -- while a model built with
+        ``f32_vertical_band=0.2`` promotes it to float64 and tracks the float64
+        reference to float32-cast precision. Verifies the constructor arg is
+        threaded through ``_compute_dtype`` per instance."""
+        dip = t([math.radians(83.0)])
+        assert abs(math.cos(float(dip))) > F32_VERTICAL_BAND     # default: un-promoted
+
+        default = OkadaSourceSimple(internal_dtype=torch.float32)
+        widened = OkadaSourceSimple(internal_dtype=torch.float32, f32_vertical_band=0.2)
+        assert default._compute_dtype(dip) == torch.float32      # stays float32
+        assert widened._compute_dtype(dip) == torch.float64      # promoted
+
+        m64 = OkadaSourceSimple(internal_dtype=torch.float64)
+        ow = widened(dip=dip.float(), **self._f32_base(torch.float32))
+        o64 = m64(dip=dip, **self._f32_base(torch.float64))
+        assert ow.e.dtype == torch.float32                       # promotion cast back
+        vw = torch.cat([ow.e, ow.n, ow.u]).double()
+        v64 = torch.cat([o64.e, o64.n, o64.u])
+        # promoted -> float64-accurate up to the final float32 cast (~1e-6)
+        assert (vw - v64).abs().max() <= 1e-5 * v64.abs().max()
 
     @pytest.mark.parametrize("dip_deg", [60.0, 89.5, 89.99, 90.0, 90.001])
     def test_dip_gradient_float32_accurate_through_vertical(self, dip_deg):

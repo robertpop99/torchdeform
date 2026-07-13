@@ -195,6 +195,13 @@ for _ in range(200):
 For forward-only use (synthetic data generation), leave `analytic_grad=False`
 (the default) — gradients aren't computed, and the analytic path costs nothing.
 
+Need **second-order** information (Hessians — e.g. Laplace-approximation
+uncertainties or Newton steps)? Take it with ordinary autograd double-backward
+(`torch.autograd.grad(..., create_graph=True)`, then differentiate again) — but in
+the **default** mode, not `analytic_grad`: the analytic backend is a custom
+autograd function and is first-order only, so a Hessian through it raises rather
+than silently returning a wrong value.
+
 ## Datasets
 
 For training you usually don't want to wire the pipeline by hand each time.
