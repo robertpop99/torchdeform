@@ -33,11 +33,21 @@ class MogiSource(SourceModel):
         internal_dtype: torch.dtype = torch.float64,
         num_eps: float | None = None,
     ):
+        """
+        Parameters
+        ----------
+        poisson_ratio : float, default 0.25
+            Poisson's ratio of the elastic half-space.
+        internal_dtype : torch.dtype, default torch.float64
+            Dtype used for the internal computation; inputs are cast to it.
+        num_eps : float or None, default None
+            Numerical guard for denominators / sqrt. ``None`` picks a floor
+            matched to ``internal_dtype`` (``1e-12`` for float64 underflows
+            float32); pass a float to override.
+        """
         super().__init__()
         self.v = poisson_ratio
         self.internal_dtype = internal_dtype
-        # None -> dtype-appropriate floor resolved per call (see _resolve_num_eps);
-        # 1e-12 underflows float32, so the default must track internal_dtype.
         self.num_eps = num_eps
 
     def forward(

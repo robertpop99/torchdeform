@@ -154,13 +154,29 @@ class PennySource(SourceModel):
         nis: int = 2,
         num_eps: float | None = None,
     ):
+        """
+        Parameters
+        ----------
+        poisson_ratio : float, default 0.25
+            Poisson's ratio of the elastic half-space.
+        shear_modulus : float, default 3e10
+            Shear modulus ``mu`` (Pa) of the elastic half-space.
+        internal_dtype : torch.dtype, default torch.float64
+            Dtype used for the internal computation; inputs are cast to it.
+        nis : int, default 2
+            Number of equal panels subdividing ``[0, 1]`` for the composite
+            Gauss-Legendre quadrature of the Fredholm equation; higher is more
+            accurate at proportionally more cost (see ``build_quadrature``).
+        num_eps : float or None, default None
+            Numerical guard for denominators / sqrt. ``None`` picks a floor
+            matched to ``internal_dtype`` (``1e-12`` for float64 underflows
+            float32); pass a float to override.
+        """
         super().__init__()
         self.v = poisson_ratio
         self.mu = shear_modulus
         self.internal_dtype = internal_dtype
         self.nis = nis
-        # None -> dtype-appropriate floor resolved per call (see _resolve_num_eps);
-        # 1e-12 underflows float32, so the default must track internal_dtype.
         self.num_eps = num_eps
 
     # ------------------------------------------------------------------ #
