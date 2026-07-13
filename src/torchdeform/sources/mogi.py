@@ -11,7 +11,7 @@ import math
 import torch
 from torch import Tensor
 
-from .base import SourceModel
+from .base import SourceModel, DEFAULT_POISSON_RATIO
 from ..core import Displacement
 
 
@@ -29,7 +29,7 @@ class MogiSource(SourceModel):
 
     def __init__(
         self,
-        poisson_ratio: float = 0.25,
+        poisson_ratio: float = DEFAULT_POISSON_RATIO,
         internal_dtype: torch.dtype = torch.float64,
         num_eps: float | None = None,
     ):

@@ -29,10 +29,9 @@ import math
 import torch
 from torch import Tensor
 
-from .base import SourceModel
+from .base import SourceModel, DEFAULT_POISSON_RATIO
 from ..core import Displacement
 
-NUM_EPS = 1e-12   # float64 denominator/sqrt safety
 # |sin(dip)| (= horizontal magnitude of the unit normal) below this => the PTD is
 # treated as vertical and the in-plane frame is fixed to (1, 0). The frame
 # ``(-ny, -nx)/h`` suffers catastrophic cancellation in its gradient for a
@@ -187,7 +186,7 @@ class PCDMSource(SourceModel):
 
     def __init__(
         self,
-        poisson_ratio: float = 0.25,
+        poisson_ratio: float = DEFAULT_POISSON_RATIO,
         internal_dtype: torch.dtype = torch.float64,
         num_eps: float | None = None,
     ):

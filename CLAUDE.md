@@ -43,8 +43,13 @@ optimisation/inversion loop.
     finite (approximate) gradients; `analytic_grad=True` keeps exact forward
     values and returns the closed-form DC3D strain as the backward (kernels
     `ua_/ub_/uc_displacement_and_derivatives`) — exact obs-coordinate + source
-    gradients even on singular fault planes, geometry/slips via autograd of the
-    exact forward, dip via a wide central difference (accurate through vertical).
+    gradients even on singular fault planes, dip/geometry/slips via autograd of
+    the exact forward — with a Richardson-extrapolated FD overwriting dip only in a
+    thin near-vertical band (`|cos(dip)| < DIP_FD_BAND`, ~0.17° of vertical) where
+    its `1/cos(dip)` terms make autograd ill-conditioned, so it stays accurate
+    (~1e-6) through vertical. `analytic_grad` is first-order only (custom
+    autograd.Function); Hessians via double-backward need the default/smooth_grad
+    mode.
     `analytic_grad` routes through `_evaluate` + an autograd.Function; the
     forward-only path skips the strain so data-gen pays nothing.
     Only the finite rectangular `DC3D` is ported, **not** the point source

@@ -44,11 +44,10 @@ import math
 import torch
 from torch import Tensor
 
-from .base import SourceModel
+from .base import SourceModel, NUM_EPS_F64, DEFAULT_POISSON_RATIO, DEFAULT_SHEAR_MODULUS
 from .pcdm import _rotation_matrix, _ptd_disp_surf
 from ..core import Displacement
 
-NUM_EPS = 1e-12        # float64 denominator/sqrt safety
 AXIS_FLOOR = 1e-12     # minimum semi-axis (avoid zero-volume geometries)
 BRANCH_TOL = 1e-6      # relative axis closeness for oblate/prolate/sphere
 CARLSON_TOL = 1e-16    # Carlson series truncation tolerance
@@ -245,7 +244,7 @@ def _shape_tensor_ecm(a1: Tensor, a2: Tensor, a3: Tensor, nu: float, eps: float)
 
 def ecm_potencies(
     a_x: Tensor, a_y: Tensor, a_z: Tensor, pressure: Tensor,
-    nu: float, bulk_K: float, eps: float = NUM_EPS,
+    nu: float, bulk_K: float, eps: float = NUM_EPS_F64,
 ):
     """Three pCDM potencies of a uniformly pressurised point ellipsoidal cavity.
 
@@ -319,8 +318,8 @@ class PECMSource(SourceModel):
 
     def __init__(
         self,
-        poisson_ratio: float = 0.25,
-        shear_modulus: float = 3.0e10,
+        poisson_ratio: float = DEFAULT_POISSON_RATIO,
+        shear_modulus: float = DEFAULT_SHEAR_MODULUS,
         internal_dtype: torch.dtype = torch.float64,
         num_eps: float | None = None,
     ):

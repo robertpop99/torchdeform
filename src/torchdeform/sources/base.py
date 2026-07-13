@@ -16,6 +16,28 @@ from torch import Tensor, nn
 from ..core import Displacement
 
 
+# Library-wide default elastic medium, set here in one place so the two properties
+# that define it live together; each model still exposes them as override knobs.
+#   nu = 0.25 is the "Poisson solid" (lambda = mu), the standard crustal reference,
+#   and the shared default of every source model.
+#   mu = 30 GPa is a standard crustal rigidity (Pa); it sets the absolute
+#   displacement scale for the pressure-parametrised sources (penny, pecm) -- the
+#   potency/slip-parametrised ones are independent of mu, so only those two use it.
+DEFAULT_POISSON_RATIO = 0.25
+DEFAULT_SHEAR_MODULUS = 3e10
+
+
+# Canonical numerical-guard floors (denominator/sqrt/log), by precision, and the
+# single source of truth for the guard magnitude across every source model. A
+# fixed 1e-12 is right for float64 but lies below float32's machine epsilon
+# (~1e-7), so it is lifted for coarser dtypes (see default_num_eps). Modules that
+# need a *standalone* (non-dtype-aware) default import NUM_EPS_F64 from here rather
+# than re-spelling the literal.
+NUM_EPS_F64 = 1e-12
+NUM_EPS_F32 = 1e-6
+NUM_EPS_F16 = 1e-3   # float16 / bfloat16 and anything coarser
+
+
 def default_num_eps(dtype: torch.dtype) -> float:
     """Numerical guard scale (denominator/sqrt/log floor) appropriate for ``dtype``.
 
@@ -28,10 +50,10 @@ def default_num_eps(dtype: torch.dtype) -> float:
     the floor with the dtype's precision so the guard keeps working.
     """
     if dtype == torch.float64:
-        return 1e-12
+        return NUM_EPS_F64
     if dtype == torch.float32:
-        return 1e-6
-    return 1e-3  # float16 / bfloat16 and anything coarser
+        return NUM_EPS_F32
+    return NUM_EPS_F16
 
 
 class SourceModel(nn.Module, ABC):

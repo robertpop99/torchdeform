@@ -88,7 +88,7 @@ from ..observation.los import (
 )
 # CDM shape->forward adapter lives with the source model (cf. okada_params_from_fault);
 # re-exported here so CDMPrior and the simulation namespace can use it.
-from ..sources.cdm import cdm_params_from_shape, CDM_STYLES
+from ..sources.cdm import cdm_params_from_shape, CDM_STYLES, FLAT_AXIS_RATIO
 
 
 def _rand(
@@ -978,7 +978,7 @@ class CDMPrior(PriorBundle):
     omega_z: Prior
     style: str = "sphere"
     signed: bool = True
-    flat_axis_ratio: float = 1e-4
+    flat_axis_ratio: float = FLAT_AXIS_RATIO
 
     def sample(
             self,

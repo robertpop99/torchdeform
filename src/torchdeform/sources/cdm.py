@@ -35,11 +35,10 @@ import math
 import torch
 from torch import Tensor
 
-from .base import SourceModel
+from .base import SourceModel, DEFAULT_POISSON_RATIO
 from .pcdm import _rotation_matrix
 from ..core import Displacement
 
-NUM_EPS = 1e-12       # float64 denominator/sqrt safety
 # |sin(beta)| below this => side is treated as vertical (its contribution is
 # masked to zero, the exact limit). Set well above the machine-eps used by the
 # reference: the half-space angular-dislocation surface formula suffers
@@ -271,7 +270,7 @@ class CDMSource(SourceModel):
 
     def __init__(
         self,
-        poisson_ratio: float = 0.25,
+        poisson_ratio: float = DEFAULT_POISSON_RATIO,
         internal_dtype: torch.dtype = torch.float64,
         num_eps: float | None = None,
     ):
@@ -398,6 +397,13 @@ class CDMSource(SourceModel):
 #: :class:`~torchdeform.simulation.CDMPrior` built on it).
 CDM_STYLES = ("sphere", "prolate", "oblate", "dyke", "sill")
 
+#: Thin-axis fraction of ``radius`` for the dyke/sill degenerate (out-of-plane)
+#: semi-axis: a nonzero sheet thickness that converges to the zero-thickness limit
+#: as it -> 0. The single default shared by :func:`cdm_params_from_shape` and
+#: :class:`~torchdeform.simulation.CDMPrior`. (Distinct from the near-vertical
+#: kernel guard DEGENERATE_SIN, which happens to share the value.)
+FLAT_AXIS_RATIO = 1e-4
+
 
 def cdm_params_from_shape(
     style: str,
@@ -407,7 +413,7 @@ def cdm_params_from_shape(
     dv: Tensor,
     omega_x: Tensor,
     omega_z: Tensor,
-    flat_axis_ratio: float = 1e-4,
+    flat_axis_ratio: float = FLAT_AXIS_RATIO,
 ) -> dict[str, Tensor]:
     """Convert a magmatic-style shape parametrisation to :class:`CDMSource` inputs.
 

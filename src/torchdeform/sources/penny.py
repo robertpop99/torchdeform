@@ -45,7 +45,7 @@ Conventions (matching the rest of torchdeform):
 import torch
 from torch import Tensor
 
-from .base import SourceModel
+from .base import SourceModel, DEFAULT_POISSON_RATIO, DEFAULT_SHEAR_MODULUS
 from ..core import Displacement
 
 
@@ -148,8 +148,8 @@ class PennySource(SourceModel):
 
     def __init__(
         self,
-        poisson_ratio: float = 0.25,
-        shear_modulus: float = 3e10,
+        poisson_ratio: float = DEFAULT_POISSON_RATIO,
+        shear_modulus: float = DEFAULT_SHEAR_MODULUS,
         internal_dtype: torch.dtype = torch.float64,
         nis: int = 2,
         num_eps: float | None = None,
