@@ -79,6 +79,10 @@ from torch import Tensor
 from .base import SourceModel, default_num_eps, NUM_EPS_F64, DEFAULT_POISSON_RATIO
 from ..core import Displacement
 
+# Analytic-Jacobian bundle returned by ``_evaluate(..., return_strain=True)``:
+# maps a parameter name to its (d ue, d un, d uu) triple. See ``_make_contract``.
+_StrainDict = dict[str, tuple[Tensor, Tensor, Tensor]]
+
 GEOM_EPS = 1e-6   # Okada-style branch / “treat as zero” (physical tolerance, metres)
 RD_EPS   = 1e-8   # float64 UB singularity guard for r + d
 SMOOTH_EPS = 1e-8  # float64 smooth_grad reciprocal/division scale
@@ -1663,6 +1667,79 @@ def uc_displacement_only(
     )
 
 
+def _dccon2_on_corners(x, p, q, al1_b, al2_b, aw1_b, aw2_b, c0, *,
+                       dtype, num_eps, geom_eps, smooth_eps, training_safe):
+    """Build the [B,2,2,N] (xi, et, q) corner grid for one source and evaluate
+    ``dccon2`` on it.
+
+    Encodes Okada's Fortran corner semantics
+    ``DCCON2(XI(J), ET(K), Q, SD, CD, KXI(K), KET(J))`` -- kxi varies with the ET
+    corner, ket with the XI corner. Shared verbatim by the finite fault's real and
+    image sources and by the surface-only model, so it lives here once.
+
+    Returns ``(xi4, et4, q4, c2)``.
+    """
+    xi = torch.stack([x - al1_b, x - al2_b], dim=1)     # [B,2,N]
+    et = torch.stack([p - aw1_b, p - aw2_b], dim=1)     # [B,2,N]
+    xi4 = xi[:, :, None, :].expand(-1, 2, 2, -1)        # [B,2,2,N]
+    et4 = et[:, None, :, :].expand(-1, 2, 2, -1)
+    q4 = q[:, None, None, :].expand(-1, 2, 2, -1)
+
+    xi1 = xi4[:, 0, 0, :]
+    xi2 = xi4[:, 1, 0, :]
+    et1 = et4[:, 0, 0, :]
+    et2 = et4[:, 0, 1, :]
+    q0 = q4[:, 0, 0, :]
+
+    r12 = torch.sqrt(xi1 * xi1 + et2 * et2 + q0 * q0)
+    r21 = torch.sqrt(xi2 * xi2 + et1 * et1 + q0 * q0)
+    r22 = torch.sqrt(xi2 * xi2 + et2 * et2 + q0 * q0)
+
+    kxi1 = (xi1 < 0.0) & ((r21 + xi2) < geom_eps)
+    kxi2 = (xi1 < 0.0) & ((r22 + xi2) < geom_eps)
+    ket1 = (et1 < 0.0) & ((r12 + et2) < geom_eps)
+    ket2 = (et1 < 0.0) & ((r22 + et2) < geom_eps)
+
+    kxi = torch.stack([kxi1, kxi2], dim=1)[:, None, :, :].expand(-1, 2, 2, -1)
+    ket = torch.stack([ket1, ket2], dim=1)[:, :, None, :].expand(-1, 2, 2, -1)
+
+    c2 = dccon2(
+        xi=xi4, et=et4, q=q4,
+        sd=c0.sd[:, None, None, None],
+        cd=c0.cd[:, None, None, None],
+        kxi=kxi, ket=ket,
+        internal_dtype=dtype,
+        eps=num_eps,
+        training_safe=training_safe,
+        smooth_eps=smooth_eps,
+        geom_eps=geom_eps,
+    )
+    return xi4, et4, q4, c2
+
+
+def _singular_mask(xi4, et4, q4, geom_eps):
+    """Okada's on-dislocation zeroing mask [B, N] from a corner grid: points where
+    ``q == 0`` and an edge is straddled. Corner values below ``geom_eps`` are
+    snapped to zero first (Okada's convention)."""
+    xi1 = xi4[:, 0, 0, :]
+    xi2 = xi4[:, 1, 0, :]
+    et1 = et4[:, 0, 0, :]
+    et2 = et4[:, 0, 1, :]
+    q0 = q4[:, 0, 0, :]
+
+    def snap(t):
+        return torch.where(torch.abs(t) < geom_eps, torch.zeros_like(t), t)
+
+    qz, xi1z, xi2z, et1z, et2z = snap(q0), snap(xi1), snap(xi2), snap(et1), snap(et2)
+    return (
+        (qz == 0.0) &
+        (
+            (((xi1z * xi2z) <= 0.0) & ((et1z * et2z) == 0.0)) |
+            (((et1z * et2z) <= 0.0) & ((xi1z * xi2z) == 0.0))
+        )
+    )  # [B, N]
+
+
 class _OkadaBase(SourceModel):
     """
     Shared configuration for the Okada source models.
@@ -1884,7 +1961,7 @@ class OkadaSource(_OkadaBase):
         disl2: Tensor,               # [B], meters
         disl3: Tensor,               # [B], meters
         return_strain: bool = False,
-    ) -> Displacement:
+    ) -> "Displacement | tuple[Displacement, _StrainDict]":
         """Displacement of a finite rectangular fault at observation depth ``z``.
 
         Parameters
@@ -1907,12 +1984,17 @@ class OkadaSource(_OkadaBase):
             (both must be > 0).
         disl1, disl2, disl3 : Tensor
             Strike-slip, dip-slip and tensile (opening) dislocations [B] in metres.
+        return_strain : bool
+            When ``True`` also return the analytic obs-coordinate Jacobian used by
+            the ``analytic_grad`` backward (see Returns).
 
         Returns
         -------
-        Displacement
-            ENU displacement [B, N] in metres. Points on the dislocation
-            singularity are zeroed.
+        Displacement, or (Displacement, strain)
+            ENU displacement [B, N] in metres (singular points zeroed). With
+            ``return_strain=True`` a ``(Displacement, strain)`` pair, where
+            ``strain`` maps ``"x_obs"``/``"y_obs"``/``"z_obs"`` to the
+            ``(d ue, d un, d uu)`` triple w.r.t. that observation coordinate.
         """
         self._validate_inputs(
             x_obs, y_obs,
@@ -2004,50 +2086,11 @@ class OkadaSource(_OkadaBase):
         aw1_b = aw1[:, None]
         aw2_b = aw2[:, None]
 
-        xi_r = torch.stack([x - al1_b, x - al2_b], dim=1)   # [B,2,N]
-        et_r = torch.stack([p_real - aw1_b, p_real - aw2_b], dim=1)  # [B,2,N]
-
-        # Expand to full 2x2 corner grid
-        xi_r4 = xi_r[:, :, None, :].expand(-1, 2, 2, -1)    # [B,2,2,N]
-        et_r4 = et_r[:, None, :, :].expand(-1, 2, 2, -1)    # [B,2,2,N]
-        q_r4  = q_real[:, None, None, :].expand(-1, 2, 2, -1)
-
-        # Corner masks (KXI / KET) for real source
-        xi1 = xi_r4[:, 0, 0, :]
-        xi2 = xi_r4[:, 1, 0, :]
-        et1 = et_r4[:, 0, 0, :]
-        et2 = et_r4[:, 0, 1, :]
-        q0  = q_r4[:, 0, 0, :]
-
-        epsg = geom_eps
-
-        r12 = torch.sqrt(xi1 * xi1 + et2 * et2 + q0 * q0)
-        r21 = torch.sqrt(xi2 * xi2 + et1 * et1 + q0 * q0)
-        r22 = torch.sqrt(xi2 * xi2 + et2 * et2 + q0 * q0)
-
-        kxi1 = (xi1 < 0.0) & ((r21 + xi2) < epsg)
-        kxi2 = (xi1 < 0.0) & ((r22 + xi2) < epsg)
-        ket1 = (et1 < 0.0) & ((r12 + et2) < epsg)
-        ket2 = (et1 < 0.0) & ((r22 + et2) < epsg)
-
-        # IMPORTANT: Fortran semantics:
-        #   DCCON2(XI(J), ET(K), Q, SD, CD, KXI(K), KET(J))
-        kxi_r = torch.stack([kxi1, kxi2], dim=1)[:, None, :, :].expand(-1, 2, 2, -1)
-        ket_r = torch.stack([ket1, ket2], dim=1)[:, :, None, :].expand(-1, 2, 2, -1)
-
-        c2_real = dccon2(
-            xi=xi_r4,
-            et=et_r4,
-            q=q_r4,
-            sd=c0.sd[:, None, None, None],
-            cd=c0.cd[:, None, None, None],
-            kxi=kxi_r,
-            ket=ket_r,
-            internal_dtype=dtype,
-            eps=num_eps,
-            training_safe=self.smooth_grad,
-            smooth_eps=smooth_eps,
-            geom_eps=geom_eps,
+        # Real source corner grid + dccon2 (Okada Fortran KXI/KET semantics).
+        _, _, _, c2_real = _dccon2_on_corners(
+            x, p_real, q_real, al1_b, al2_b, aw1_b, aw2_b, c0,
+            dtype=dtype, num_eps=num_eps, geom_eps=geom_eps,
+            smooth_eps=smooth_eps, training_safe=self.smooth_grad,
         )
 
         ua_real = ua_displacement(
@@ -2074,62 +2117,13 @@ class OkadaSource(_OkadaBase):
         p_img = y * cd_b + d_img * sd_b
         q_img = y * sd_b - d_img * cd_b
 
-        xi_i = torch.stack([x - al1_b, x - al2_b], dim=1)
-        et_i = torch.stack([p_img - aw1_b, p_img - aw2_b], dim=1)
-
-        xi_i4 = xi_i[:, :, None, :].expand(-1, 2, 2, -1)
-        et_i4 = et_i[:, None, :, :].expand(-1, 2, 2, -1)
-        q_i4  = q_img[:, None, None, :].expand(-1, 2, 2, -1)
-
-        xi1 = xi_i4[:, 0, 0, :]
-        xi2 = xi_i4[:, 1, 0, :]
-        et1 = et_i4[:, 0, 0, :]
-        et2 = et_i4[:, 0, 1, :]
-        q0  = q_i4[:, 0, 0, :]
-
-        eps0 = geom_eps
-
-        # mimic Okada's zeroing convention
-        qz = torch.where(torch.abs(q0) < eps0, torch.zeros_like(q0), q0)
-        xi1z = torch.where(torch.abs(xi1) < eps0, torch.zeros_like(xi1), xi1)
-        xi2z = torch.where(torch.abs(xi2) < eps0, torch.zeros_like(xi2), xi2)
-        et1z = torch.where(torch.abs(et1) < eps0, torch.zeros_like(et1), et1)
-        et2z = torch.where(torch.abs(et2) < eps0, torch.zeros_like(et2), et2)
-
-        singular = (
-                (qz == 0.0) &
-                (
-                        (((xi1z * xi2z) <= 0.0) & ((et1z * et2z) == 0.0)) |
-                        (((et1z * et2z) <= 0.0) & ((xi1z * xi2z) == 0.0))
-                )
-        )  # [B, N]
-
-        r12 = torch.sqrt(xi1 * xi1 + et2 * et2 + q0 * q0)
-        r21 = torch.sqrt(xi2 * xi2 + et1 * et1 + q0 * q0)
-        r22 = torch.sqrt(xi2 * xi2 + et2 * et2 + q0 * q0)
-
-        kxi1 = (xi1 < 0.0) & ((r21 + xi2) < epsg)
-        kxi2 = (xi1 < 0.0) & ((r22 + xi2) < epsg)
-        ket1 = (et1 < 0.0) & ((r12 + et2) < epsg)
-        ket2 = (et1 < 0.0) & ((r22 + et2) < epsg)
-
-        kxi_i = torch.stack([kxi1, kxi2], dim=1)[:, None, :, :].expand(-1, 2, 2, -1)
-        ket_i = torch.stack([ket1, ket2], dim=1)[:, :, None, :].expand(-1, 2, 2, -1)
-
-        c2_img = dccon2(
-            xi=xi_i4,
-            et=et_i4,
-            q=q_i4,
-            sd=c0.sd[:, None, None, None],
-            cd=c0.cd[:, None, None, None],
-            kxi=kxi_i,
-            ket=ket_i,
-            internal_dtype=dtype,
-            eps=num_eps,
-            training_safe=self.smooth_grad,
-            smooth_eps=smooth_eps,
-            geom_eps=geom_eps,
+        # Image source (D = depth - z): corner grid, dccon2, on-dislocation mask.
+        xi_i4, et_i4, q_i4, c2_img = _dccon2_on_corners(
+            x, p_img, q_img, al1_b, al2_b, aw1_b, aw2_b, c0,
+            dtype=dtype, num_eps=num_eps, geom_eps=geom_eps,
+            smooth_eps=smooth_eps, training_safe=self.smooth_grad,
         )
+        singular = _singular_mask(xi_i4, et_i4, q_i4, geom_eps)
 
         ua_img = ua_displacement(
             disl1=disl1,
@@ -2325,6 +2319,55 @@ class OkadaSource(_OkadaBase):
         return disp, strain
 
 
+def _dip_fd_fallback(model, ev, dip, g_dip_ag, ge, gn, gu, disp_at_dip):
+    """Overwrite the autograd dip gradient with a Richardson FD near vertical.
+
+    ``g_dip_ag`` is autograd of the exact forward, which is exact to ~machine
+    precision away from the vertical manifold but ill-conditioned in a thin band
+    (``|cos(dip)| < DIP_FD_BAND``) where the kernel's ``1/cos(dip)**2`` terms blow
+    up (and dip is zeroed exactly at 90 deg, where ``dccon0`` snaps ``cos(dip)``).
+    For the -- rare -- batch elements in that band, fall back to Richardson
+    extrapolation of the exact forward (see ``DIP_FD_RICH_STEP``): its wide sample
+    steps clear the vertical singularity for every in-band dip and it cancels the
+    O(H^2) truncation, giving ~1e-6 through vertical. The FD runs in float64: near
+    vertical Okada's general-dip forward needs the precision (as in
+    ``_compute_dtype``) and so does the subtraction of nearly-equal losses; only
+    the result is cast back to dip's dtype. Skipped entirely (no extra forward
+    evals) when no element is near vertical -- the common case.
+
+    ``disp_at_dip(fd_ev, cast, dip_value)`` re-evaluates the exact forward at
+    ``dip_value`` (every other parameter captured by the caller, cast via ``cast``)
+    and returns the displacement; the only piece that differs between the full and
+    surface-only Okada functions.
+    """
+    near_vert = torch.cos(dip.detach().to(torch.float64)).abs() < DIP_FD_BAND
+    if not bool(near_vert.any()):
+        return g_dip_ag
+    fd_ev, cast = (model._f64_twin()._evaluate, lambda u: u.to(torch.float64)) \
+        if model.internal_dtype != torch.float64 else (ev, lambda u: u)
+    gef, gnf, guf = cast(ge), cast(gn), cast(gu)
+
+    def _dip_loss(dip_value):
+        o = disp_at_dip(fd_ev, cast, dip_value)
+        return (o.e * gef + o.n * gnf + o.u * guf).sum(dim=1)   # [B]
+
+    dip_c = cast(dip)
+    H = DIP_FD_RICH_STEP
+    _D = lambda st: (_dip_loss(dip_c + st) - _dip_loss(dip_c - st)) / (2.0 * st)
+    with torch.no_grad():
+        g_fd = ((4.0 * _D(H / 2) - _D(H)) / 3.0).to(dip.dtype)
+    return torch.where(near_vert.to(g_fd.device), g_fd, g_dip_ag)
+
+
+def _make_contract(strain, ge, gn, gu):
+    """Bind the per-parameter VJP: sum a parameter's saved per-output strain
+    against the grad_outputs. Returns ``contract(key) -> ge*se + gn*sn + gu*su``."""
+    def contract(key):
+        se, sn, su = strain[key]
+        return ge * se + gn * sn + gu * su
+    return contract
+
+
 class _OkadaAnalyticFn(torch.autograd.Function):
     """Analytic-backward implementation of :class:`OkadaSource` (``analytic_grad``).
 
@@ -2361,64 +2404,59 @@ class _OkadaAnalyticFn(torch.autograd.Function):
         strain = {k: s[13 + 3 * i: 16 + 3 * i]
                   for i, k in enumerate(("x_obs", "y_obs", "z_obs"))}
         ev = ctx.model._evaluate
+        # needs_input_grad aligned to forward inputs:
+        # (model, x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
+        #  centroid_depth, length, width, disl1, disl2, disl3)
+        ng = ctx.needs_input_grad
+        contract = _make_contract(strain, ge, gn, gu)
 
-        def contract(key):
-            se, sn, su = strain[key]
-            return ge * se + gn * sn + gu * su
-
-        gx = contract("x_obs")             # [B, N]
-        gy = contract("y_obs")
-        gz = contract("z_obs")
-        gsx = -gx.sum(dim=1)               # translation invariance (x, y only)
-        gsy = -gy.sum(dim=1)
-        if ctx.z_ndim == 1:                # scalar z per image -> reduce over N
+        # Obs-coordinate + source-location grads: cheap closed-form contractions of
+        # the saved strain. gx/gy feed both the obs grad and the translation-
+        # invariant source grad, so compute them if either end is requested, then
+        # drop the obs grad if only the source was asked for.
+        gx = contract("x_obs") if (ng[1] or ng[4]) else None   # [B, N]
+        gy = contract("y_obs") if (ng[2] or ng[5]) else None
+        gz = contract("z_obs") if ng[3] else None
+        gsx = -gx.sum(dim=1) if ng[4] else None                # translation invariance
+        gsy = -gy.sum(dim=1) if ng[5] else None
+        if not ng[1]:
+            gx = None
+        if not ng[2]:
+            gy = None
+        if ng[3] and ctx.z_ndim == 1:      # scalar z per image -> reduce over N
             gz = gz.sum(dim=1)
 
         # dip + geometry + slips: autograd of the EXACT forward. dip rides the
         # same re-evaluation for free; away from the vertical manifold its autograd
         # is exact to ~machine precision (the wide-FD fallback below overwrites only
         # the thin near-vertical band where 1/cos(dip)**2 makes it ill-conditioned).
-        dip_l = dip.detach().clone().requires_grad_(True)
-        geo = [v.detach().clone().requires_grad_(True)
-               for v in (strike, centroid_depth, length, width,
-                         disl1, disl2, disl3)]
-        with torch.enable_grad():
-            out = ev(x_obs, y_obs, z_obs, source_x, source_y, dip_l,
-                     geo[0], geo[1], geo[2], geo[3], geo[4], geo[5], geo[6])
-            loss = (out.e * ge + out.n * gn + out.u * gu).sum()
-        g_dip_ag, g_strike, g_depth, g_length, g_width, g_d1, g_d2, g_d3 = \
-            torch.autograd.grad(loss, [dip_l, *geo])
-
-        # dip: autograd (above) everywhere except a thin near-vertical band
-        # (|cos(dip)| < DIP_FD_BAND), where it is ill-conditioned (and exactly zero
-        # at dip = 90 deg, where dccon0 snaps cos(dip)). For the -- rare -- batch
-        # elements in that band, fall back to Richardson extrapolation of the exact
-        # forward (see DIP_FD_RICH_STEP): its wide sample steps clear the vertical
-        # singularity for every in-band dip, and it cancels the O(H^2) truncation,
-        # giving ~1e-6 through vertical. The FD runs in float64: near vertical
-        # Okada's general-dip forward needs the precision (as in _compute_dtype)
-        # and so does the subtraction of nearly-equal losses; only the result is
-        # cast back to dip's dtype. Skipped entirely (no extra forward evals) when
-        # no element is near vertical -- the common case.
-        g_dip = g_dip_ag
-        near_vert = torch.cos(dip.detach().to(torch.float64)).abs() < DIP_FD_BAND
-        if bool(near_vert.any()):
-            fd_ev, cast = (ctx.model._f64_twin()._evaluate, lambda u: u.to(torch.float64)) \
-                if ctx.model.internal_dtype != torch.float64 else (ev, lambda u: u)
-            gef, gnf, guf = cast(ge), cast(gn), cast(gu)
-
-            def _dip_loss(dip_value):
-                o = fd_ev(cast(x_obs), cast(y_obs), cast(z_obs), cast(source_x),
-                          cast(source_y), dip_value, cast(strike), cast(centroid_depth),
-                          cast(length), cast(width), cast(disl1), cast(disl2), cast(disl3))
-                return (o.e * gef + o.n * gnf + o.u * guf).sum(dim=1)
-
-            dip_c = cast(dip)
-            H = DIP_FD_RICH_STEP
-            _D = lambda s: (_dip_loss(dip_c + s) - _dip_loss(dip_c - s)) / (2.0 * s)
-            with torch.no_grad():
-                g_fd = ((4.0 * _D(H / 2) - _D(H)) / 3.0).to(dip.dtype)
-            g_dip = torch.where(near_vert.to(g_fd.device), g_fd, g_dip_ag)
+        # The shared re-evaluation is the dominant backward cost, so skip it whole
+        # when none of dip/geometry/slips is requested, and ask autograd only for
+        # the leaves that are.
+        g_dip = g_strike = g_depth = g_length = g_width = g_d1 = g_d2 = g_d3 = None
+        mask = ng[6:14]   # dip, strike, depth, length, width, disl1, disl2, disl3
+        if any(mask):
+            dip_l = dip.detach().clone().requires_grad_(True)
+            geo = [v.detach().clone().requires_grad_(True)
+                   for v in (strike, centroid_depth, length, width,
+                             disl1, disl2, disl3)]
+            leaves = [dip_l, *geo]         # aligned to mask
+            with torch.enable_grad():
+                out = ev(x_obs, y_obs, z_obs, source_x, source_y, dip_l,
+                         geo[0], geo[1], geo[2], geo[3], geo[4], geo[5], geo[6])
+                loss = (out.e * ge + out.n * gn + out.u * gu).sum()
+            gi = iter(torch.autograd.grad(loss, [lf for lf, m in zip(leaves, mask) if m]))
+            g_dip_ag, g_strike, g_depth, g_length, g_width, g_d1, g_d2, g_d3 = \
+                [next(gi) if m else None for m in mask]
+            # dip: autograd above, with a Richardson FD overwriting only the thin
+            # near-vertical band where it is ill-conditioned (see _dip_fd_fallback).
+            if ng[6]:
+                g_dip = _dip_fd_fallback(
+                    ctx.model, ev, dip, g_dip_ag, ge, gn, gu,
+                    lambda fd_ev, cast, dip_value: fd_ev(
+                        cast(x_obs), cast(y_obs), cast(z_obs), cast(source_x),
+                        cast(source_y), dip_value, cast(strike), cast(centroid_depth),
+                        cast(length), cast(width), cast(disl1), cast(disl2), cast(disl3)))
 
         # order: model, x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
         #        centroid_depth, length, width, disl1, disl2, disl3
@@ -2478,7 +2516,7 @@ class OkadaSourceSimple(_OkadaBase):
             disl2: Tensor,  # [B], meters
             disl3: Tensor,  # [B], meters
             return_strain: bool = False,
-    ) -> Displacement:
+    ) -> "Displacement | tuple[Displacement, _StrainDict]":
         """Surface displacement of a finite rectangular fault (``z = 0``).
 
         Same parameters as :meth:`OkadaSource.forward` but without ``z_obs``
@@ -2500,11 +2538,18 @@ class OkadaSourceSimple(_OkadaBase):
             (both must be > 0).
         disl1, disl2, disl3 : Tensor
             Strike-slip, dip-slip and tensile (opening) dislocations [B] in metres.
+        return_strain : bool
+            When ``True`` also return the analytic Jacobian used by the
+            ``analytic_grad`` backward (see Returns).
 
         Returns
         -------
-        Displacement
-            ENU surface displacement [B, N] in metres; singular points zeroed.
+        Displacement, or (Displacement, strain)
+            ENU surface displacement [B, N] in metres (singular points zeroed).
+            With ``return_strain=True`` a ``(Displacement, strain)`` pair, where
+            ``strain`` maps each analytically differentiated parameter
+            (``"x_obs"``/``"y_obs"``/``"length"``/``"width"``/``"depth"``/
+            ``"strike"``) to its ``(d ue, d un, d uu)`` triple.
         """
         self._validate_inputs(
             x_obs, y_obs,
@@ -2586,73 +2631,14 @@ class OkadaSourceSimple(_OkadaBase):
         aw1_b = aw1[:, None]
         aw2_b = aw2[:, None]
 
-        xi = torch.stack([x - al1_b, x - al2_b], dim=1)  # [B,2,N]
-        et = torch.stack([p - aw1_b, p - aw2_b], dim=1)  # [B,
-
-        # Build full 2x2 corner grid explicitly
-        xi = xi[:, :, None, :].expand(-1, 2, 2, -1)  # [B,2,2,N]
-        et = et[:, None, :, :].expand(-1, 2, 2, -1)  # [B,2,2,N]
-        q = q[:, None, None, :].expand(-1, 2, 2, -1)  # [B,2,2,N]
-
-        xi1 = xi[:, 0, 0, :]  # [B,N]
-        xi2 = xi[:, 1, 0, :]  # [B,N]
-        et1 = et[:, 0, 0, :]  # [B,N]
-        et2 = et[:, 0, 1, :]  # [B,N]
-        q0 = q[:, 0, 0, :]  # [B,N]
-
-        eps0 = geom_eps
-
-        # mimic Okada's zeroing convention
-        qz = torch.where(torch.abs(q0) < eps0, torch.zeros_like(q0), q0)
-        xi1z = torch.where(torch.abs(xi1) < eps0, torch.zeros_like(xi1), xi1)
-        xi2z = torch.where(torch.abs(xi2) < eps0, torch.zeros_like(xi2), xi2)
-        et1z = torch.where(torch.abs(et1) < eps0, torch.zeros_like(et1), et1)
-        et2z = torch.where(torch.abs(et2) < eps0, torch.zeros_like(et2), et2)
-
-        singular = (
-                (qz == 0.0) &
-                (
-                        (((xi1z * xi2z) <= 0.0) & ((et1z * et2z) == 0.0)) |
-                        (((et1z * et2z) <= 0.0) & ((xi1z * xi2z) == 0.0))
-                )
-        )  # [B, N]
-
-        eps = geom_eps
-
-        r12 = torch.sqrt(xi1 * xi1 + et2 * et2 + q0 * q0)
-        r21 = torch.sqrt(xi2 * xi2 + et1 * et1 + q0 * q0)
-        r22 = torch.sqrt(xi2 * xi2 + et2 * et2 + q0 * q0)
-
-        kxi1 = (xi1 < 0.0) & ((r21 + xi2) < eps)
-        kxi2 = (xi1 < 0.0) & ((r22 + xi2) < eps)
-        ket1 = (et1 < 0.0) & ((r12 + et2) < eps)
-        ket2 = (et1 < 0.0) & ((r22 + et2) < eps)
-
-        # Fortran semantics:
-        #   DCCON2(XI(J), ET(K), Q, SD, CD, KXI(K), KET(J))
-
-        # kxi varies with K (ET corner), not J
-        kxi_base = torch.stack([kxi1, kxi2], dim=1)[:, None, :, :]  # [B,1,2,N]
-        kxi = kxi_base.expand(-1, 2, 2, -1)  # [B,2,2,N]
-
-        # ket varies with J (XI corner), not K
-        ket_base = torch.stack([ket1, ket2], dim=1)[:, :, None, :]  # [B,2,1,N]
-        ket = ket_base.expand(-1, 2, 2, -1)  # [B,2,2,N]
-
-        c2 = dccon2(
-            xi=xi,
-            et=et,
-            q=q,
-            sd=c0.sd[:, None, None, None],
-            cd=c0.cd[:, None, None, None],
-            kxi=kxi,
-            ket=ket,
-            internal_dtype=dtype,
-            eps=num_eps,
-            training_safe=self.smooth_grad,
-            smooth_eps=smooth_eps,
-            geom_eps=geom_eps,
+        # Corner grid + dccon2 (Okada Fortran KXI/KET semantics) and the
+        # on-dislocation mask.
+        xi4, et4, q4, c2 = _dccon2_on_corners(
+            x, p, q, al1_b, al2_b, aw1_b, aw2_b, c0,
+            dtype=dtype, num_eps=num_eps, geom_eps=geom_eps,
+            smooth_eps=smooth_eps, training_safe=self.smooth_grad,
         )
+        singular = _singular_mask(xi4, et4, q4, geom_eps)
 
         ub = ub_displacement(
             disl1=disl1,
@@ -2789,12 +2775,6 @@ class OkadaSourceSimple(_OkadaBase):
         return disp, strain
 
 
-def _contract(strain, key, ge, gn, gu):
-    """VJP for one parameter: sum the per-output strain against grad_outputs."""
-    se, sn, su = strain[key]
-    return ge * se + gn * sn + gu * su
-
-
 class _OkadaSimpleAnalyticFn(torch.autograd.Function):
     """Analytic-backward implementation of :class:`OkadaSourceSimple`.
 
@@ -2833,65 +2813,62 @@ class _OkadaSimpleAnalyticFn(torch.autograd.Function):
         keys = _OkadaSimpleAnalyticFn._ANALYTIC
         strain = {k: saved[12 + 3 * i: 15 + 3 * i] for i, k in enumerate(keys)}
         ev = ctx.model._evaluate
+        # needs_input_grad aligned to forward inputs:
+        # (model, x_obs, y_obs, source_x, source_y, dip, strike, centroid_depth,
+        #  length, width, disl1, disl2, disl3)
+        ng = ctx.needs_input_grad
+        contract = _make_contract(strain, ge, gn, gu)
 
-        # Analytic gradients.
-        gx = _contract(strain, "x_obs", ge, gn, gu)     # d/dx_obs  [B, N]
-        gy = _contract(strain, "y_obs", ge, gn, gu)     # d/dy_obs  [B, N]
+        # Analytic gradients (cheap closed-form strain contractions). gx/gy feed
+        # both the obs grad and the translation-invariant source grad, so compute
+        # them if either end is requested, then drop the obs grad if only the source
+        # was asked for.
+        gx = contract("x_obs") if (ng[1] or ng[3]) else None  # [B, N]
+        gy = contract("y_obs") if (ng[2] or ng[4]) else None
         # Translation invariance: field depends on (x_obs - source_x).
-        gsx = -gx.sum(dim=1)
-        gsy = -gy.sum(dim=1)
+        gsx = -gx.sum(dim=1) if ng[3] else None
+        gsy = -gy.sum(dim=1) if ng[4] else None
+        if not ng[1]:
+            gx = None
+        if not ng[2]:
+            gy = None
         # per-image scalar params: contract then sum over observation points
-        g_strike = _contract(strain, "strike", ge, gn, gu).sum(dim=1)
-        g_depth = _contract(strain, "depth", ge, gn, gu).sum(dim=1)
-        g_length = _contract(strain, "length", ge, gn, gu).sum(dim=1)
-        g_width = _contract(strain, "width", ge, gn, gu).sum(dim=1)
+        g_strike = contract("strike").sum(dim=1) if ng[6] else None
+        g_depth = contract("depth").sum(dim=1) if ng[7] else None
+        g_length = contract("length").sum(dim=1) if ng[8] else None
+        g_width = contract("width").sum(dim=1) if ng[9] else None
 
         # dip + slips: autograd of the EXACT forward. Slips are linear (exact and
         # stable); dip rides the same re-evaluation for free and is exact to
         # ~machine precision away from the vertical manifold -- 4-6 orders tighter
         # than the wide FD -- so autograd is used there and the FD fallback below
-        # overwrites only the thin near-vertical band.
-        dip_l = dip.detach().clone().requires_grad_(True)
-        slips = [disl1.detach().clone().requires_grad_(True),
-                 disl2.detach().clone().requires_grad_(True),
-                 disl3.detach().clone().requires_grad_(True)]
-        with torch.enable_grad():
-            out = ev(x_obs, y_obs, source_x, source_y, dip_l, strike,
-                     centroid_depth, length, width, slips[0], slips[1], slips[2])
-            loss = (out.e * ge + out.n * gn + out.u * gu).sum()
-        g_dip_ag, g_d1, g_d2, g_d3 = torch.autograd.grad(loss, [dip_l, *slips])
+        # overwrites only the thin near-vertical band. This shared re-evaluation is
+        # the dominant backward cost, so skip it whole when neither dip nor a slip
+        # is requested, and ask autograd only for the leaves that are.
+        g_dip = g_d1 = g_d2 = g_d3 = None
+        mask = (ng[5], ng[10], ng[11], ng[12])   # dip, disl1, disl2, disl3
+        if any(mask):
+            dip_l = dip.detach().clone().requires_grad_(True)
+            slips = [disl1.detach().clone().requires_grad_(True),
+                     disl2.detach().clone().requires_grad_(True),
+                     disl3.detach().clone().requires_grad_(True)]
+            leaves = [dip_l, *slips]       # aligned to mask
+            with torch.enable_grad():
+                out = ev(x_obs, y_obs, source_x, source_y, dip_l, strike,
+                         centroid_depth, length, width, slips[0], slips[1], slips[2])
+                loss = (out.e * ge + out.n * gn + out.u * gu).sum()
+            gi = iter(torch.autograd.grad(loss, [lf for lf, m in zip(leaves, mask) if m]))
+            g_dip_ag, g_d1, g_d2, g_d3 = [next(gi) if m else None for m in mask]
 
-        # dip: autograd (above) everywhere except a thin near-vertical band
-        # (|cos(dip)| < DIP_FD_BAND), where the kernel's 1/cos(dip)^2 terms make it
-        # ill-conditioned (and it is zeroed exactly at dip = 90 deg, where dccon0
-        # snaps cos(dip)). For the -- rare -- batch elements in that band, fall back
-        # to Richardson extrapolation of the exact forward (see DIP_FD_RICH_STEP):
-        # its wide sample steps clear the vertical singularity for every in-band dip
-        # and it cancels the O(H^2) truncation, giving ~1e-6 through dip = 90 deg.
-        # In a reduced precision the whole FD runs in float64: near vertical Okada's
-        # general-dip forward needs the precision (as in _compute_dtype), and so
-        # does the subtraction of nearly-equal losses; only the result is cast back
-        # to dip's dtype. Skipped entirely (no extra forward evals) when no element
-        # is near vertical -- the common case.
-        g_dip = g_dip_ag
-        near_vert = torch.cos(dip.detach().to(torch.float64)).abs() < DIP_FD_BAND
-        if bool(near_vert.any()):
-            fd_ev, cast = (ctx.model._f64_twin()._evaluate, lambda u: u.to(torch.float64)) \
-                if ctx.model.internal_dtype != torch.float64 else (ev, lambda u: u)
-            gef, gnf, guf = cast(ge), cast(gn), cast(gu)
-
-            def _dip_loss(dip_value):
-                o = fd_ev(cast(x_obs), cast(y_obs), cast(source_x), cast(source_y),
-                          dip_value, cast(strike), cast(centroid_depth), cast(length),
-                          cast(width), cast(disl1), cast(disl2), cast(disl3))
-                return (o.e * gef + o.n * gnf + o.u * guf).sum(dim=1)   # [B]
-
-            dip_c = cast(dip)
-            H = DIP_FD_RICH_STEP
-            _D = lambda s: (_dip_loss(dip_c + s) - _dip_loss(dip_c - s)) / (2.0 * s)
-            with torch.no_grad():
-                g_fd = ((4.0 * _D(H / 2) - _D(H)) / 3.0).to(dip.dtype)
-            g_dip = torch.where(near_vert.to(g_fd.device), g_fd, g_dip_ag)
+            # dip: autograd above, with a Richardson FD overwriting only the thin
+            # near-vertical band where it is ill-conditioned (see _dip_fd_fallback).
+            if ng[5]:
+                g_dip = _dip_fd_fallback(
+                    ctx.model, ev, dip, g_dip_ag, ge, gn, gu,
+                    lambda fd_ev, cast, dip_value: fd_ev(
+                        cast(x_obs), cast(y_obs), cast(source_x), cast(source_y),
+                        dip_value, cast(strike), cast(centroid_depth), cast(length),
+                        cast(width), cast(disl1), cast(disl2), cast(disl3)))
 
         # order: model, x_obs, y_obs, source_x, source_y, dip, strike,
         #        centroid_depth, length, width, disl1, disl2, disl3
