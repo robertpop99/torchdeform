@@ -1903,6 +1903,21 @@ class _OkadaBase(SourceModel):
         depth = centroid_depth
         return al1, al2, aw1, aw2, depth
 
+    @staticmethod
+    def _corner_sum(arr):
+        """Chinnery ``(+ - - +)`` signed reduction over the ``[B, 2, 2, N]``
+        corner grid (along-strike axis 1, down-dip axis 2), returning ``[B, N]``.
+
+        A per-corner weight is applied by passing a pre-weighted ``arr`` (e.g.
+        ``_corner_sum(w * a)`` with ``w`` broadcasting along a corner axis).
+        """
+        return (
+            arr[:, 0, 0, :]
+            - arr[:, 0, 1, :]
+            - arr[:, 1, 0, :]
+            + arr[:, 1, 1, :]
+        )
+
 
 class OkadaSource(_OkadaBase):
     """
@@ -2202,19 +2217,10 @@ class OkadaSource(_OkadaBase):
         )
 
         # -------------------------------------------------
-        # Signed corner summation
-        #
-        # (+ - - +) pattern
+        # Signed corner summation ((+ - - +) pattern); see _OkadaBase._corner_sum
         # -------------------------------------------------
 
-        def corner_sum(arr):
-            return (
-                arr[:, 0, 0, :]
-                - arr[:, 0, 1, :]
-                - arr[:, 1, 0, :]
-                + arr[:, 1, 1, :]
-            )
-
+        corner_sum = self._corner_sum
         ux_fault = corner_sum(real_x + img_x)
         uy_fault = corner_sum(real_y + img_y)
         uz_fault = corner_sum(real_z + img_z)
@@ -2653,15 +2659,6 @@ class OkadaSourceSimple(_OkadaBase):
             rd_eps=rd_eps,
         )
 
-        sign = torch.tensor(
-            [[1.0, -1.0],
-             [-1.0, 1.0]],
-            device=x.device,
-            dtype=x.dtype,
-        )
-
-        sign = sign[None, :, :, None]
-
         sd = c0.sd[:, None, None, None]
         cd = c0.cd[:, None, None, None]
 
@@ -2670,9 +2667,9 @@ class OkadaSourceSimple(_OkadaBase):
         corner_y = ub.uy * cd - ub.uz * sd
         corner_z = ub.uy * sd + ub.uz * cd
 
-        ux_fault = (sign * corner_x).sum(dim=(1, 2))
-        uy_fault = (sign * corner_y).sum(dim=(1, 2))
-        uz_fault = (sign * corner_z).sum(dim=(1, 2))
+        ux_fault = self._corner_sum(corner_x)
+        uy_fault = self._corner_sum(corner_y)
+        uz_fault = self._corner_sum(corner_z)
 
         ue = ux_fault * ss + uy_fault * cs
         un = ux_fault * cs - uy_fault * ss
@@ -2703,10 +2700,10 @@ class OkadaSourceSimple(_OkadaBase):
             # Fault-frame triple (ux/uy/uz parts) over the corner grid, with the
             # dip rotation + signed corner sum + a per-corner weight w applied.
             a, b, cc = triple
-            sw = sign * w
-            fx = (sw * a).sum(dim=(1, 2))
-            fy = (sw * (b * cd - cc * sd)).sum(dim=(1, 2))
-            fz = (sw * (b * sd + cc * cd)).sum(dim=(1, 2))
+            csum = self._corner_sum
+            fx = csum(w * a)
+            fy = csum(w * (b * cd - cc * sd))
+            fz = csum(w * (b * sd + cc * cd))
             return fx, fy, fz
 
         def _enu(fx, fy, fz):
