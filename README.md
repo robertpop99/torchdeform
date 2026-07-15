@@ -376,6 +376,16 @@ The suite checks correctness against independent references, batching, and —
 central to this library — differentiability via `torch.autograd.gradcheck`,
 including health checks near the regularised singularities.
 
+**Measured accuracy.** The source models are validated to machine precision
+against external ground truth, and the numbers are tabulated:
+
+- [Reference-value accuracy](tests/sources/reference/README.md) — each port vs
+  the **original authors' code** (Okada's Fortran `DC3D`, Nikkhoo/Fialko
+  MATLAB), forward displacement and analytic gradients.
+- [VMOD cross-validation](tests/external/README.md) — an independent check
+  against the third-party [VMOD](https://github.com/uafgeotools/vmod) library
+  over ~1000 random parameter sets per model.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
