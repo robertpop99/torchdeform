@@ -271,6 +271,9 @@ def ecm_potencies(
     Tensor
         Potencies ``[B, 3]`` = ``(DVx, DVy, DVz)``.
     """
+    for name, val in (("a_x", a_x), ("a_y", a_y), ("a_z", a_z)):
+        if torch.any(val <= 0):
+            raise ValueError(f"{name} must be strictly positive")
     a = torch.stack([a_x, a_y, a_z], dim=-1).clamp_min(AXIS_FLOOR)   # [B, 3]
     ai, idx = torch.sort(a, dim=-1, descending=True)
     a1, a2, a3 = ai[:, 0], ai[:, 1], ai[:, 2]
@@ -285,7 +288,9 @@ def ecm_potencies(
     same_sign = torch.sign(eT) == torch.sign(pressure).unsqueeze(-1)
     eT = torch.where(same_sign, eT, torch.zeros_like(eT))
 
-    V = 4.0 / 3.0 * math.pi * a_x * a_y * a_z           # [B] volume
+    # Volume from the same (floored) axes the shape tensor saw, so the two
+    # cannot disagree for sub-floor inputs.
+    V = 4.0 / 3.0 * math.pi * a.prod(dim=-1)            # [B] volume
     pot_sorted = V.unsqueeze(-1) * eT                   # [B, 3] sorted order
     DV = torch.zeros_like(pot_sorted).scatter(1, idx, pot_sorted)   # original order
     return DV
@@ -389,6 +394,8 @@ class PECMSource(SourceModel):
              "omega_x": omega_x, "omega_y": omega_y, "omega_z": omega_z,
              "a_x": a_x, "a_y": a_y, "a_z": a_z, "pressure": pressure},
         )
+        if torch.any(depth <= 0):
+            raise ValueError("depth must be strictly positive")
 
         dtype = self.internal_dtype
         num_eps = self._resolve_num_eps()

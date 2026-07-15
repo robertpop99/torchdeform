@@ -240,6 +240,75 @@ def test_bad_shape_raises():
                     a_x=_f(3, 900), a_y=_f(3, 700), a_z=_f(3, 300), opening=_f(3, 3.0))
 
 
+def _valid_kwargs(B, **over):
+    kw = dict(source_x=_f(B, 0), source_y=_f(B, 0), depth=_f(B, 4000),
+              omega_x=_f(B, 0.3), omega_y=_f(B, 0.2), omega_z=_f(B, 0.5),
+              a_x=_f(B, 900), a_y=_f(B, 700), a_z=_f(B, 300), opening=_f(B, 3.0))
+    kw.update(over)
+    return kw
+
+
+@pytest.mark.parametrize("bad", [0.0, -4000.0])
+def test_nonpositive_depth_raises(bad):
+    # a source at/above the free surface is outside the buried half-space.
+    x, y = _grid(2, 5)
+    with pytest.raises(ValueError, match="depth"):
+        CDMSource()(x, y, **_valid_kwargs(2, depth=_f(2, bad)))
+
+
+@pytest.mark.parametrize("axis", ["a_x", "a_y", "a_z"])
+@pytest.mark.parametrize("bad", [0.0, -300.0])
+def test_nonpositive_semi_axis_raises(axis, bad):
+    x, y = _grid(2, 5)
+    with pytest.raises(ValueError, match=axis):
+        CDMSource()(x, y, **_valid_kwargs(2, **{axis: _f(2, bad)}))
+
+
+def test_vertex_above_surface_raises():
+    """A shallow, tilted box whose rectangle vertices poke above z = 0 is outside
+    the half-space solution (the reference CDM.m errors here); it must raise, not
+    silently return an unphysical field."""
+    x, y = _grid(1, 5)
+    with pytest.raises(ValueError, match="free surface"):
+        CDMSource()(x, y, **_valid_kwargs(
+            1, depth=_f(1, 200), a_z=_f(1, 600), omega_x=_f(1, 0.9),
+            omega_y=_f(1, 0.0), omega_z=_f(1, 0.0)))
+    # same box safely buried: no error
+    out = CDMSource()(x, y, **_valid_kwargs(
+        1, depth=_f(1, 4000), a_z=_f(1, 600), omega_x=_f(1, 0.9),
+        omega_y=_f(1, 0.0), omega_z=_f(1, 0.0)))
+    assert torch.isfinite(out.u).all()
+
+
+def test_surface_touching_vertex_allowed():
+    """Vertices exactly at z = 0 are the boundary of validity (analogous to a
+    surface-rupturing Okada fault): the reference CDM.m only rejects vertices
+    strictly *above* the surface, so touching must not raise. Off the touching
+    vertex the field is finite; directly above it the RD kernel is genuinely
+    singular (no DC3D-style zeroing convention here), which is why observation
+    points below skip x = 0."""
+    # axis-aligned: the z-spanning rectangles reach z = -depth + a_z, so
+    # depth == a_z puts the top edge exactly at the surface.
+    x = torch.tensor([[-10e3, -5e3, 5e3, 10e3]], dtype=DTYPE)
+    y = torch.full_like(x, 2e3)
+    out = CDMSource()(x, y, **_valid_kwargs(
+        1, depth=_f(1, 300), a_x=_f(1, 200), a_y=_f(1, 200), a_z=_f(1, 300),
+        omega_x=_f(1, 0.0), omega_y=_f(1, 0.0), omega_z=_f(1, 0.0)))
+    for tns in (out.e, out.n, out.u):
+        assert torch.isfinite(tns).all()
+
+
+def test_raises_if_any_batch_element_degenerate():
+    # a single bad element in an otherwise valid batch must still raise.
+    x, y = _grid(3, 5)
+    depth = _f(3, 4000); depth[1] = -1.0
+    with pytest.raises(ValueError, match="depth"):
+        CDMSource()(x, y, **_valid_kwargs(3, depth=depth))
+    a_y = _f(3, 700); a_y[2] = 0.0
+    with pytest.raises(ValueError, match="a_y"):
+        CDMSource()(x, y, **_valid_kwargs(3, a_y=a_y))
+
+
 # --------------------------------------------------------------------------- #
 # Differentiability  (unit-scale, generic non-degenerate orientation)
 # --------------------------------------------------------------------------- #
@@ -363,9 +432,7 @@ class TestNikkhooReference:
 # --------------------------------------------------------------------------- #
 # External reference: CDM over a random parameter volume
 # --------------------------------------------------------------------------- #
-_CDM_VOLUME_GOLDEN = (
-    Path(__file__).resolve().parent / "data" / "cdm_volume_golden.json"
-)
+_CDM_VOLUME_DIR = Path(__file__).resolve().parent / "data"
 
 
 def _tt(x):
@@ -379,22 +446,27 @@ class TestCDMVolume:
     Complements ``TestNikkhooReference``'s two hand-picked orientations: the
     fixture ``data/cdm_volume_golden.json`` freezes ``CDM.m``'s forward ENU for
     16 random buried CDMs -- random depth, full 3-axis orientation, semi-axes and
-    (signed) opening -- observed at 24 surface points each. Forward only:
-    CDMSource has no hand-written backward, so its gradients are covered by
-    ``test_gradcheck`` (autograd vs. finite differences), not here. Regenerate
-    with ``reference/gen_cdm_volume.py`` (needs MATLAB + vendored nikkhoo/); the
-    committed JSON is all this test needs. See reference/README.md.
+    (signed) opening -- observed at 24 surface points each. The ``_nu0.32``
+    sibling repeats the identical geometry at ``nu = 0.32``, verifying the
+    non-trivial Poisson-ratio dependence that the ``nu = 0.25``-only fixtures
+    cannot see. Forward only: CDMSource has no hand-written backward, so its
+    gradients are covered by ``test_gradcheck`` (autograd vs. finite
+    differences), not here. Regenerate with ``reference/gen_cdm_volume.py
+    [--nu 0.32]`` (needs MATLAB + vendored nikkhoo/); the committed JSON is all
+    this test needs. See reference/README.md.
     """
 
-    def test_cdm_volume_displacement(self):
-        assert _CDM_VOLUME_GOLDEN.is_file(), (
-            f"{_CDM_VOLUME_GOLDEN} missing; regenerate with "
-            "reference/gen_cdm_volume.py"
+    @pytest.mark.parametrize(
+        "fname", ["cdm_volume_golden.json", "cdm_volume_golden_nu0.32.json"]
+    )
+    def test_cdm_volume_displacement(self, fname):
+        golden = _CDM_VOLUME_DIR / fname
+        assert golden.is_file(), (
+            f"{golden} missing; regenerate with reference/gen_cdm_volume.py"
         )
-        d = json.loads(_CDM_VOLUME_GOLDEN.read_text())
-        assert d["poisson_ratio"] == 0.25   # must match CDMSource default nu
+        d = json.loads(golden.read_text())
 
-        out = CDMSource()(
+        out = CDMSource(poisson_ratio=d["poisson_ratio"])(
             _tt(d["x_obs"]), _tt(d["y_obs"]),
             source_x=_tt(d["source_x"]), source_y=_tt(d["source_y"]),
             depth=_tt(d["depth"]),
@@ -405,7 +477,9 @@ class TestCDMVolume:
         )
         got = torch.stack([out.e, out.n, out.u], dim=-1)   # [B, N, 3] ENU
         want = _tt(d["u_enu"])
-        assert torch.allclose(got, want, rtol=1e-6, atol=1e-12), (
+        # Both sides float64; the port reproduces CDM.m to ~1e-13 relative, so
+        # rtol has ~4 orders of headroom while still catching small regressions.
+        assert torch.allclose(got, want, rtol=1e-9, atol=1e-12), (
             "CDMSource disagrees with CDM.m: max abs diff "
             f"{(got - want).abs().max().item():.3e} m"
         )

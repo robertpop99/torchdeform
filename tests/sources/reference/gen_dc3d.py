@@ -220,20 +220,35 @@ def rotate_enu_array(strike: float, uxyz: np.ndarray) -> np.ndarray:
     return np.stack([ux * s + uy * c, ux * c - uy * s, uz], axis=-1)
 
 
-# Central-difference steps for the source-parameter gradient references. Absolute
-# for dip (radians); relative-to-value for the length-scale parameters. Tuned so
-# the O(h^2) truncation and O(eps/h) round-off both stay well below the ~1e-6
-# tolerance the finite-difference tests use.
-H_DIP = 1e-5                # radians
-H_REL = 1e-4               # fraction of length / width / centroid_depth
+# Finite-difference steps for the source-parameter gradient references. Absolute
+# for dip (radians); relative-to-value for the length-scale parameters. Each
+# gradient is a *Richardson-extrapolated* central difference -- D(h) and D(h/2)
+# combined as (4*D(h/2) - D(h)) / 3, the same scheme OkadaSource's near-vertical
+# dip fallback uses -- which cancels the O(h^2) truncation term.
+#
+# Step size is set by DC3D's *own* evaluation noise, not machine eps: its
+# internal cancellations leave ~1e-12 relative noise on each forward value,
+# which an FD divides by h. A step sweep (consecutive-step self-consistency of
+# the reference, no torchdeform involved) shows the error is noise/h-dominated
+# up to h ~ 1e-3 and truncation takes over past ~3e-3 (earliest for
+# centroid_depth; for dip the O(h^4) term grows as 1/cos(dip)^k on the
+# fixture's near-vertical faults). h = 1e-3 sits at the optimum for every
+# parameter: reference good to ~1e-9 relative. (The old plain central
+# differences at h_dip = 1e-5 / h_rel = 1e-4 bottomed out at ~1e-7: same noise
+# floor, 10-100x smaller h.)
+H_DIP = 1e-3                # radians
+H_REL = 1e-3               # fraction of length / width / centroid_depth
 
 # Gradient-reference evaluation variants, in the fixed row order the driver sees.
 # "base" is the nominal fault; slip{1,2,3} are unit-slip responses (exact
-# d u / d disl_k); the +/- pairs feed central differences for dip/L/W/depth.
+# d u / d disl_k); the +/- full-step and +/- half-step ("*2") pairs feed the
+# Richardson-extrapolated differences for dip/L/W/depth.
 _GRAD_VARIANTS = (
     "base", "slip1", "slip2", "slip3",
-    "dip_p", "dip_m", "len_p", "len_m",
-    "wid_p", "wid_m", "dep_p", "dep_m",
+    "dip_p", "dip_m", "dip_p2", "dip_m2",
+    "len_p", "len_m", "len_p2", "len_m2",
+    "wid_p", "wid_m", "wid_p2", "wid_m2",
+    "dep_p", "dep_m", "dep_p2", "dep_m2",
 )
 
 
@@ -250,6 +265,11 @@ def _variant_rows(f: dict, pts: list) -> np.ndarray:
         "wid_p": dict(width=f["width"] + hW), "wid_m": dict(width=f["width"] - hW),
         "dep_p": dict(depth=f["centroid_depth"] + hD),
         "dep_m": dict(depth=f["centroid_depth"] - hD),
+        "dip_p2": dict(dip=f["dip"] + H_DIP / 2), "dip_m2": dict(dip=f["dip"] - H_DIP / 2),
+        "len_p2": dict(length=f["length"] + hL / 2), "len_m2": dict(length=f["length"] - hL / 2),
+        "wid_p2": dict(width=f["width"] + hW / 2), "wid_m2": dict(width=f["width"] - hW / 2),
+        "dep_p2": dict(depth=f["centroid_depth"] + hD / 2),
+        "dep_m2": dict(depth=f["centroid_depth"] - hD / 2),
     }
     blocks = [
         [to_fault_frame(f, *p, **overrides[name]) for p in pts]
@@ -258,7 +278,12 @@ def _variant_rows(f: dict, pts: list) -> np.ndarray:
     return np.array(blocks).reshape(len(_GRAD_VARIANTS) * len(pts), 13)
 
 
-def main() -> None:
+def main(nu: float = 0.25) -> None:
+    # to_fault_frame reads the module-level ALPHA; rebind it for this run so a
+    # non-default nu flows into every DC3D row.
+    global ALPHA
+    ALPHA = 1.0 / (2.0 * (1.0 - nu))
+
     dc3d = find_dc3d()
     rng = np.random.default_rng(SEED)
 
@@ -311,13 +336,20 @@ def main() -> None:
             grad["disl2"][bi] = enu_of("slip2")
             grad["disl3"][bi] = enu_of("slip3")
 
-            # Central differences for the parameters with no closed form here.
+            # Richardson-extrapolated central differences for the parameters
+            # with no closed form here: (4*D(h/2) - D(h)) / 3 cancels the O(h^2)
+            # truncation (see the step-size comment above _GRAD_VARIANTS).
+            def richardson(stem: str, h: float) -> np.ndarray:
+                d_full = (enu_of(f"{stem}_p") - enu_of(f"{stem}_m")) / (2 * h)
+                d_half = (enu_of(f"{stem}_p2") - enu_of(f"{stem}_m2")) / h
+                return (4.0 * d_half - d_full) / 3.0
+
             hL, hW = H_REL * f["length"], H_REL * f["width"]
             hD = H_REL * f["centroid_depth"]
-            grad["dip"][bi] = (enu_of("dip_p") - enu_of("dip_m")) / (2 * H_DIP)
-            grad["length"][bi] = (enu_of("len_p") - enu_of("len_m")) / (2 * hL)
-            grad["width"][bi] = (enu_of("wid_p") - enu_of("wid_m")) / (2 * hW)
-            grad["centroid_depth"][bi] = (enu_of("dep_p") - enu_of("dep_m")) / (2 * hD)
+            grad["dip"][bi] = richardson("dip", H_DIP)
+            grad["length"][bi] = richardson("len", hL)
+            grad["width"][bi] = richardson("wid", hW)
+            grad["centroid_depth"][bi] = richardson("dep", hD)
 
     payload = {
         "_comment": (
@@ -325,7 +357,7 @@ def main() -> None:
             "Generated by tests/sources/reference/gen_dc3d.py. Do not edit by hand."
         ),
         "alpha": ALPHA,
-        "poisson_ratio": 0.25,
+        "poisson_ratio": nu,
         "seed": SEED,
         "n_faults": N_FAULTS,
         "n_points": N_POINTS,
@@ -350,15 +382,20 @@ def main() -> None:
         "derivatives_fault_frame": deriv.tolist(),
         # ENU source-parameter gradients d(E,N,U)/d(param), each [B, N, 3].
         # disl{1,2,3} are exact (unit-slip responses); dip/length/width/
-        # centroid_depth are central differences (steps below). source_x/source_y
-        # gradients are omitted: half-space horizontal homogeneity makes them
-        # exactly the negated horizontal spatial strain (derived in the test).
+        # centroid_depth are Richardson-extrapolated central differences
+        # (steps/scheme below). source_x/source_y gradients are omitted:
+        # half-space horizontal homogeneity makes them exactly the negated
+        # horizontal spatial strain (derived in the test).
         "param_gradients": {k: g.tolist() for k, g in grad.items()},
-        "grad_fd_steps": {"dip_rad": H_DIP, "length_width_depth_rel": H_REL},
+        "grad_fd_steps": {"dip_rad": H_DIP, "length_width_depth_rel": H_REL,
+                          "scheme": "richardson (4*D(h/2) - D(h)) / 3"},
     }
 
     DATA.mkdir(exist_ok=True)
-    outfile = DATA / "dc3d_golden.json"
+    # nu = 0.25 keeps the canonical filename; other ratios get a suffixed
+    # sibling (e.g. dc3d_golden_nu0.32.json).
+    suffix = "" if nu == 0.25 else f"_nu{nu:g}"
+    outfile = DATA / f"dc3d_golden{suffix}.json"
     outfile.write_text(json.dumps(payload))
     n = N_FAULTS * N_POINTS
     print(f"wrote {outfile} ({n} points, {outfile.stat().st_size / 1024:.0f} KiB)")
@@ -420,8 +457,13 @@ if __name__ == "__main__":
         help="print header, array shapes, and per-fault inputs from the "
              "committed JSON, then exit (no Fortran toolchain needed).",
     )
+    parser.add_argument(
+        "--nu", type=float, default=0.25,
+        help="Poisson ratio for the reference run (default %(default)s). "
+             "Non-default values write a _nu<value>-suffixed fixture.",
+    )
     args = parser.parse_args()
     if args.summary:
         summarize()
     else:
-        main()
+        main(args.nu)

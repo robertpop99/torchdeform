@@ -152,7 +152,7 @@ def _report(name: str, errs: np.ndarray, tol: float) -> None:
 # --------------------------------------------------------------------------- #
 # Mogi
 # --------------------------------------------------------------------------- #
-def test_mogi_vs_vmod():
+def _run_mogi() -> np.ndarray:
     rng = np.random.default_rng(BASE_SEED + 1)
     xc = rng.uniform(-500, 500, N_SAMPLES)
     yc = rng.uniform(-500, 500, N_SAMPLES)
@@ -174,7 +174,11 @@ def test_mogi_vs_vmod():
         ours = np.stack([OE[i], ON[i], OU[i]])
         vmod = np.stack([ve, vn, vu])
         errs[i] = _rel_field_error(ours, vmod)
+    return errs
 
+
+def test_mogi_vs_vmod():
+    errs = _run_mogi()
     tol = 1e-10
     _report("Mogi", errs, tol)
     assert errs.max() < tol
@@ -219,7 +223,7 @@ def _okada_vmod(strike_deg, dip_deg, d1, d2, d3, xc, yc, depth, L, W):
     return np.stack([eh[0], eh[1], tot[2]])
 
 
-def test_okada_vs_vmod():
+def _run_okada() -> np.ndarray:
     rng = np.random.default_rng(BASE_SEED + 2)
     strike = rng.uniform(0, 360, N_SAMPLES)
     dip = rng.uniform(5, 89, N_SAMPLES)
@@ -254,7 +258,11 @@ def test_okada_vs_vmod():
         )
         ours = np.stack([OE[i], ON[i], OU[i]])
         errs[i] = _rel_field_error(ours, vmod)
+    return errs
 
+
+def test_okada_vs_vmod():
+    errs = _run_okada()
     # analytic model; residual is dominated by obs points nearest the fault
     tol = 1e-4
     _report("Okada", errs, tol)
@@ -265,7 +273,7 @@ def test_okada_vs_vmod():
 # --------------------------------------------------------------------------- #
 # Penny-shaped crack
 # --------------------------------------------------------------------------- #
-def test_penny_vs_vmod():
+def _run_penny() -> np.ndarray:
     rng = np.random.default_rng(BASE_SEED + 3)
     xc = rng.uniform(-500, 500, N_SAMPLES)
     yc = rng.uniform(-500, 500, N_SAMPLES)
@@ -307,7 +315,11 @@ def test_penny_vs_vmod():
         ours = np.stack([OE[i], ON[i], OU[i]])
         vmod = np.stack([ve, vn, vu])
         errs[i] = _rel_field_error(ours, vmod)
+    return errs
 
+
+def test_penny_vs_vmod():
+    errs = _run_penny()
     # ~1e-3 rel = VMOD's numerical Hankel transform vs our closed-form one; in
     # absolute terms ~0.1% of the peak (e.g. 0.17 mm on a 168 mm signal).
     tol = 5e-3
@@ -348,7 +360,7 @@ def _cdm_euler_to_vmod(ox, oy, oz):
     return np.degrees(a), np.degrees(b), np.degrees(c)
 
 
-def test_cdm_vs_vmod():
+def _run_cdm() -> np.ndarray:
     rng = np.random.default_rng(BASE_SEED + 4)
     xc = rng.uniform(-500, 500, N_SAMPLES)
     yc = rng.uniform(-500, 500, N_SAMPLES)
@@ -381,8 +393,27 @@ def test_cdm_vs_vmod():
         )
         ours = np.stack([OE[i], ON[i], OU[i]])
         errs[i] = _rel_field_error(ours, vmod)
+    return errs
 
+
+def test_cdm_vs_vmod():
+    errs = _run_cdm()
     tol = 1e-4
     _report("CDM", errs, tol)
     assert np.quantile(errs, 0.99) < tol
     assert errs.max() < 5 * tol
+
+
+# --------------------------------------------------------------------------- #
+# Registry consumed by the accuracy-table emitter (emit_accuracy_table.py).
+# Order matches the README table. Each entry: (torchdeform class, VMOD class,
+# error-array producer, qualitative note). Keeping this next to the tests means
+# the emitted table measures exactly what the tests measure -- one driver, no
+# duplicated sampling/adapter logic to drift.
+# --------------------------------------------------------------------------- #
+MODELS = [
+    ("MogiSource", "Mogi", _run_mogi, "closed-form, machine precision"),
+    ("OkadaSource", "Okada", _run_okada, "closed-form; max is 1 near-fault point"),
+    ("CDMSource", "Cdm", _run_cdm, "closed-form; max is 1 near-source point"),
+    ("PennySource", "Penny", _run_penny, "numerical Hankel transform (see below)"),
+]

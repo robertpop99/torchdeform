@@ -118,7 +118,7 @@ def run_fullz(x_obs, y_obs, z_obs, source_x, source_y, dip, strike,
     return out.e, out.n, out.u
 
 
-def random_params(seed, batch=4, n=12, surface_safe=True):
+def random_params(seed, batch=4, n=12):
     """Random but physically sane fault/observation configurations."""
     g = torch.Generator().manual_seed(seed)
 
@@ -139,8 +139,6 @@ def random_params(seed, batch=4, n=12, surface_safe=True):
     d3 = u(-0.5, 0.5, batch)
     x_obs = u(-60e3, 60e3, batch, n)
     y_obs = u(-60e3, 60e3, batch, n)
-    if not surface_safe:
-        pass
     return dict(x_obs=x_obs, y_obs=y_obs, source_x=source_x, source_y=source_y,
                 dip=dip, strike=strike, depth=depth, length=length,
                 width=width, d1=d1, d2=d2, d3=d3)
@@ -501,16 +499,25 @@ class TestOkadaDC3DVolume:
     DC3D.f90); the committed JSON is all this test needs. See reference/README.md.
     """
 
-    def _load(self):
-        assert _DC3D_GOLDEN.is_file(), (
-            f"{_DC3D_GOLDEN} missing; regenerate with reference/gen_dc3d.py"
+    def _load(self, fname="dc3d_golden.json"):
+        golden = _DC3D_GOLDEN.parent / fname
+        assert golden.is_file(), (
+            f"{golden} missing; regenerate with reference/gen_dc3d.py"
         )
-        return json.loads(_DC3D_GOLDEN.read_text())
+        return json.loads(golden.read_text())
 
-    def test_dc3d_volume_displacement(self):
-        d = self._load()
-        # Material must match the fixture (nu = 0.25 -> alpha = 2/3).
-        assert d["poisson_ratio"] == 0.25
+    # The canonical fixture is nu = 0.25 (the default everywhere); the _nu0.32
+    # sibling repeats the identical faults/points at nu = 0.32, verifying the
+    # poisson_ratio -> alpha path against DC3D itself. The vectorized
+    # forward/strain tests -- both the full-volume OkadaSource ones and the
+    # surface-only OkadaSourceSimple ones -- run on both; the one-hot gradient
+    # loops below stay on the canonical fixture (a wrong nu-dependence would
+    # already show in the vectorized rows).
+    _FIXTURES = ["dc3d_golden.json", "dc3d_golden_nu0.32.json"]
+
+    @pytest.mark.parametrize("fname", _FIXTURES)
+    def test_dc3d_volume_displacement(self, fname):
+        d = self._load(fname)
 
         model = OkadaSource(poisson_ratio=d["poisson_ratio"])
         out = model(
@@ -532,7 +539,8 @@ class TestOkadaDC3DVolume:
             f"{(got - want).abs().max().item():.3e} m"
         )
 
-    def test_dc3d_surface_simplified(self):
+    @pytest.mark.parametrize("fname", _FIXTURES)
+    def test_dc3d_surface_simplified(self, fname):
         """OkadaSourceSimple (surface-only fast path) against DC3D ground truth
         at the fixture's z = 0 points.
 
@@ -542,7 +550,7 @@ class TestOkadaDC3DVolume:
         strike. Each surface point is flattened to its own batch element so the
         per-fault parameters line up with the ragged count of z = 0 points.
         """
-        d = self._load()
+        d = self._load(fname)
         z = t(d["z_obs"])
         mask = z == 0.0                       # exact: generator sets 0.0
         assert int(mask.sum()) > 50, "fixture has too few surface points"
@@ -569,7 +577,8 @@ class TestOkadaDC3DVolume:
             f"{(got - want).abs().max().item():.3e} m"
         )
 
-    def test_dc3d_surface_simplified_analytic_grad_strain(self):
+    @pytest.mark.parametrize("fname", _FIXTURES)
+    def test_dc3d_surface_simplified_analytic_grad_strain(self, fname):
         """OkadaSourceSimple(analytic_grad=True)'s closed-form backward vs DC3D's
         exact derivatives, at the fixture's z = 0 points.
 
@@ -580,7 +589,7 @@ class TestOkadaDC3DVolume:
         ``(C @ J_fault @ C)[:, :, :2]`` is the reference. The z-derivative column
         is only checkable through the full OkadaSource (see the volume test).
         """
-        d = self._load()
+        d = self._load(fname)
         z = t(d["z_obs"])
         mask = z == 0.0
         b, n = z.shape
@@ -623,7 +632,8 @@ class TestOkadaDC3DVolume:
             f"surface: max abs diff {(j_map_h - j_map_ref).abs().max().item():.3e} /m"
         )
 
-    def test_dc3d_volume_analytic_grad_strain(self):
+    @pytest.mark.parametrize("fname", _FIXTURES)
+    def test_dc3d_volume_analytic_grad_strain(self, fname):
         """OkadaSource(analytic_grad=True)'s closed-form backward vs DC3D's exact
         spatial derivatives, over the same at-depth volume.
 
@@ -641,7 +651,7 @@ class TestOkadaDC3DVolume:
         analytic strain in the *interior* (z < 0) and for all nine components --
         Okada-85 Table 2 covers three surface points and horizontal derivatives.
         """
-        d = self._load()
+        d = self._load(fname)
 
         x = t(d["x_obs"]).requires_grad_(True)
         y = t(d["y_obs"]).requires_grad_(True)
@@ -714,11 +724,12 @@ class TestOkadaDC3DVolume:
             )
 
     def test_dc3d_geometry_gradient_finite_diff(self):
-        """length / width / centroid_depth gradients vs DC3D central differences
-        (stored in the fixture). These flow through autograd of the exact forward,
-        a different path from the closed-form strain. The gradient magnitudes are
-        small (~1e-5 /m), so the finite-difference truncation is negligible and
-        agreement is ~1e-11."""
+        """length / width / centroid_depth gradients vs DC3D Richardson-
+        extrapolated central differences (stored in the fixture). These flow
+        through autograd of the exact forward, a different path from the
+        closed-form strain. The reference's own noise floor is ~1e-9 relative
+        (DC3D forward noise / step -- see gen_dc3d.py), which sets the
+        tolerance; measured agreement is ~3e-9 of the peak gradient."""
         d = self._load()
         b, n = d["n_faults"], d["n_points"]
         names = ("length", "width", "centroid_depth")
@@ -726,23 +737,24 @@ class TestOkadaDC3DVolume:
         for name in names:
             got = _per_point_source_grad(out, leaves[name], b, n)
             want = t(d["param_gradients"][name])[:, :got.shape[1]]
-            assert torch.allclose(got, want, rtol=1e-6, atol=1e-9), (
+            assert torch.allclose(got, want, rtol=1e-7, atol=1e-11), (
                 f"d u / d {name} disagrees with DC3D finite diff: max abs diff "
                 f"{(got - want).abs().max().item():.3e}"
             )
 
     def test_dc3d_dip_gradient_finite_diff(self):
-        """dip gradient vs a DC3D central difference. The weakest of the set:
-        analytic_grad computes dip by its *own* wide central difference, so this
-        is finite-diff vs finite-diff -- it confirms sign and scale (agreement
-        ~1e-6 on a gradient of magnitude ~0.5), not machine precision. The exact
-        dip sensitivity is covered by the gradcheck tests below."""
+        """dip gradient vs a DC3D Richardson-extrapolated central difference.
+        No fixture fault lies in the near-vertical band where analytic_grad
+        swaps in its own FD (|cos dip| < DIP_FD_BAND, ~0.17 deg of vertical;
+        the fixture's steepest is 89 deg), so this checks autograd of the exact
+        forward. Agreement is limited by the reference's ~1e-9 relative noise
+        floor (see gen_dc3d.py), measured ~2e-9 of the peak gradient."""
         d = self._load()
         b, n = d["n_faults"], d["n_points"]
         out, leaves = _dc3d_model_run(d, {"dip"})
         got = _per_point_source_grad(out, leaves["dip"], b, n)
         want = t(d["param_gradients"]["dip"])[:, :got.shape[1]]
-        assert torch.allclose(got, want, rtol=1e-3, atol=1e-5), (
+        assert torch.allclose(got, want, rtol=1e-7, atol=1e-8), (
             "d u / d dip disagrees with DC3D finite diff: max abs diff "
             f"{(got - want).abs().max().item():.3e}"
         )
@@ -779,12 +791,13 @@ class TestOkadaDC3DVolume:
 
     def test_dc3d_surface_simplified_finite_diff_gradients(self):
         """OkadaSourceSimple finite-difference source-parameter gradients at
-        z = 0: dip / length / width / centroid_depth vs the DC3D references.
-        Same tolerances as the volume model (dip is the loose one)."""
+        z = 0: dip / length / width / centroid_depth vs the DC3D references
+        (Richardson-extrapolated central differences, ~1e-9 relative). Same
+        tolerances as the volume model."""
         d = self._load()
         tol = {
-            "length": (1e-6, 1e-9), "width": (1e-6, 1e-9),
-            "centroid_depth": (1e-6, 1e-9), "dip": (1e-3, 1e-5),
+            "length": (1e-7, 1e-11), "width": (1e-7, 1e-11),
+            "centroid_depth": (1e-7, 1e-11), "dip": (1e-7, 1e-8),
         }
         out, leaves, mask = _dc3d_surface_simplified_run(d, set(tol))
         for name, (rtol, atol) in tol.items():
@@ -1092,46 +1105,44 @@ class TestAnalyticBackend:
 
     @pytest.mark.parametrize("mode", [{}, {"smooth_grad": True}],
                              ids=["exact", "smooth_grad"])
-    @pytest.mark.parametrize("dip_deg", [78.0, 82.0, 84.0])
+    @pytest.mark.parametrize("dip_deg", [72.0, 76.0, 78.0])
     def test_forward_float32_band_edge_margin(self, dip_deg, mode):
         """Characterise pure-float32 accuracy just *outside* the promotion band.
 
-        These dips have ``|cos(dip)| = 0.21/0.14/0.105 > F32_VERTICAL_BAND = 0.1``,
+        These dips have ``|cos(dip)| = 0.31/0.24/0.21 > F32_VERTICAL_BAND = 0.2``,
         so the model does NOT promote and runs in pure float32 -- this is the edge
-        the 0.1 threshold leaves to float32. It exposes that 0.1 is *optimistic*:
-        error grows steeply toward the band and, right at the edge (84 deg), the
-        exact mode reaches ~1.3e-3 -- over the 1e-3 contract that the promoted band
-        satisfies (see the ``F32_VERTICAL_BAND`` note; the un-promoted edge is the
-        one regime that misses it). Widening the band to 0.2 would promote these
-        dips and restore 1e-3; it is left at 0.1 for speed for now. This test pins
-        the edge to a 2e-3 bound so the small overshoot cannot silently grow (via a
-        narrowed band or numeric drift) without a failure here.
-
-        The 78/82 deg cases stay well under 1e-3 (~2-4e-4); 84 deg is the outlier.
+        the threshold leaves to float32, historically the one regime that broke
+        the 1e-3 contract. With the old 0.1 band the un-promoted edge sat at
+        84 deg where a normal geometry reaches ~1.3e-3; the band is 0.2 exactly
+        so the edge (~78.5 deg, measured ~1-2e-4 here) meets the contract with
+        ~5-8x margin. This test pins the un-promoted edge to the 1e-3 contract
+        itself, so a narrowed band or numeric drift fails here rather than
+        silently eroding float32 accuracy.
         """
         m32 = OkadaSourceSimple(internal_dtype=torch.float32, **mode)
         m64 = OkadaSourceSimple(internal_dtype=torch.float64, **mode)
         dip = math.radians(dip_deg)
         assert abs(math.cos(dip)) > F32_VERTICAL_BAND     # genuinely un-promoted
+        assert m32._compute_dtype(t([dip]).float()) == torch.float32
         o32 = m32(dip=t([dip]).float(), **self._f32_base(torch.float32))
         o64 = m64(dip=t([dip]), **self._f32_base(torch.float64))
         v32 = torch.cat([o32.e, o32.n, o32.u]).double()
         v64 = torch.cat([o64.e, o64.n, o64.u])
-        assert (v32 - v64).abs().max() <= 2e-3 * v64.abs().max()
+        assert (v32 - v64).abs().max() <= 1e-3 * v64.abs().max()
 
     def test_f32_vertical_band_constructor_override(self):
         """The ``f32_vertical_band`` knob widens the float64-promotion band.
 
-        At dip 83 deg (``|cos| = 0.122``) the default band (0.1) leaves the batch
-        in float32 -- near the edge, so ~1e-3 error -- while a model built with
-        ``f32_vertical_band=0.2`` promotes it to float64 and tracks the float64
-        reference to float32-cast precision. Verifies the constructor arg is
-        threaded through ``_compute_dtype`` per instance."""
-        dip = t([math.radians(83.0)])
+        At dip 76 deg (``|cos| = 0.242``) the default band (0.2) leaves the batch
+        in float32, while a model built with ``f32_vertical_band=0.3`` promotes
+        it to float64 and tracks the float64 reference to float32-cast
+        precision. Verifies the constructor arg is threaded through
+        ``_compute_dtype`` per instance."""
+        dip = t([math.radians(76.0)])
         assert abs(math.cos(float(dip))) > F32_VERTICAL_BAND     # default: un-promoted
 
         default = OkadaSourceSimple(internal_dtype=torch.float32)
-        widened = OkadaSourceSimple(internal_dtype=torch.float32, f32_vertical_band=0.2)
+        widened = OkadaSourceSimple(internal_dtype=torch.float32, f32_vertical_band=0.3)
         assert default._compute_dtype(dip) == torch.float32      # stays float32
         assert widened._compute_dtype(dip) == torch.float64      # promoted
 
@@ -1341,11 +1352,15 @@ class TestFullZConsistency:
         assert torch.allclose(un_f, un_s, rtol=1e-10, atol=1e-12)
         assert torch.allclose(uu_f, uu_s, rtol=1e-10, atol=1e-12)
 
-    def test_fullz_against_dc3d_at_depth(self):
+    @pytest.mark.parametrize("nu", [0.25, 0.32])
+    def test_fullz_against_dc3d_at_depth(self, nu):
+        """Parametrized over nu: 0.25 is the default everywhere else in the
+        suite, 0.32 exercises the poisson_ratio -> alpha path against DC3D's own
+        material handling (alpha = (lam+mu)/(lam+2mu) = 1/(2(1-nu)))."""
         okada_wrapper = pytest.importorskip("okada_wrapper")
         dc3dwrapper = okada_wrapper.dc3dwrapper
 
-        alpha = 2.0 / 3.0  # nu = 0.25  ->  alpha = (lam+mu)/(lam+2mu) = 2/3
+        alpha = 1.0 / (2.0 * (1.0 - nu))
         dip_deg = 55.0
         dip = math.radians(dip_deg)
         L, W, depth_c = 12e3, 6e3, 9e3
@@ -1369,6 +1384,7 @@ class TestFullZConsistency:
             dip=[dip], strike=[0.0],
             depth=[depth_c], length=[L], width=[W],
             d1=[d1], d2=[d2], d3=[d3],
+            poisson_ratio=nu,
         )
 
         for i, (xl, yl, z) in enumerate(obs):
@@ -1502,6 +1518,43 @@ class TestPhysicsInvariants:
 
 class TestNumericalHealth:
     """Finite values and gradients at and near Okada's singular configurations."""
+
+    def test_smooth_grad_forward_tracks_exact(self):
+        """Pin the smooth_grad forward to the exact forward.
+
+        smooth_grad perturbs the kernels only near their singular configurations;
+        everywhere else its *values* must track the exact forward closely. Nothing
+        else in the suite bounds this (the reference checks all run the exact
+        mode), so a regression that ballooned the smoothing radius would
+        otherwise pass every test. Measured today: ~8e-9 relative at a benign
+        config, ~5e-7 m max on a trace-crossing grid with unit slips -- the
+        bounds below leave ~100x headroom.
+        """
+        # benign, fully-buried config: tight relative agreement
+        p = random_params(3, batch=3, n=8)
+        exact = run_simplified(**p)
+        smooth = run_simplified(**p, smooth_grad=True)
+        for a, b in zip(smooth, exact):
+            scale = float(b.abs().max())
+            assert float((a - b).abs().max()) <= 1e-6 * scale
+
+        # surface-breaking vertical fault, grid crossing the trace: the
+        # perturbation is allowed near the singular trace but must stay small
+        # in absolute terms for unit slips.
+        L, W = 10e3, 5e3
+        g = torch.linspace(-8e3, 8e3, 41, dtype=DTYPE)
+        X, Y = torch.meshgrid(g, g, indexing="xy")
+        common = dict(
+            x_obs=X.reshape(1, -1), y_obs=Y.reshape(1, -1),
+            source_x=[0.0], source_y=[0.0],
+            dip=[math.pi / 2.0], strike=[0.3],
+            depth=[0.5 * W], length=[L], width=[W],
+            d1=[1.0], d2=[0.5], d3=[0.0],
+        )
+        exact = run_simplified(**common)
+        smooth = run_simplified(**common, smooth_grad=True)
+        for a, b in zip(smooth, exact):
+            assert float((a - b).abs().max()) <= 1e-5
 
     def test_surface_breaking_trace_is_finite(self):
         """Vertical, surface-breaking fault: points exactly on the trace hit
@@ -1718,6 +1771,16 @@ class TestInputValidation:
         with pytest.raises(ValueError, match="width"):
             run_simplified(**p)
 
+    def test_fullz_rejects_positive_z(self):
+        # observation points above the free surface are outside the half-space.
+        with pytest.raises(ValueError, match="z <= 0"):
+            run_fullz(z_obs=[[0.0, 1.0]], **self._base)
+
+    def test_fullz_rejects_bad_z_shape(self):
+        # z must be [B] or [B, N]; a 3-D z must fail loudly, not broadcast.
+        with pytest.raises(ValueError, match="z must have shape"):
+            run_fullz(z_obs=[[[0.0], [0.0]]], **self._base)
+
     # dip = 90 deg vertical; top-edge depth = centroid_depth - width/2.
     _vert = dict(_base, dip=[math.pi / 2], width=[4e3])
 
@@ -1754,6 +1817,21 @@ class TestBatching:
             assert torch.allclose(ue[b:b + 1], ue_b, rtol=1e-12, atol=1e-15)
             assert torch.allclose(un[b:b + 1], un_b, rtol=1e-12, atol=1e-15)
             assert torch.allclose(uu[b:b + 1], uu_b, rtol=1e-12, atol=1e-15)
+
+    def test_single_source_broadcasts_over_batch(self):
+        """B=1 source parameters against [B, N] observations: the documented
+        broadcast path in ``_validate_inputs`` ("leading dimension B or 1") must
+        equal explicitly expanding the parameters to B."""
+        p = random_params(37, batch=3, n=5)
+        single = {k: (v[:1] if v.ndim == 1 else v) for k, v in p.items()}
+        expanded = {k: (v[:1].expand(3).clone() if v.ndim == 1 else v)
+                    for k, v in p.items()}
+        ue1, un1, uu1 = run_simplified(**single)
+        ue2, un2, uu2 = run_simplified(**expanded)
+        assert ue1.shape == p["x_obs"].shape
+        assert torch.allclose(ue1, ue2, rtol=1e-12, atol=1e-15)
+        assert torch.allclose(un1, un2, rtol=1e-12, atol=1e-15)
+        assert torch.allclose(uu1, uu2, rtol=1e-12, atol=1e-15)
 
     def test_fullz_scalar_and_per_point_z_agree(self):
         p = random_params(31, batch=2, n=7)

@@ -334,6 +334,11 @@ class CDMSource(SourceModel):
              "omega_x": omega_x, "omega_y": omega_y, "omega_z": omega_z,
              "a_x": a_x, "a_y": a_y, "a_z": a_z, "opening": opening},
         )
+        if torch.any(depth <= 0):
+            raise ValueError("depth must be strictly positive")
+        for name, val in (("a_x", a_x), ("a_y", a_y), ("a_z", a_z)):
+            if torch.any(val <= 0):
+                raise ValueError(f"{name} must be strictly positive")
 
         dtype = self.internal_dtype
         num_eps = self._resolve_num_eps()
@@ -379,6 +384,20 @@ class CDMSource(SourceModel):
         R2 = R1 - ax * c1
         R3 = R2 - ay * c2
         R4 = R1 - ay * c2
+
+        # Half-space solution: every dislocation vertex must stay at or below
+        # the free surface (the reference CDM.m errors with "The CDM must be
+        # under the free surface!"). Above-surface vertices would otherwise
+        # produce silently unphysical fields.
+        vert_z = torch.stack(
+            [V[:, 2] for V in (P1, P2, P3, P4, Q1, Q2, Q3, Q4, R1, R2, R3, R4)],
+            dim=-1,
+        )
+        if torch.any(vert_z > 0):
+            raise ValueError(
+                "CDM extends above the free surface: all dislocation vertices "
+                "must satisfy z <= 0. Increase depth or shrink the semi-axes."
+            )
 
         op = opening[:, None]
         ue = torch.zeros_like(x_obs)

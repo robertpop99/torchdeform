@@ -69,14 +69,32 @@ Optional knobs:
 
 ### What's compared
 
-Relative field error over 1000 random samples, as `median → max`:
+The table below is **generated**, not hand-typed: `emit_accuracy_table.py`
+runs the same drivers as this suite and writes a qualitative `median → max`
+table. Refresh it (needs VMOD installed) with:
 
-| torchdeform      | VMOD    | median | max   | notes                     |
-|------------------|---------|--------|-------|---------------------------|
-| `MogiSource`     | `Mogi`  | ~2e-16 | ~5e-16| closed-form, machine prec |
-| `OkadaSource`    | `Okada` | ~2e-13 | ~1e-9 | closed-form; max is 1 near-fault point |
-| `CDMSource`      | `Cdm`   | ~7e-13 | ~1e-6 | closed-form; max is 1 near-source point |
-| `PennySource`    | `Penny` | ~1e-3  | <5e-3 | numerical Hankel transform (see below) |
+```bash
+RUN_VMOD_TESTS=1 python emit_accuracy_table.py --write
+```
+
+The numbers are seed- and sample-count-dependent, so they are rendered
+qualitatively (one significant figure) — "these came from a real seed-0 run",
+not "reproducible to machine precision".
+
+<!-- VMOD-ACCURACY:START -->
+
+Relative field error over 1000 random samples per model (seed 0), as `median → max`. Qualitative (one significant figure) -- the exact digits shift with the seed and sample count.
+
+| torchdeform | VMOD | median | max | notes |
+|---|---|--------|-------|-------|
+| `MogiSource` | `Mogi` | ~2e-16 | ~5e-16 | closed-form, machine precision |
+| `OkadaSource` | `Okada` | ~2e-13 | ~1e-9 | closed-form; max is 1 near-fault point |
+| `CDMSource` | `Cdm` | ~7e-13 | ~4e-6 | closed-form; max is 1 near-source point |
+| `PennySource` | `Penny` | ~1e-3 | ~2e-2 | numerical Hankel transform (see below) |
+
+*Regenerate with `RUN_VMOD_TESTS=1 python emit_accuracy_table.py --write` (needs VMOD installed; numbers are from one seed-0 run).*
+
+<!-- VMOD-ACCURACY:END -->
 
 The Okada/CDM `max` columns are a normalization artifact, not real disagreement
 — see "Why Penny agrees only to ~1e-3" below for the full breakdown.
@@ -94,14 +112,14 @@ signal, never "1e-3 mm".
 Mogi, Okada and CDM are **closed-form** elementary functions: both libraries
 evaluate essentially the same algebra, so they agree to float64 machine
 precision. Their *median* error is ~1e-13; the larger *max* figures in the table
-(Okada ~1e-9, CDM ~1e-6) are a **normalization artifact**, not real
-disagreement. They come from the single observation point nearest a dislocation
-edge / the buried source, where the kernels (logs, arctangents) go near-singular
-and the two codes' rounding diverges by tens of nanometres — divided by a small
-peak amplitude, that reads as ~1e-6 relative. CDM's tail is a touch larger than
-Okada's because it sums three near-singular rectangular dislocations rather than
-one (the Euler-angle re-decomposition is exact to machine epsilon and is *not*
-the cause).
+are a **normalization artifact**, not real disagreement. They come from the
+single observation point nearest a dislocation edge / the buried source, where
+the kernels (logs, arctangents) go near-singular and the two codes' rounding
+diverges by tens of nanometres — divided by a small peak amplitude, that reads
+as a few ×1e-6 relative. CDM's tail is a touch larger than Okada's because it
+sums three near-singular rectangular dislocations rather than one (the
+Euler-angle re-decomposition is exact to machine epsilon and is *not* the
+cause).
 
 The **Penny** (Fialko 2001) crack has **no elementary closed form**. It requires
 a Fredholm solve for auxiliary functions plus a *semi-infinite* Hankel
@@ -119,7 +137,9 @@ for shallow/wide cracks (small h, where the e^(−ξh) tail decays slowly past
 ξ = 60) and for far-field points (Jₙ(ξr) oscillates faster than the fixed node
 set resolves). It is not torchdeform uncertainty — refining our quadrature
 doesn't move the gap. The Penny test samples the deeper magmatic regime
-(depth ≥ 4 km, radius/depth ∈ [0.2, 0.75]) to keep that error sub-percent.
+(depth ≥ 4 km, radius/depth ∈ [0.2, 0.75]) to keep the *typical* error
+sub-percent (median ~1e-3); the worst single sample of 1000 still reaches a few
+percent (max ~2e-2), which is why the test asserts `max < 2e-2`.
 
 The two libraries use different internal parameter conventions; each adapter in
 the test maps a torchdeform parameter set to the equivalent VMOD call. The

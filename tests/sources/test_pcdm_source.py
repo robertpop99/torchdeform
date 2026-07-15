@@ -328,9 +328,7 @@ class TestNikkhooReference:
 # --------------------------------------------------------------------------- #
 # External reference: pCDM over a random parameter volume
 # --------------------------------------------------------------------------- #
-_PCDM_VOLUME_GOLDEN = (
-    Path(__file__).resolve().parent / "data" / "pcdm_volume_golden.json"
-)
+_PCDM_VOLUME_DIR = Path(__file__).resolve().parent / "data"
 
 
 def _t(x):
@@ -345,21 +343,27 @@ class TestPCDMVolume:
     fixture ``data/pcdm_volume_golden.json`` freezes ``pCDM.m``'s forward ENU for
     16 random buried pCDMs -- random depth, full 3-axis orientation, and
     anisotropic (same-sign) potencies -- observed at 24 surface points each.
+    The ``_nu0.32`` sibling repeats the identical geometry at ``nu = 0.32``:
+    every other external reference in the suite pins ``nu = 0.25``, so this is
+    what verifies the non-trivial Poisson-ratio dependence of the kernels.
     Forward only: PCDMSource has no hand-written backward, so its gradients are
     covered by ``test_gradcheck`` (autograd vs. finite differences), not here.
-    Regenerate with ``reference/gen_pcdm_volume.py`` (needs MATLAB + vendored
-    nikkhoo/); the committed JSON is all this test needs. See reference/README.md.
+    Regenerate with ``reference/gen_pcdm_volume.py [--nu 0.32]`` (needs MATLAB +
+    vendored nikkhoo/); the committed JSON is all this test needs. See
+    reference/README.md.
     """
 
-    def test_pcdm_volume_displacement(self):
-        assert _PCDM_VOLUME_GOLDEN.is_file(), (
-            f"{_PCDM_VOLUME_GOLDEN} missing; regenerate with "
-            "reference/gen_pcdm_volume.py"
+    @pytest.mark.parametrize(
+        "fname", ["pcdm_volume_golden.json", "pcdm_volume_golden_nu0.32.json"]
+    )
+    def test_pcdm_volume_displacement(self, fname):
+        golden = _PCDM_VOLUME_DIR / fname
+        assert golden.is_file(), (
+            f"{golden} missing; regenerate with reference/gen_pcdm_volume.py"
         )
-        d = json.loads(_PCDM_VOLUME_GOLDEN.read_text())
-        assert d["poisson_ratio"] == 0.25   # must match PCDMSource default nu
+        d = json.loads(golden.read_text())
 
-        out = PCDMSource()(
+        out = PCDMSource(poisson_ratio=d["poisson_ratio"])(
             _t(d["x_obs"]), _t(d["y_obs"]),
             source_x=_t(d["source_x"]), source_y=_t(d["source_y"]),
             depth=_t(d["depth"]),
@@ -370,9 +374,10 @@ class TestPCDMVolume:
         got = torch.stack([out.e, out.n, out.u], dim=-1)   # [B, N, 3] ENU
         want = _t(d["u_enu"])
 
-        # Both sides float64; the port reproduces pCDM.m to ~1e-13 relative. atol
-        # covers far-field points where |u| shrinks to noise.
-        assert torch.allclose(got, want, rtol=1e-6, atol=1e-12), (
+        # Both sides float64; the port reproduces pCDM.m to ~1e-13 relative, so
+        # rtol has ~4 orders of headroom while still catching small numerical
+        # regressions. atol covers far-field points where |u| shrinks to noise.
+        assert torch.allclose(got, want, rtol=1e-9, atol=1e-12), (
             "PCDMSource disagrees with pCDM.m: max abs diff "
             f"{(got - want).abs().max().item():.3e} m"
         )

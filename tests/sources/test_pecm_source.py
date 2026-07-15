@@ -255,6 +255,49 @@ def test_bad_shape_raises():
                a_x=_f(3, 900), a_y=_f(3, 600), a_z=_f(3, 300), pressure=_f(3, 8e6))
 
 
+def _valid_kwargs(B, **over):
+    kw = dict(source_x=_f(B, 0), source_y=_f(B, 0), depth=_f(B, 4000),
+              omega_x=_f(B, 0.3), omega_y=_f(B, 0.2), omega_z=_f(B, 0.5),
+              a_x=_f(B, 900), a_y=_f(B, 600), a_z=_f(B, 300), pressure=_f(B, 8e6))
+    kw.update(over)
+    return kw
+
+
+@pytest.mark.parametrize("bad", [0.0, -4000.0])
+def test_nonpositive_depth_raises(bad):
+    # a source at/above the free surface is outside the buried half-space.
+    x, y = _grid(2, 5)
+    with pytest.raises(ValueError, match="depth"):
+        _src()(x, y, **_valid_kwargs(2, depth=_f(2, bad)))
+
+
+@pytest.mark.parametrize("axis", ["a_x", "a_y", "a_z"])
+@pytest.mark.parametrize("bad", [0.0, -600.0])
+def test_nonpositive_semi_axis_raises(axis, bad):
+    # previously a negative axis fed a negative volume into the potencies and
+    # returned ~1e10 m displacements silently.
+    x, y = _grid(2, 5)
+    with pytest.raises(ValueError, match=axis):
+        _src()(x, y, **_valid_kwargs(2, **{axis: _f(2, bad)}))
+
+
+def test_ecm_potencies_rejects_nonpositive_axis():
+    # the public helper must guard itself too, not only via PECMSource.forward.
+    with pytest.raises(ValueError, match="a_y"):
+        ecm_potencies(_f(1, 900), _f(1, 0.0), _f(1, 300), _f(1, 8e6), NU, K)
+
+
+def test_raises_if_any_batch_element_degenerate():
+    # a single bad element in an otherwise valid batch must still raise.
+    x, y = _grid(3, 5)
+    depth = _f(3, 4000); depth[1] = 0.0
+    with pytest.raises(ValueError, match="depth"):
+        _src()(x, y, **_valid_kwargs(3, depth=depth))
+    a_z = _f(3, 300); a_z[2] = -5.0
+    with pytest.raises(ValueError, match="a_z"):
+        _src()(x, y, **_valid_kwargs(3, a_z=a_z))
+
+
 # --------------------------------------------------------------------------- #
 # Differentiability  (unit-scale, triaxial, away from branch boundaries)
 # --------------------------------------------------------------------------- #
@@ -382,9 +425,7 @@ class TestNikkhooReference:
 # --------------------------------------------------------------------------- #
 # External reference: pECM over a random parameter volume
 # --------------------------------------------------------------------------- #
-_PECM_VOLUME_GOLDEN = (
-    Path(__file__).resolve().parent / "data" / "pecm_volume_golden.json"
-)
+_PECM_VOLUME_DIR = Path(__file__).resolve().parent / "data"
 
 
 def _tt(x):
@@ -398,20 +439,25 @@ class TestPECMVolume:
     Complements ``TestNikkhooReference``'s two hand-picked orientations: the
     fixture ``data/pecm_volume_golden.json`` freezes ``pECM.m``'s forward ENU for
     16 random buried point cavities -- random depth, full 3-axis orientation,
-    semi-axes and (signed) pressure -- observed at 24 surface points each.
-    Forward only: PECMSource has no hand-written backward, so its gradients are
-    covered by ``test_gradcheck`` (autograd vs. finite differences), not here.
-    Regenerate with ``reference/gen_pecm_volume.py`` (needs MATLAB + vendored
+    semi-axes and (signed) pressure -- observed at 24 surface points each. The
+    ``_nu0.32`` sibling repeats the identical geometry at ``nu = 0.32``,
+    verifying the non-trivial Poisson-ratio dependence (Eshelby shape tensor +
+    PTD kernels) that the ``nu = 0.25``-only fixtures cannot see. Forward only:
+    PECMSource has no hand-written backward, so its gradients are covered by
+    ``test_gradcheck`` (autograd vs. finite differences), not here. Regenerate
+    with ``reference/gen_pecm_volume.py [--nu 0.32]`` (needs MATLAB + vendored
     nikkhoo/); the committed JSON is all this test needs. See reference/README.md.
     """
 
-    def test_pecm_volume_displacement(self):
-        assert _PECM_VOLUME_GOLDEN.is_file(), (
-            f"{_PECM_VOLUME_GOLDEN} missing; regenerate with "
-            "reference/gen_pecm_volume.py"
+    @pytest.mark.parametrize(
+        "fname", ["pecm_volume_golden.json", "pecm_volume_golden_nu0.32.json"]
+    )
+    def test_pecm_volume_displacement(self, fname):
+        golden = _PECM_VOLUME_DIR / fname
+        assert golden.is_file(), (
+            f"{golden} missing; regenerate with reference/gen_pecm_volume.py"
         )
-        d = json.loads(_PECM_VOLUME_GOLDEN.read_text())
-        assert d["poisson_ratio"] == 0.25    # material must match the fixture
+        d = json.loads(golden.read_text())
         assert d["shear_modulus"] == 3.0e10
 
         out = PECMSource(
@@ -427,7 +473,9 @@ class TestPECMVolume:
         )
         got = torch.stack([out.e, out.n, out.u], dim=-1)   # [B, N, 3] ENU
         want = _tt(d["u_enu"])
-        assert torch.allclose(got, want, rtol=1e-6, atol=1e-12), (
+        # Both sides float64; the port reproduces pECM.m to ~1e-13 relative, so
+        # rtol has ~4 orders of headroom while still catching small regressions.
+        assert torch.allclose(got, want, rtol=1e-9, atol=1e-12), (
             "PECMSource disagrees with pECM.m: max abs diff "
             f"{(got - want).abs().max().item():.3e} m"
         )

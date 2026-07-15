@@ -548,11 +548,13 @@ class TestPennyVolume:
             pressure=_tt(d["pressure"]),
         )
         # Radial (== +East) and vertical against the Fialko ground truth.
-        assert torch.allclose(out.e, _tt(d["ur"]), rtol=1e-6, atol=1e-12), (
+        # PennySource reproduces the Fialko code to ~1e-11 relative; 1e-9 keeps
+        # headroom while catching small regressions.
+        assert torch.allclose(out.e, _tt(d["ur"]), rtol=1e-9, atol=1e-12), (
             "PennySource Ur disagrees: max abs diff "
             f"{(out.e - _tt(d['ur'])).abs().max().item():.3e} m"
         )
-        assert torch.allclose(out.u, _tt(d["uz"]), rtol=1e-6, atol=1e-12), (
+        assert torch.allclose(out.u, _tt(d["uz"]), rtol=1e-9, atol=1e-12), (
             "PennySource Uz disagrees: max abs diff "
             f"{(out.u - _tt(d['uz'])).abs().max().item():.3e} m"
         )

@@ -109,24 +109,27 @@ BLEND_EPS  = 1e-4  # smooth_grad cd~0 blend width (physical, dtype-independent)
 # in float64 and cast the result back (see _OkadaBase._compute_dtype); float64 is
 # accurate down to |cos| ~ 1e-6, which is why it is the default compute dtype.
 #
-# Choice of 0.1 -- safe against gross failure, but slightly optimistic against the
-# 1e-3 float32 contract (see test_forward_float32_accurate_near_vertical). Measured
-# pure-float32 error (promotion disabled) grows smoothly as |cos(dip)| shrinks:
-# ~1e-5 at |cos|=0.5, ~1.5e-4 by |cos|=0.26 (dip 75 deg), then steeply near the
-# edge. It never leaks an orders-of-magnitude failure -- those start around
-# |cos|<0.05, well inside the band. But right at the band edge |cos|~0.1 (dip
-# ~84 deg) it reaches ~5e-4 to ~1.3e-3 depending on scene, i.e. a normal geometry
-# already *exceeds* 1e-3 there (the promoted band is what keeps the contract; the
-# un-promoted edge is the one regime that misses it -- see
-# test_forward_float32_band_edge_margin). Widening to 0.2 (dip ~78.5 deg) would
-# pull the edge back to ~2e-4 and restore 1e-3, at the cost of promoting steep
-# (>78 deg) faults to float64; near-vertical dykes already promote regardless and
-# common 45-70 deg faults stay float32 either way, so the extra cost is modest.
-# Default is 0.1 (favours float32 speed); a float32 user near ~80-84 deg dip should
-# expect ~1e-3, not float32 baseline. This is the *default* of the per-model
-# ``f32_vertical_band`` constructor knob -- callers who want tighter near-vertical
-# float32 accuracy can raise it (e.g. to 0.2) at the cost of promoting more scenes.
-F32_VERTICAL_BAND = 0.1
+# Choice of 0.2 -- holds the 1e-3 float32 contract through the un-promoted edge
+# (see test_forward_float32_accurate_near_vertical). Measured pure-float32 error
+# (promotion disabled) grows smoothly as |cos(dip)| shrinks: ~1e-5 at |cos|=0.5,
+# ~6e-5 by |cos|=0.24 (dip 76 deg), ~1.3e-4 at the band edge |cos|=0.2 (dip
+# ~78.5 deg) -- comfortably under 1e-3 -- then ~2.7e-4 at |cos|=0.14 and ~1.3e-3
+# at |cos|=0.105 (dip 84 deg), where a normal geometry already exceeds 1e-3.
+# The previous default of 0.1 put the edge exactly there, so the one un-promoted
+# regime broke the contract (see test_forward_float32_band_edge_margin history).
+# Orders-of-magnitude failures start around |cos|<0.05, well inside either band.
+#
+# The cost of the wider band is modest because promotion is whole-batch
+# (_compute_dtype): with a wide dip prior (30-90 deg) and realistic batch sizes,
+# a batch almost surely contains a near-vertical dip and promotes under either
+# band (B=64: 99.7% at 0.1 vs 100% at 0.2); priors that avoid steep dips
+# (<~78 deg) never promote under either. Only workloads concentrated in the
+# 78.5-84.3 deg window newly promote -- exactly the ones that previously got the
+# worst un-promoted error. This is the *default* of the per-model
+# ``f32_vertical_band`` constructor knob -- callers who prefer float32 speed for
+# steep (~79-84 deg) faults can lower it back (e.g. to 0.1) and accept ~1e-3
+# error at that edge.
+F32_VERTICAL_BAND = 0.2
 
 # analytic_grad dip derivative: |cos(dip)| below which we fall back from autograd
 # of the exact forward to a finite-difference estimate. Away from vertical,
@@ -1790,16 +1793,16 @@ class _OkadaBase(SourceModel):
             ``smooth_eps``, ``blend_eps``) are no longer constructor knobs -- they
             are derived from ``internal_dtype`` per call (see ``_okada_grad_floors``
             and the module ``*_EPS`` constants).
-        f32_vertical_band : float, default ``F32_VERTICAL_BAND`` (0.1)
+        f32_vertical_band : float, default ``F32_VERTICAL_BAND`` (0.2)
             Only relevant for a reduced-precision ``internal_dtype`` (float32/16).
             ``|cos(dip)|`` below which a batch is promoted to float64 for the near-
             vertical band the reduced precision cannot resolve (see
             ``_compute_dtype``). Trades float32 speed against near-vertical
-            accuracy: the 0.1 default keeps float32 for dips up to ~84 deg but lets
-            the error there reach ~1e-3; raise toward ~0.2 to hold the error under
-            ~1e-3 through the edge (promoting steep, >78 deg, faults to float64), or
-            lower it to keep more scenes in float32 if you can tolerate the error.
-            See the ``F32_VERTICAL_BAND`` note for the measured tradeoff.
+            accuracy: the 0.2 default promotes steep (>~78.5 deg) faults and holds
+            the float32 error under ~1e-3 everywhere; lower it (e.g. to 0.1) to
+            keep dips up to ~84 deg in float32 if you can tolerate ~1e-3 error at
+            that edge. See the ``F32_VERTICAL_BAND`` note for the measured
+            tradeoff.
         """
         super().__init__()
         if smooth_grad and analytic_grad:
@@ -2052,8 +2055,14 @@ class OkadaSource(_OkadaBase):
 
         if z_obs.ndim == 1:
             z_b = z_obs[:, None]   # [B,1]
-        else:
+        elif z_obs.ndim == 2:
             z_b = z_obs            # [B,N]
+        else:
+            # fail here with a clear message, not with a confusing broadcast
+            # error deep inside the kernel.
+            raise ValueError(
+                f"z must have shape [B] or [B,N]; got {tuple(z_obs.shape)}"
+            )
 
         if torch.any(z_b > 0):
             raise ValueError("Okada convention requires z <= 0. Use z=0 at surface, z<0 below surface.")

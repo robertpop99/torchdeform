@@ -239,6 +239,19 @@ class TestBatching:
         out = model(*make_inputs(2, N))
         assert out.e.shape == (2, N)
 
+    def test_single_source_broadcasts_over_batch(self, model):
+        """B=1 source parameters against [B, N] observations: the documented
+        broadcast path in ``_validate_inputs`` ("leading dimension B or 1") must
+        equal explicitly expanding the parameters to B."""
+        x_obs, y_obs, sx, sy, depth, dv = make_inputs(3, 10)
+        single = model(x_obs, y_obs, sx[:1], sy[:1], depth[:1], dv[:1])
+        expanded = model(x_obs, y_obs, sx[:1].expand(3), sy[:1].expand(3),
+                         depth[:1].expand(3), dv[:1].expand(3))
+        assert single.e.shape == (3, 10)
+        torch.testing.assert_close(single.e, expanded.e)
+        torch.testing.assert_close(single.n, expanded.n)
+        torch.testing.assert_close(single.u, expanded.u)
+
 
 # --------------------------------------------------------------------------- #
 # Differentiability
