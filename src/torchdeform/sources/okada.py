@@ -1028,6 +1028,13 @@ def ub_displacement(
 
         xi_mask = torch.abs(xi) > eps
         den_safe = torch.where(xi_mask, atan_den, torch.ones_like(atan_den))
+        # dccon0's exact-mode vertical snap makes cd -- and hence atan_den --
+        # exactly zero even where xi_mask holds; cd_mask deselects this branch
+        # in the output, but torch.where still backprops through it, and
+        # atan(num/0) saves u=inf whose zero incoming gradient turns into
+        # 0/0 = NaN in the division backward. Keep the denominator off exact
+        # zero (sign-preserving, as in the training-safe branch).
+        den_safe = torch.where(den_safe >= 0.0, den_safe + eps, den_safe - eps)
         ai4_a = torch.where(
             xi_mask,
             (xi / rd_safe * sd * cd + 2.0 * torch.atan(atan_num / den_safe)) / (cd * cd + eps),

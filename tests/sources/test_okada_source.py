@@ -1610,6 +1610,52 @@ class TestNumericalHealth:
             assert p.grad is not None and torch.isfinite(p.grad).all(), \
                 f"non-finite gradient for {name}"
 
+    @pytest.mark.parametrize("cls", [OkadaSource, OkadaSourceSimple])
+    @pytest.mark.parametrize("analytic_grad", [False, True])
+    def test_no_nan_gradients_exact_vertical_dip(self, cls, analytic_grad):
+        """Exact (default) and analytic_grad modes: gradients w.r.t. *every*
+        input must stay finite at a fault whose dip is *exactly* vertical
+        (dip = pi/2, so cos(dip) collapses to a hard zero via dccon0's snap).
+
+        Regression for the ``ub_displacement`` exact-mode ``ai4`` branch. There,
+        ``atan_den = xi*(r+x)*cd`` is exactly zero at vertical even where
+        ``xi != 0``; the ``cd`` mask deselects that branch from the *forward*
+        output, but ``torch.where`` still backprops through it, and
+        ``atan(num/0)`` saved ``u = inf`` whose zero incoming gradient became
+        ``0/0 = NaN`` in the division backward -- poisoning the gradients of
+        source position, geometry (strike/depth/length/width) and the
+        observation coordinates on a grid crossing the surface trace. The
+        forward values (and smooth_grad, covered above) were never affected.
+        """
+        L, W = 10e3, 5e3
+        g = torch.linspace(-8e3, 8e3, 21, dtype=DTYPE)
+        X, Y = torch.meshgrid(g, g, indexing="xy")
+        x_obs = X.reshape(1, -1).clone().requires_grad_(True)
+        y_obs = Y.reshape(1, -1).clone().requires_grad_(True)
+
+        leaves = {
+            "source_x": t([0.0]), "source_y": t([0.0]),
+            "dip": t([math.pi / 2.0]), "strike": t([0.3]),
+            "centroid_depth": t([0.5 * W]), "length": t([L]), "width": t([W]),
+            "disl1": t([1.0]), "disl2": t([0.5]), "disl3": t([0.2]),
+        }
+        for v in leaves.values():
+            v.requires_grad_(True)
+
+        model = cls(analytic_grad=analytic_grad)
+        common = dict(x_obs=x_obs, y_obs=y_obs, **leaves)
+        if cls is OkadaSource:
+            common["z_obs"] = t([[0.0]])
+        out = model(**common)
+
+        loss = (out.e**2 + out.n**2 + out.u**2).sum()
+        assert torch.isfinite(loss)
+        loss.backward()
+        for name, p in (("x_obs", x_obs), ("y_obs", y_obs), *leaves.items()):
+            assert p.grad is not None and torch.isfinite(p.grad).all(), \
+                f"non-finite gradient for {name} at exactly vertical dip"
+
+
 class TestDifferentiability:
     """Autograd through the model: gradcheck and finite-gradient coverage."""
 
