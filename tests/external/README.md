@@ -89,7 +89,7 @@ Relative field error over 1000 random samples per model (seed 0), as `median →
 |---|---|--------|-------|-------|
 | `MogiSource` | `Mogi` | ~2e-16 | ~5e-16 | closed-form, machine precision |
 | `OkadaSource` | `Okada` | ~2e-13 | ~1e-9 | closed-form; max is 1 near-fault point |
-| `CDMSource` | `Cdm` | ~7e-13 | ~4e-6 | closed-form; max is 1 near-source point |
+| `CDMSource` | `Cdm` | ~8e-13 | ~5e-6 | closed-form; max is 1 near-source point |
 | `PennySource` | `Penny` | ~1e-3 | ~2e-2 | numerical Hankel transform (see below) |
 
 *Regenerate with `RUN_VMOD_TESTS=1 python emit_accuracy_table.py --write` (needs VMOD installed; numbers are from one seed-0 run).*
