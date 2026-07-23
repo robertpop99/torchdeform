@@ -98,6 +98,46 @@ def test_gradients_finite_at_vertical_sides():
             assert p.grad is not None and torch.isfinite(p.grad).all(), name
 
 
+def test_no_spurious_spike_near_vertical_side():
+    """Regression: thin, near-vertical sources (elongated prolates observed from
+    near overhead) used to emit a huge single-pixel spike in the horizontal
+    field. Root cause: the Burgers term ``Fi = 2*atan2(...)`` wraps to ~+-2pi on
+    the ``beta < 0`` branch of a near-vertical side, and multiplied by ``cotB**2``
+    (which blows up as the side approaches vertical) produces an O(1e2..1e13)
+    spurious displacement where the true field is tiny. It is NOT fixable by the
+    exactly-vertical mask: the instability reaches ``sin(beta) ~ 0.06``, where the
+    side still contributes physically, so masking there would bias real sources.
+    Fixed by folding ``Fi`` into (-pi, pi].
+
+    The spike is razor-sharp in the parameters (a ~1e-5 relative change moves off
+    it), so this asserts over an *ensemble* of thin sources on an edge-aligned
+    grid (a node directly above the centroid). Before the fix ~28% of these
+    spiked; after, none do.
+    """
+    g = torch.Generator().manual_seed(0)
+    B = 400
+    a_in = 5 + 45 * torch.rand(B, generator=g, dtype=DTYPE)          # thin in-plane
+    a_z = 300 + 1500 * torch.rand(B, generator=g, dtype=DTYPE)       # tall
+    depth = a_z / (0.05 + 0.28 * torch.rand(B, generator=g, dtype=DTYPE))  # submerged
+    ox = (torch.rand(B, generator=g, dtype=DTYPE) * 2 - 1) * 0.15    # near-vertical
+    oz = torch.rand(B, generator=g, dtype=DTYPE) * torch.pi
+    op = -2 + 4 * torch.rand(B, generator=g, dtype=DTYPE)
+
+    ax = torch.linspace(-5000.0, 5000.0, 11, dtype=DTYPE)           # node at (0, 0)
+    yy, xx = torch.meshgrid(ax, ax, indexing="ij")
+    x = xx.reshape(1, -1).expand(B, -1).contiguous()
+    y = yy.reshape(1, -1).expand(B, -1).contiguous()
+    z = torch.zeros(B, dtype=DTYPE)
+
+    out = CDMSource()(x, y, z, z, depth, ox, z, oz, a_in, a_in, a_z, op)
+    mag = torch.stack([out.e, out.n, out.u], dim=-1).abs().amax(-1)  # [B, N]
+    assert torch.isfinite(mag).all()
+    peak = mag.amax(1)
+    med = mag.median(1).values.clamp_min(1e-9)
+    n_spiked = int(((peak / med) > 100.0).sum())
+    assert n_spiked == 0, f"{n_spiked}/{B} near-vertical sources spiked"
+
+
 # --------------------------------------------------------------------------- #
 # Correctness: far-field reduction to the point CDM
 # --------------------------------------------------------------------------- #

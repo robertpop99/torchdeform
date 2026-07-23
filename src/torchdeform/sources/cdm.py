@@ -83,6 +83,15 @@ def _ang_dis_disp_surf(
     sin_half = torch.where(sin_half.abs() < eps, torch.full_like(sin_half, eps), sin_half)
     cot_half = torch.cos(half) / sin_half
     Fi = 2.0 * torch.atan2(y2, (r + a) * cot_half - y1)
+    # Wrap Fi to (-pi, pi]. Fi = 2*atan2(...) lives in (-2pi, 2pi]; for a
+    # near-vertical side (beta -> 0) the atan2 argument's x-part -> -inf on the
+    # beta < 0 branch, so Fi jumps to ~+-2pi instead of the correct small value
+    # continuous with the beta -> 0 limit. Multiplied by cotB^2 (which blows up
+    # for near-vertical sides) that spurious 2pi produces O(1e2..1e13) surface
+    # spikes. The physical Burgers term is the principal value, so fold Fi back
+    # into (-pi, pi]; this is a no-op wherever |Fi| <= pi (all non-degenerate
+    # sides) and only repairs the near-vertical branch.
+    Fi = Fi - 2.0 * math.pi * torch.round(Fi / (2.0 * math.pi))
 
     inv = 1.0 - 2.0 * nu
     rpa = r + a
