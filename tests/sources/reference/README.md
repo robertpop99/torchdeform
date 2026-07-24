@@ -40,8 +40,8 @@ Each row is a torchdeform port vs the **original authors' code** over a random-p
 | `OkadaSourceSimple` | DC3D surface (z=0), nu=0.32 | 195 | 8.4e-12 | 3.6e-11 |
 | `PCDMSource` | Nikkhoo (2017) pCDM.m volume, nu=0.25 | 384 | 1.5e-16 | 8.5e-16 |
 | `PCDMSource` | Nikkhoo (2017) pCDM.m volume, nu=0.32 | 384 | 1.7e-16 | 8.9e-16 |
-| `CDMSource` | Nikkhoo (2017) CDM.m volume, nu=0.25 | 384 | 4.9e-14 | 8.3e-12 |
-| `CDMSource` | Nikkhoo (2017) CDM.m volume, nu=0.32 | 384 | 4.1e-14 | 6.4e-12 |
+| `CDMSource` | Nikkhoo (2017) CDM.m volume, nu=0.25 | 384 | 5.1e-14 | 8.6e-12 |
+| `CDMSource` | Nikkhoo (2017) CDM.m volume, nu=0.32 | 384 | 4.7e-14 | 7.3e-12 |
 | `PECMSource` | Nikkhoo (2017) pECM.m volume, nu=0.25 | 384 | 1.6e-19 | 1.7e-15 |
 | `PECMSource` | Nikkhoo (2017) pECM.m volume, nu=0.32 | 384 | 9.5e-20 | 1.0e-15 |
 | `PennySource` | Fialko (2001) penny volume, nu=0.25 | 384 | 4.7e-13 | 5.9e-12 |
