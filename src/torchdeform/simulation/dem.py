@@ -180,6 +180,14 @@ def _thermal_erosion(field, iters, talus, rate, eps=1e-12):
 # None of them need gradients (see ``synthetic_dem``), so they favour the
 # batched-tensor formulation over the asymptotically better serial one.
 
+#: Upper bound on the refinement grid chosen by ``spim_fine_res=None``. Runtime is
+#: quadratic in this number (a batch of 8 costs ~7 s at 176, ~27 s at 352 and ~110 s
+#: at 674 on CPU), so it buys back most of the fidelity a fixed cap loses at large
+#: output sizes without letting cost track the output without limit. Raise it for
+#: large DEMs where quality matters more than throughput; pass an explicit
+#: ``spim_fine_res`` to override per call.
+SPIM_FINE_RES_CAP = 352
+
 def _pin_ring(z, value=0.0):
     """Clamp the outermost ring of cells to ``value`` (base level / outlet).
     ``value`` may be a scalar or a same-shaped field to copy the ring from."""
@@ -339,7 +347,17 @@ def _spim_terrain(batch, rows, cols, *, res, fine_res, detail, margin, steps,
     # to grow a network on.
     long_axis = max(rows, cols)
     want = int(math.ceil(long_axis / max(1e-6, 1.0 - 2.0 * margin)))
-    fine_long = min(int(fine_res), max(48, want))
+    # ``fine_res=None`` tracks the output instead of pinning a fixed grid: a constant
+    # cap silently costs fidelity as the output grows (at 512^2 a 176-cell fine pass
+    # loses ~14 dB of structure in the 0.3-0.6 Nyquist band against a 1:1 run, and
+    # ``detail`` then papers over it with noise). Cost is quadratic in this grid, so
+    # it still stops at SPIM_FINE_RES_CAP rather than following the output forever.
+    cap = SPIM_FINE_RES_CAP if fine_res is None else int(fine_res)
+    fine_long = min(cap, max(48, want))
+    # The coarse pass is *not* scaled with it: within a fixed step budget a coarser
+    # start organises the network better, so raising ``res`` alongside measurably
+    # hurts (at 512^2, res=224 gives -6.2 dB against res=112's -1.3 dB at the same
+    # fine grid). ``res`` stays a fixed small grid by design.
     coarse_long = min(int(res), fine_long)
 
     def _grid(long_target):
@@ -428,7 +446,7 @@ def synthetic_dem(
     spim_steps: int = 400,            # spim: coarse-pass landscape-evolution iterations
     spim_fine_steps: int = 200,       # spim: refinement iterations at fine resolution (0 disables)
     spim_res: int = 112,              # spim: coarse-pass LEM resolution (long axis)
-    spim_fine_res: int = 176,         # spim: refinement-pass resolution (long axis)
+    spim_fine_res: Optional[int] = None,  # spim: refinement-pass resolution (long axis; None tracks the output, capped at SPIM_FINE_RES_CAP)
     spim_margin: float = 0.12,        # spim: fraction cropped per side (drops the base-level frame)
     spim_m: float = 0.5,              # spim: drainage-area exponent
     spim_n: float = 1.0,              # spim: slope exponent (m/n ~ 0.5 is the constrained ratio)

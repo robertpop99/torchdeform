@@ -120,7 +120,8 @@ phase = to_phase(disp.to_los(los)).reshape(B, rows, cols)
 #    (in a calm scene the long-wavelength ramp dominates; turbulence is texture)
 # Real topography from Copernicus GLO-30 (public, no auth; needs network +
 # `torchdeform[dem]`). For a zero-setup offline DEM instead, swap this line for
-# `dem = synthetic_dem(B, rows, cols, relief=600.0)`. See "Real topography" below.
+# `dem = synthetic_dem(B, rows, cols, relief=600.0)` — or `method="spim"` for
+# realistic dendritic drainage at a compute cost. See "Real topography" below.
 dem = DEMPatchSampler.from_copernicus(4, patch_rows=rows, patch_cols=cols)(B)
 aps = orbital_ramp(B, rows, cols, rms=4.0)                              # long-wavelength trend
 aps = aps + stratified_aps(dem, coeff=torch.full((B,), 3e-3))          # tracks topography
@@ -242,6 +243,7 @@ geometry = GeometryGenerator(DEFAULT_S1_GEOMETRY_PRIOR)        # Sentinel-1 asc/
 # callable. A stack of Copernicus tiles (fetched once) yields unlimited patches via
 # random crops/flips. For a zero-setup offline DEM, use instead:
 #   dem=lambda b, g: synthetic_dem(b, grid.rows, grid.cols, relief=600.0, generator=g)
+# (see "Real topography" for the more realistic — but slower — method="spim").
 dem_source = DEMPatchSampler.from_copernicus(8, patch_rows=grid.rows, patch_cols=grid.cols)
 
 atmosphere = AtmosphereGenerator(
@@ -310,6 +312,44 @@ rasters load with numpy alone. A finite stack of tiles yields effectively
 unlimited variety through random tile choice, crop location, flips and rotations,
 and stays seed-reproducible (all randomness flows through the passed
 `torch.Generator`, exactly like `synthetic_dem`).
+
+### Offline alternative: `method="spim"`
+
+If you'd rather not depend on downloads at all, `synthetic_dem(...,
+method="spim")` runs a stream-power landscape-evolution model. Unlike the fractal
+methods (`"ridged"`, `"fbm"`) it produces **connected dendritic drainage
+networks** — branching valleys with realistic ridge/valley structure — which is
+what makes the stratified atmosphere look like a real scene:
+
+```python
+from torchdeform.simulation import synthetic_dem, DEMPatchSampler
+
+dem = synthetic_dem(8, 256, 256, relief=600.0, method="spim")   # [8, 256, 256] (m)
+```
+
+The cost is compute: on CPU the batch above takes ~26 s, against ~0.06 s for the
+default `"ridged"`. That's fine for a one-off scene, but far too slow to call per
+sample inside a `DataLoader`.
+
+Runtime is set by the internal landscape-model grid, not by the output size, so it
+plateaus: `spim_fine_res=None` (the default) sizes that grid to the output but
+stops at `SPIM_FINE_RES_CAP` (352), which is why a batch of 512² DEMs costs about
+the same as 256². Lower `spim_fine_res` explicitly to trade terrain detail for
+speed — `spim_fine_res=176` is roughly 4x faster at 256²/512², at the cost of
+visibly coarser hillslopes. So for datasets, generate a bank of large SPIM DEMs
+once and sample patches from it: `DEMPatchSampler` takes in-memory rasters, so it
+works on synthetic terrain exactly as it does on Copernicus tiles.
+
+```python
+bank = synthetic_dem(8, 512, 512, relief=600.0, method="spim")  # once, ~29 s
+dem  = DEMPatchSampler(list(bank), patch_rows=grid.rows, patch_cols=grid.cols)
+atmosphere = AtmosphereGenerator(grid, strat_coeff=UniformPrior(-3e-3, 3e-3), dem=dem)
+```
+
+Note that `"spim"` is deliberately **not differentiable** (it runs under
+`no_grad` and returns a leaf tensor) — a DEM is input data, and gradients through
+a landscape model are meaningless because drainage reorganises discontinuously
+under basin capture. The `"ridged"`/`"fbm"` methods carry gradients as before.
 
 ## Priors
 

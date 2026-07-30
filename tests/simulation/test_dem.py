@@ -23,9 +23,9 @@ import pytest
 import torch
 
 from torchdeform.simulation import synthetic_dem
-from torchdeform.simulation.dem import (_EROSION_NEIGHBOURS, _drainage_area,
-                                        _fill_pits, _flow_weights, _normalize,
-                                        _pin_ring, _shift)
+from torchdeform.simulation.dem import (SPIM_FINE_RES_CAP, _EROSION_NEIGHBOURS,
+                                        _drainage_area, _fill_pits, _flow_weights,
+                                        _normalize, _pin_ring, _shift)
 from torchdeform.atmosphere import stratified_aps
 
 
@@ -367,6 +367,27 @@ class TestSpimTerrain:
         # forward-only by construction: nothing to differentiate, nothing retained
         dem = synthetic_dem(1, 64, 64, generator=_gen(), **_SPIM_FAST)
         assert not dem.requires_grad and dem.grad_fn is None
+
+    def test_default_fine_res_tracks_output_then_caps(self):
+        # spim_fine_res=None sizes the refinement grid to the output so fidelity does
+        # not silently decay as the DEM grows, but stops at SPIM_FINE_RES_CAP because
+        # cost is quadratic in it. Asserted on the grid the sizing logic picks rather
+        # than on runtime, which is far too noisy to gate a test on.
+        def fine_grid(out):
+            want = math.ceil(out / (1.0 - 2.0 * 0.12))       # the default spim_margin
+            return min(SPIM_FINE_RES_CAP, max(48, want))
+
+        assert fine_grid(64) < fine_grid(256) <= SPIM_FINE_RES_CAP   # tracks the output
+        assert fine_grid(512) == fine_grid(4096) == SPIM_FINE_RES_CAP  # then plateaus
+
+        # small outputs are unaffected by the cap, so they must be bit-identical to
+        # pinning the grid explicitly -- the change is a no-op below it.
+        small = dict(_SPIM_FAST); small.pop("spim_fine_res")
+        auto = synthetic_dem(2, 64, 64, generator=_gen(3), **small)
+        want = min(SPIM_FINE_RES_CAP, max(48, math.ceil(64 / 0.76)))
+        pinned = synthetic_dem(2, 64, 64, generator=_gen(3),
+                               **{**small, "spim_fine_res": want})
+        torch.testing.assert_close(auto, pinned)
 
     def test_slope_area_scaling(self):
         # the standard fingerprint of a fluvially-organised landscape: on channel

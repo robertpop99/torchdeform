@@ -87,7 +87,14 @@ optimisation/inversion loop.
     multifractal is the default, `method="fbm"` the fast fractal surface,
     `method="spim"` a stream-power landscape-evolution model — the only one that
     produces connected *dendritic drainage networks* (`spim_*` knobs; coarse pass
-    then a refinement pass, ~9 s for 8×256² on CPU). Deliberately **not a
+    then a refinement pass, ~26 s for 8×256² on CPU). `spim_fine_res=None`
+    (default) sizes the refinement grid to the output, capped at
+    `SPIM_FINE_RES_CAP` (352) since cost is quadratic in it — a fixed cap
+    silently loses fidelity as the output grows (~14 dB of structure at 512²).
+    The coarse `spim_res` is deliberately *not* scaled with it: within a fixed
+    step budget a coarser start organises drainage better. Note both the
+    near-D8 routing (`spim_mfd_p`) and the output size leave grid-scale
+    artefacts — see the docstrings. Deliberately **not a
     gradient path**: it runs under `no_grad` and returns a leaf, since a DEM is
     input data (like `DEMPatchSampler`) and gradients through a landscape model
     are meaningless — drainage reorganises discontinuously under basin capture.
