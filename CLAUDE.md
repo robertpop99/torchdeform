@@ -84,7 +84,13 @@ optimisation/inversion loop.
 
 - **`simulation/`** — randomised scene generation for datasets:
   - `dem.py` → `synthetic_dem` (procedural terrain; `method="ridged"` realistic
-    multifractal is the default, `method="fbm"` the fast fractal surface;
+    multifractal is the default, `method="fbm"` the fast fractal surface,
+    `method="spim"` a stream-power landscape-evolution model — the only one that
+    produces connected *dendritic drainage networks* (`spim_*` knobs; coarse pass
+    then a refinement pass, ~9 s for 8×256² on CPU). Deliberately **not a
+    gradient path**: it runs under `no_grad` and returns a leaf, since a DEM is
+    input data (like `DEMPatchSampler`) and gradients through a landscape model
+    are meaningless — drainage reorganises discontinuously under basin capture.
     `fold`/`positive` for non-negative referencing).
   - `real_dem.py` → `DEMPatchSampler` (random `[B,rows,cols]` patches from real
     elevation rasters; a drop-in `(batch, generator)->dem` source for

@@ -7,6 +7,9 @@ Checks:
   gets smoother as Hurst rises; ``beta`` overrides ``hurst``;
 * the regional ``ramp`` (peak-to-peak) and the ``positive`` shift (min == base);
 * generator determinism, dtype, device;
+* ``method="spim"``: exact unit tests of the flow-routing / drainage-area /
+  pit-filling helpers, plus slope-area scaling and gradient isotropy of the
+  evolved terrain (no gradcheck -- spim is a data generator, not a gradient path);
 * it feeds ``stratified_aps`` (skipped if the atmosphere module isn't importable).
 
 Run with::
@@ -14,10 +17,15 @@ Run with::
     pytest test_dem.py -v
 
 """
+import math
+
 import pytest
 import torch
 
 from torchdeform.simulation import synthetic_dem
+from torchdeform.simulation.dem import (_EROSION_NEIGHBOURS, _drainage_area,
+                                        _fill_pits, _flow_weights, _normalize,
+                                        _pin_ring, _shift)
 from torchdeform.atmosphere import stratified_aps
 
 
@@ -218,6 +226,205 @@ class TestRidgedMethod:
         torch.testing.assert_close(synthetic_dem(2, 64, 64, generator=_gen(11)),
                                    synthetic_dem(2, 64, 64, method="ridged",
                                                  generator=_gen(11)))
+
+
+# --------------------------------------------------------------------------- #
+# Stream-power ("spim") terrain
+# --------------------------------------------------------------------------- #
+# The routing/drainage/fill helpers are the valuable unit tests -- they are exact
+# on hand-built surfaces, and a sign error in any of them only shows up as soup
+# after a few hundred evolution steps. Deliberately no gradcheck: "spim" is a data
+# generator, not a gradient path (see the module docstring).
+
+# small but still network-forming; the default 400+200 steps at 112/176 is far
+# too slow for CI
+_SPIM_FAST = dict(method="spim", spim_res=64, spim_fine_res=96,
+                  spim_steps=120, spim_fine_steps=60)
+
+
+def _plane(n, dtype=DTYPE):
+    """Inclined plane dropping toward +y, ringed by base level."""
+    yy = torch.arange(n, dtype=dtype)
+    z = (n - 1 - yy)[None, :, None].repeat(1, 1, n).contiguous()
+    return _pin_ring(z, 0.0)
+
+
+def _orientation_stats(dem, nbins=72):
+    """Magnitude-weighted histogram of gradient orientations (mod 180 deg),
+    normalised to mean 1. Returns ``(peak, aligned/off-axis)``: both ~1 for an
+    isotropic field, both large when structure locks onto the grid."""
+    gy, gx = torch.gradient(dem, dim=(-2, -1))
+    mag = (gx ** 2 + gy ** 2).sqrt()
+    ang = torch.atan2(gy, gx) % math.pi
+    idx = (ang / math.pi * nbins).long().clamp(0, nbins - 1)
+    hist = torch.zeros(nbins, dtype=dem.dtype)
+    hist.scatter_add_(0, idx.reshape(-1), mag.reshape(-1))
+    hist = hist / hist.mean()
+
+    centres = torch.arange(nbins) * 180.0 / nbins
+    aligned = torch.zeros(nbins, dtype=torch.bool)
+    for a in (0.0, 45.0, 90.0, 135.0):
+        off = (centres - a).abs() % 180.0
+        aligned |= (off < 3.0) | (off > 177.0)
+    ratio = hist[aligned].mean() / hist[~aligned].mean().clamp_min(1e-12)
+    return hist.max().item(), ratio.item()
+
+
+def _interior_pits(z):
+    """Count interior cells lying below all eight of their neighbours."""
+    nb = torch.stack([_shift(z, dy, dx, mode="constant")
+                      for dy, dx, _ in _EROSION_NEIGHBOURS], dim=0)
+    inner = torch.zeros_like(z, dtype=torch.bool)
+    inner[:, 1:-1, 1:-1] = True
+    return int(((z < nb.amin(dim=0)) & inner).sum())
+
+
+class TestSpimRouting:
+    def test_flow_points_downhill(self):
+        w, _ = _flow_weights(_plane(24), 8.0)
+        k = int(w[:, 0, 5, 5].argmax())
+        assert _EROSION_NEIGHBOURS[k][:2] == (1, 0)      # +y is downslope
+
+    def test_drainage_grows_downslope(self):
+        z = _plane(24)
+        w, _ = _flow_weights(z, 8.0)
+        col = _drainage_area(w, torch.ones_like(z), 60)[0, :, 12]
+        assert torch.all(col[2:-1] >= col[1:-2] - 1e-9)
+
+    def test_drainage_area_counts_upslope_cells(self):
+        # with near-D8 routing on a plane, the cell above the outlet drains the
+        # whole column above it: area == number of upslope interior cells
+        n = 24
+        z = _plane(n)
+        w, _ = _flow_weights(z, 8.0)
+        area = _drainage_area(w, torch.ones_like(z), 4 * n)
+        assert abs(area[0, -2, n // 2].item() - (n - 3)) < 0.5
+
+    def test_fill_removes_interior_pits(self):
+        n = 24
+        yy = torch.arange(n, dtype=DTYPE)
+        z = (n - 1 - yy)[None, :, None].repeat(1, 1, n).contiguous()
+        z[0, 12, 12] = -50.0
+        assert _interior_pits(z) == 1
+        zf = _fill_pits(z, None, n, z.new_tensor(1e-6))
+        assert _interior_pits(zf) == 0
+        assert torch.all(zf >= z - 1e-12)               # filling only ever raises
+
+    def test_fill_is_a_no_op_on_a_monotone_surface(self):
+        z = _plane(24)
+        zf = _fill_pits(z, None, 24, z.new_tensor(1e-9))
+        assert (zf - z).abs().max().item() < 1e-6
+
+    def test_pits_route_nowhere(self):
+        # a cell with no downhill neighbour keeps its water instead of sending it
+        # uphill: all-zero weights, not a uniform 1/8 split
+        z = torch.zeros(1, 5, 5, dtype=DTYPE)
+        z[0, 2, 2] = -1.0
+        w, _ = _flow_weights(z, 4.0)
+        assert w[:, 0, 2, 2].abs().max().item() == 0.0
+
+
+class TestSpimTerrain:
+    def test_shape_and_finite(self):
+        dem = synthetic_dem(3, 96, 128, generator=_gen(), **_SPIM_FAST)
+        assert dem.shape == (3, 96, 128) and torch.isfinite(dem).all()
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_dtypes_finite(self, dtype):
+        dem = synthetic_dem(2, 64, 64, dtype=dtype, generator=_gen(), **_SPIM_FAST)
+        assert dem.dtype == dtype and torch.isfinite(dem).all()
+
+    def test_shares_output_semantics(self):
+        dem = synthetic_dem(4, 64, 64, relief=250.0, base_elevation=800.0,
+                            generator=_gen(), **_SPIM_FAST)
+        torch.testing.assert_close(dem.std(dim=(-2, -1)),
+                                   torch.full((4,), 250.0, dtype=DTYPE),
+                                   rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(dem.mean(dim=(-2, -1)),
+                                   torch.full((4,), 800.0, dtype=DTYPE),
+                                   rtol=0, atol=1e-6)
+
+    def test_positive_and_fold(self):
+        p = synthetic_dem(2, 64, 64, positive=True, base_elevation=7.0,
+                          generator=_gen(), **_SPIM_FAST)
+        torch.testing.assert_close(p.amin(dim=(-2, -1)),
+                                   torch.full((2,), 7.0, dtype=DTYPE))
+        f = synthetic_dem(2, 64, 64, fold=True, generator=_gen(), **_SPIM_FAST)
+        assert (f >= 0).all()
+
+    def test_deterministic_and_batch_varies(self):
+        a = synthetic_dem(2, 64, 64, generator=_gen(3), **_SPIM_FAST)
+        b = synthetic_dem(2, 64, 64, generator=_gen(3), **_SPIM_FAST)
+        torch.testing.assert_close(a, b)
+        assert not torch.allclose(a[0], a[1])
+
+    def test_runs_without_the_refinement_pass(self):
+        dem = synthetic_dem(2, 64, 64, generator=_gen(),
+                            **{**_SPIM_FAST, "spim_fine_steps": 0})
+        assert torch.isfinite(dem).all()
+
+    def test_no_autograd_graph(self):
+        # forward-only by construction: nothing to differentiate, nothing retained
+        dem = synthetic_dem(1, 64, 64, generator=_gen(), **_SPIM_FAST)
+        assert not dem.requires_grad and dem.grad_fn is None
+
+    def test_slope_area_scaling(self):
+        # the standard fingerprint of a fluvially-organised landscape: on channel
+        # cells, S ~ A^(-m/n). Measured with detail off (the added roughness biases
+        # S upward) and lakes excluded (filled depressions have S ~ 0 by
+        # construction and are exactly the high-A cells). Wide band on purpose --
+        # S ~ A^(-m/n) is a steady-state result and a few hundred steps from noise
+        # need not have got there.
+        dem = _normalize(synthetic_dem(2, 128, 128, generator=_gen(0),
+                                       **{**_SPIM_FAST, "spim_detail": 0.0}))
+        n = max(dem.shape[-2:])
+        zf = _fill_pits(dem, None, n, dem.new_tensor(1e-9))
+        w, _ = _flow_weights(zf, 4.0)
+        area = _drainage_area(w, torch.ones_like(dem), 2 * n)
+        _, drops = _flow_weights(dem, 4.0)               # slope on the real surface
+        slope = (w * drops).sum(dim=0)
+
+        lake = (zf - dem) > 1e-9 * (dem.amax() - dem.amin())
+        keep = (area >= torch.quantile(area.reshape(-1), 0.90)) & ~lake & (slope > 0)
+        keep[:, :3, :] = keep[:, -3:, :] = False
+        keep[:, :, :3] = keep[:, :, -3:] = False
+        assert int(keep.sum()) > 200
+
+        la, ls = torch.log(area[keep]), torch.log(slope[keep])
+        design = torch.stack([la, torch.ones_like(la)], dim=1)
+        exponent = torch.linalg.lstsq(design, ls[:, None]).solution[0, 0].item()
+        assert -0.8 < exponent < -0.2, exponent
+
+    def test_not_grid_aligned(self):
+        # Routing on a grid risks locking drainage onto the 8 neighbour
+        # directions. Bin gradient orientations (mod 180 deg) weighted by
+        # magnitude: striations show up as energy piled onto 0/45/90/135. The
+        # ratio is ~0.87 for spim and unbounded for genuinely striped fields.
+        s_peak, s_ratio = _orientation_stats(
+            synthetic_dem(4, 128, 128, generator=_gen(0), **_SPIM_FAST))
+        assert s_ratio < 1.15, s_ratio          # no preference for grid axes
+        assert s_peak < 1.8, s_peak             # no single dominant orientation
+
+    def test_orientation_metric_catches_striations(self):
+        # guards the test above: a deliberately striped field must fail it
+        n = 128
+        stripes = torch.sin(1.2 * torch.arange(n, dtype=DTYPE))
+        peak, ratio = _orientation_stats(stripes[None, :, None].repeat(1, 1, n))
+        assert peak > 10.0 and ratio > 5.0
+
+
+class TestOtherMethodsUnaffected:
+    @pytest.mark.parametrize("kw", [
+        dict(method="fbm"),
+        dict(method="ridged", warp=0.2, erosion_iters=25),
+        dict(method="ridged", ramp=500.0, positive=True),
+    ])
+    def test_spim_kwargs_do_not_touch_other_methods(self, kw):
+        # the spim_* knobs must be inert outside method="spim"
+        a = synthetic_dem(2, 48, 48, generator=_gen(5), **kw)
+        b = synthetic_dem(2, 48, 48, generator=_gen(5), spim_steps=7,
+                          spim_res=32, spim_detail=0.9, spim_margin=0.3, **kw)
+        assert torch.equal(a, b)
 
 
 # --------------------------------------------------------------------------- #
