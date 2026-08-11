@@ -29,6 +29,16 @@ Any elevation raster works. Convenient free sources of global ~30 m tiles:
   ``[(lat, lon), ...]`` list, or ``n`` random land tiles).
 * **SRTM / NASADEM / ASTER GDMEM** -- via OpenTopography or NASA Earthdata.
 
+The finer **Copernicus EEA-10** tier is deliberately not wired up: it is
+licence-restricted (registered access via the Copernicus Data Space Ecosystem,
+not the open AWS bucket) and covers only the EEA39 area rather than the globe.
+It is also finer than needed here -- interferograms are typically multilooked to
+~20-90 m posting and the topography-correlated delay is a smooth function of
+elevation, so GLO-30 already resolves what matters. To use it anyway, fetch the
+tiles yourself and point :meth:`DEMPatchSampler.from_files` at them, or pass a
+``url_for(lat, lon) -> url`` override to the download helpers if your source
+exposes plain URLs.
+
 Reading GeoTIFFs needs the optional ``rasterio`` dependency; ``.npy`` / ``.npz``
 rasters load with numpy alone.
 """
