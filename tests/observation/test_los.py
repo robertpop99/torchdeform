@@ -5,7 +5,8 @@ What is checked
 ---------------
 * **Convention** - the unit LOS vector (ground -> satellite, ENU) matches the
   documented Sentinel-1 ascending/descending reference vectors, points along
-  ``heading + look_side*90`` in the horizontal, and has ``u = cos(incidence)``.
+  ``heading - look_side*90`` in the horizontal (the reciprocal of the
+  satellite -> ground look azimuth), and has ``u = cos(incidence)``.
 * **Unit norm** - ``e^2 + n^2 + u^2 == 1`` for every entry point and geometry.
 * **Entry-point consistency** - per-image ([B,1]) broadcasts to per-pixel
   ([B,N]); ``los_vector_from_center`` reduces to the per-image value at the
@@ -53,9 +54,10 @@ def _ref_los(heading_deg, incidence_deg, look_side=S1_LOOK_SIDE, device="cpu"):
     """Independent re-statement of the LOS formula for cross-checking."""
     h = _t(heading_deg, device) * _D2R
     i = _t(incidence_deg, device) * _D2R
-    az = h + look_side * (math.pi / 2.0)
+    az = h + look_side * (math.pi / 2.0)      # look az: satellite -> ground
     sin_i = torch.sin(i)
-    return sin_i * torch.sin(az), sin_i * torch.cos(az), torch.cos(i)
+    # returned vector is ground -> satellite, i.e. the reciprocal direction
+    return -sin_i * torch.sin(az), -sin_i * torch.cos(az), torch.cos(i)
 
 
 def _norm(v):
@@ -67,8 +69,8 @@ def _norm(v):
 # --------------------------------------------------------------------------- #
 class TestConvention:
     @pytest.mark.parametrize("name,heading,want", [
-        ("ascending", -12.0, (0.62, 0.13, 0.78)),
-        ("descending", -168.0, (-0.62, 0.13, 0.78)),
+        ("ascending", -12.0, (-0.62, -0.13, 0.78)),
+        ("descending", -168.0, (0.62, -0.13, 0.78)),
     ])
     def test_documented_sentinel1_vectors(self, name, heading, want):
         # Reference vectors quoted in the module docstring (inc=39, right-look)
@@ -99,18 +101,39 @@ class TestConvention:
         # incidence is recoverable from u
         torch.testing.assert_close(torch.acos(v.u) / _D2R, i, atol=1e-9, rtol=0)
 
-    def test_horizontal_points_along_heading_plus_look(self):
-        # atan2(e, n) == heading + look_side*90 (compare as unit vectors)
+    def test_horizontal_points_along_heading_minus_look(self):
+        # The radar looks along heading + look_side*90; the ground -> satellite
+        # vector points back along heading - look_side*90.
         h = _t([-13.0, -167.0, 30.0]); i = _t([39.0, 33.0, 40.0])
         v = los_vector(h, i)
         az = torch.atan2(v.e[:, 0], v.n[:, 0])
-        want = (h + S1_LOOK_SIDE * 90.0) * _D2R
+        want = (h - S1_LOOK_SIDE * 90.0) * _D2R
         torch.testing.assert_close(torch.sin(az), torch.sin(want), atol=1e-9, rtol=0)
         torch.testing.assert_close(torch.cos(az), torch.cos(want), atol=1e-9, rtol=0)
 
-    def test_ascending_east_descending_west(self):
-        assert los_vector([-13.0], [39.0]).e.item() > 0   # ascending looks East
-        assert los_vector([-167.0], [39.0]).e.item() < 0  # descending looks West
+    def test_ascending_satellite_west_descending_east(self):
+        # Sentinel-1 is right-looking, so an ascending pass (flying ~N) images
+        # to its East and therefore sits West of the target: the ground ->
+        # satellite vector points West, E < 0. Descending is the mirror.
+        # Confirmed by LiCSAR geo.E/N/U: every ascending frame has E < 0.
+        assert los_vector([-13.0], [39.0]).e.item() < 0    # satellite is West
+        assert los_vector([-167.0], [39.0]).e.item() > 0   # satellite is East
+        # N is negative for BOTH passes (heading is west of north either way)
+        assert los_vector([-13.0], [39.0]).n.item() < 0
+        assert los_vector([-167.0], [39.0]).n.item() < 0
+
+    def test_matches_published_licsar_geo_enu(self):
+        # Median geo.E/N/U.tif over two real LiCSAR frames, with the per-frame
+        # (heading, incidence) those rasters imply. Regression guard on the
+        # sign convention: the pre-fix formula sits 73-79 deg away.
+        for heading, inc, want in (
+            (-11.20, 36.49, (-0.583, -0.116, 0.804)),   # 014A, ascending
+            (-168.90, 39.49, (0.624, -0.122, 0.772)),   # 079D, descending
+        ):
+            v = los_vector([heading], [inc])
+            got = (v.e.item(), v.n.item(), v.u.item())
+            # `want` is quoted to 3 dp, so that is the achievable tolerance
+            assert all(abs(a - b) < 1e-3 for a, b in zip(got, want)), (got, want)
 
     def test_look_side_flips_horizontal_keeps_vertical(self):
         h, i = sample_s1_geometry(50, generator=torch.Generator().manual_seed(2))

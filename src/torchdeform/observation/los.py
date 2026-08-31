@@ -8,16 +8,29 @@ positive projected value means ground motion TOWARD the satellite (range
 *decrease*). This is the Hanssen / standard-InSAR convention.
 
     look_az = heading + look_side * 90 deg      (right-looking => look_side=+1)
-    los_e = sin(incidence) * sin(look_az)
-    los_n = sin(incidence) * cos(look_az)
-    los_u = cos(incidence)
+    los_e = -sin(incidence) * sin(look_az)
+    los_n = -sin(incidence) * cos(look_az)
+    los_u =  cos(incidence)
 
 where `heading` is the satellite flight azimuth in degrees clockwise from
 North, and `incidence` is the radar incidence angle (angle from vertical).
 
+`look_az` is the direction the radar looks, i.e. SATELLITE -> GROUND. The
+vector returned points the other way, GROUND -> SATELLITE, hence the leading
+minus on the horizontal components: a right-looking satellite images terrain
+to its right, so it sits to the *left* of what it images. Equivalently, the
+ground -> satellite horizontal azimuth is `heading - look_side * 90`.
+
 Sanity values (right-looking, inc=39 deg):
-    Ascending  heading ~ -12  deg  ->  (+0.62, +0.13, +0.78)   looks East
-    Descending heading ~ -168 deg  ->  (-0.62, +0.13, +0.78)   looks West
+    Ascending  heading ~ -12  deg  ->  (-0.62, -0.13, +0.78)   satellite West
+    Descending heading ~ -168 deg  ->  (+0.62, -0.13, +0.78)   satellite East
+
+Verified against LiCSAR's published per-frame `geo.E/N/U.tif` ground ->
+satellite unit vectors (29 Sentinel-1 frames, ascending and descending): the
+formula above reproduces them to 0.03 deg, and agrees with the exact
+`los_vector_from_satellite` geometry for a right-looking satellite. Dropping
+the minus signs mirrors the vector horizontally (E and N flip, U kept), which
+is the LEFT-looking geometry and sits ~73-79 deg from the published LOS.
 
 """
 
@@ -90,8 +103,11 @@ def _los_from_angles(heading_rad: Tensor, incidence_rad: Tensor,
         look_side = look_side[:, None]
     look_az = heading_rad + look_side * (math.pi / 2.0)
     sin_i = torch.sin(incidence_rad)
-    los_e = sin_i * torch.sin(look_az)
-    los_n = sin_i * torch.cos(look_az)
+    # `look_az` points satellite -> ground; the returned vector points
+    # ground -> satellite, so the horizontal components are negated. See the
+    # module docstring for the check against LiCSAR's published geo.E/N/U.
+    los_e = -sin_i * torch.sin(look_az)
+    los_n = -sin_i * torch.cos(look_az)
     los_u = torch.cos(incidence_rad)
     # return los_e, los_n, los_u
     return LOSVector(
