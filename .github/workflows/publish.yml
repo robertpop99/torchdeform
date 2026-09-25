@@ -30,7 +30,9 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
-    environment: pypi          # optional: add a protection rule on this env in repo settings
+    environment:               # optional: add a protection rule on this env in repo settings
+      name: pypi
+      url: https://pypi.org/p/torchdeform   # shown as the link in GitHub's Deployments panel
     permissions:
       id-token: write          # required for PyPI Trusted Publishing (OIDC)
     steps:
