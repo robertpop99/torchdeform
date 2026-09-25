@@ -23,7 +23,7 @@ optimisation/inversion loop.
 
 ## Package layout (`src/torchdeform/`)
 
-- **`__init__.py`** — re-exports the common API at top level. `__version__ = "0.2.1"`.
+- **`__init__.py`** — re-exports the common API at top level. `__version__ = "0.3.0"`.
 
 - **`core.py`** — tensor-backed dataclasses (`TensorDataclassMixin` gives
   `.to/.detach/.device/.dtype/.cpu/.cuda/.clone`):
