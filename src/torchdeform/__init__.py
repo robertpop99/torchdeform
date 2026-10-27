@@ -6,7 +6,8 @@ differentiably, so it can be used both to build training datasets and as layers
 inside a model:
 
 * ``sources`` -- analytic deformation source models (Mogi, Okada finite fault,
-  penny-shaped crack) producing ground displacement fields.
+  penny-shaped crack, compound dislocations, spheroid) producing ground
+  displacement fields.
 * ``observation`` -- line-of-sight geometry and the displacement <-> phase
   observation operators (Sentinel-1 conventions by default).
 * ``atmosphere`` -- turbulent and topography-correlated atmospheric phase
@@ -28,6 +29,7 @@ from .sources import (
     CDMSource,
     cdm_params_from_shape,
     PECMSource,
+    SpheroidSource,
 )
 from .observation import (
     # S1_INCIDENCE_RANGE_DEG,
@@ -66,6 +68,7 @@ __all__ = [
     "CDMSource",
     "cdm_params_from_shape",
     "PECMSource",
+    "SpheroidSource",
 
     # "S1_INCIDENCE_RANGE_DEG",
     # "S1_HEADING_ASCENDING_DEG",

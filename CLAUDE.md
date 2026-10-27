@@ -66,6 +66,17 @@ optimisation/inversion loop.
   - `pecm.py` → `PECMSource` (point ellipsoidal cavity model: a uniformly
     pressurised point ellipsoid mapped to point-CDM potencies via the Eshelby
     (1957) shape tensor)
+  - `spheroid.py` → `SpheroidSource` (finite pressurised spheroid, Yang et al.
+    1988 as corrected by Cervelli's USGS `spheroid.m`, public domain; prolate,
+    oblate via complex foci, any dip/strike, `strength_type` pressure|volume).
+    Surface-only, reformulated so the axis piercing point and strike line are
+    exact and smooth (no thresholded limits). Two singular limits are
+    interpolated by a 5-node quartic through their closed form: within
+    `VERTICAL_BAND` (0.015 rad) of vertical (general branch has `1/cos(dip)^2`
+    round-off) and `SPHERE_BAND` (|a/b-1| < 0.01, centre node = Mogi). Batch
+    rows are split so each path sees only its own rows. ~1e-9 of peak through
+    the bands vs a 50-digit reference. Priors: `SpheroidPrior`,
+    `DEFAULT_SPHEROID_PRIORS` (prolate/oblate).
 
 - **`observation/`** — geometry + observation operators:
   - `los.py` → `los_vector`, `los_vector_per_pixel`, `los_vector_from_center`,
@@ -112,7 +123,8 @@ optimisation/inversion loop.
   - `priors.py` → `Prior` family (`UniformPrior`, `LogUniformPrior`,
     `SignedLogUniformPrior`, `ConstantPrior`, `MultimodalPrior`, `make_prior`),
     per-source prior bundles (`MogiPrior`, `OkadaPrior`, `PennyPrior`,
-    `PCDMPrior`, `GeometryPrior`, `LocationPrior`), `DEFAULT_*_PRIOR` presets
+    `PCDMPrior`, `CDMPrior`, `SpheroidPrior`, `GeometryPrior`, `LocationPrior`),
+    `DEFAULT_*_PRIOR` presets
     (earthquake/dyke/sill/mogi/penny/pcdm/S1 geometry), mixtures.
   - `generators.py` → `ObservationGrid`, `SourceGenerator`,
     `DeformationGenerator` (+`DeformationSample`), `GeometryGenerator`,

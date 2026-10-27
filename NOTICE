@@ -80,6 +80,29 @@ Okada rectangular finite-fault model (DC3D)
 
 -------------------------------------------------------------------------------
 
+Finite spheroid source (Yang et al. 1988, corrected by Cervelli)
+  src/torchdeform/sources/spheroid.py is a derivative work (a differentiable,
+  batched PyTorch port of the surface-displacement computation, reformulated at
+  the free surface) of the MATLAB "spheroid.m" (v1.11, 2018) by Peter F.
+  Cervelli, U.S. Geological Survey, distributed by the USGS Volcano Hazards
+  Program at https://volcanoes.usgs.gov/software/spheroid/. As a work of the
+  U.S. Government it is in the public domain in the United States
+  (17 U.S.C. 105); no license accompanies it. A verbatim copy (line endings
+  normalised) is vendored as a test reference in
+  tests/sources/reference/cervelli/spheroid.m. The attribution below is a
+  scientific acknowledgment.
+
+  References:
+    Yang, X.-M., Davis, P. M. & Dieterich, J. H. (1988), "Deformation from
+    inflation of a dipping finite prolate spheroid in an elastic half-space as
+    a model for volcanic stressing", Journal of Geophysical Research, 93(B5),
+    4249-4257.
+    Cervelli, P. F. (2013), "Analytical expressions for deformation from an
+    arbitrarily oriented spheroid in a half-space", Eos Trans. AGU (Fall
+    Meeting presentation).
+
+-------------------------------------------------------------------------------
+
 Acknowledgments (penny-shaped crack source)
   src/torchdeform/sources/penny.py is an INDEPENDENT implementation of the
   pressurised horizontal penny-shaped crack model, written solely from the

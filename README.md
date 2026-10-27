@@ -32,7 +32,10 @@ inverting an interferogram by gradient descent.
   dislocation, a triaxial volcanic point source), `CDMSource` (its finite
   counterpart, with a `cdm_params_from_shape` helper and sphere/prolate/oblate/
   dyke/sill style presets), and `PECMSource` (point ellipsoidal cavity, a
-  uniformly pressurised point ellipsoid). All differentiable
+  uniformly pressurised point ellipsoid). `SpheroidSource` is the finite
+  pressurised spheroid of Yang et al. (1988, as corrected by Cervelli) — a
+  dipping prolate reservoir/conduit or an oblate body, by pressure or volume
+  change. All differentiable
   in their parameters. The Okada sources take two optional gradient modes
   (default: plain autograd of the exact forward): `analytic_grad=True` returns
   closed-form Okada strains for gradients that stay accurate even at the singular

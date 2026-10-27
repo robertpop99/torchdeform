@@ -8,6 +8,7 @@ from .penny import PennySource
 from .pcdm import PCDMSource
 from .cdm import CDMSource, cdm_params_from_shape, CDM_STYLES
 from .pecm import PECMSource, ecm_potencies
+from .spheroid import SpheroidSource
 
 __all__ = [
     "MogiSource",
@@ -21,5 +22,6 @@ __all__ = [
     "CDM_STYLES",
     "PECMSource",
     "ecm_potencies",
+    "SpheroidSource",
 ]
 

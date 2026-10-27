@@ -46,7 +46,8 @@ Prior bundles
 :class:`PriorBundle` subclasses bundle one named scalar prior per parameter,
 named exactly as a consuming function's arguments, so ``f(**bundle.sample(n))``
 works: source models (:class:`MogiPrior`, :class:`PennyPrior`,
-:class:`OkadaPrior`, :class:`PCDMPrior`) and acquisition geometry
+:class:`OkadaPrior`, :class:`PCDMPrior`, :class:`CDMPrior`,
+:class:`SpheroidPrior`) and acquisition geometry
 (:class:`GeometryPrior`, whose fields feed :func:`~torchdeform.observation.los_vector`).
 ``OkadaPrior`` samples a geophysical fault parametrisation; convert it with
 :func:`~torchdeform.sources.okada.okada_params_from_fault`.
@@ -1010,6 +1011,27 @@ class CDMPrior(PriorBundle):
 
 
 @dataclass(slots=True)
+class SpheroidPrior(PriorBundle):
+    """Prior over finite spheroid parameters (fields match ``SpheroidSource``).
+
+    ``polar_radius`` is the semi-axis along the symmetry axis and
+    ``equatorial_radius`` the one perpendicular to it; ``dip`` / ``strike``
+    (radians) orient the polar axis; ``strength`` is a pressure change (Pa) or a
+    volume change (m^3), matching the consuming model's ``strength_type``. The
+    presets (:data:`DEFAULT_SPHEROID_PRIORS`) keep each cavity buried and its
+    shape class (prolate / oblate) fixed by choosing non-overlapping axis
+    ranges below the minimum depth.
+    """
+
+    depth: Prior
+    polar_radius: Prior
+    equatorial_radius: Prior
+    dip: Prior
+    strike: Prior
+    strength: Prior
+
+
+@dataclass(slots=True)
 class GeometryPrior(PriorBundle):
     """Prior over acquisition geometry (fields match :func:`los_vector`).
 
@@ -1203,6 +1225,39 @@ DEFAULT_CDM_PRIORS: dict[str, CDMPrior] = {
     "sphere": DEFAULT_CDM_SPHERE_PRIOR,
     "prolate": DEFAULT_CDM_PROLATE_PRIOR,
     "oblate": DEFAULT_CDM_OBLATE_PRIOR,
+}
+
+# --------------------------------------------------------------------------- #
+# Finite-spheroid presets (drive SpheroidSource with its default
+# strength_type="pressure"; strength in Pa). Every semi-axis stays below 0.35x
+# the minimum depth -- the same compactness bound as the CDM presets, and the
+# regime where the Yang et al. (1988) approximation is accurate -- so the cavity
+# is buried at any orientation. The prolate / oblate axis ranges do not overlap,
+# fixing the shape class. (dip, strike) and (pi - dip, strike + pi) are the same
+# cavity, so dip in [0, pi/2] with a full-circle strike covers every orientation.
+# --------------------------------------------------------------------------- #
+DEFAULT_SPHEROID_PROLATE_PRIOR = SpheroidPrior(
+    depth=LogUniformPrior(5_000.0, 20_000.0),
+    polar_radius=UniformPrior(400.0, 1_750.0),     # elongated reservoir / conduit
+    equatorial_radius=UniformPrior(100.0, 350.0),  # < polar: always prolate
+    dip=UniformPrior(0.0, math.pi / 2),
+    strike=UniformPrior(0.0, 2.0 * math.pi),
+    strength=SignedLogUniformPrior(1e6, 1e8),
+)
+
+DEFAULT_SPHEROID_OBLATE_PRIOR = SpheroidPrior(
+    depth=LogUniformPrior(5_000.0, 20_000.0),
+    polar_radius=UniformPrior(100.0, 350.0),       # flattened along its axis
+    equatorial_radius=UniformPrior(400.0, 1_750.0),
+    dip=UniformPrior(0.0, math.pi / 2),            # pi/2: polar axis vertical (sill-like)
+    strike=UniformPrior(0.0, 2.0 * math.pi),
+    strength=SignedLogUniformPrior(1e6, 1e8),
+)
+
+#: Default finite-spheroid prior per shape class, keyed by name.
+DEFAULT_SPHEROID_PRIORS: dict[str, SpheroidPrior] = {
+    "prolate": DEFAULT_SPHEROID_PROLATE_PRIOR,
+    "oblate": DEFAULT_SPHEROID_OBLATE_PRIOR,
 }
 
 #: Sentinel-1 IW acquisition geometry: bimodal heading (ascending/descending),
